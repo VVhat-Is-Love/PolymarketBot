@@ -66,13 +66,69 @@ def _kelly_total_stake(
     return min(max(stake, 0.0), max_bet_usd)
 
 
+_DEFAULT_POLYGON_RPC = "https://polygon-rpc.com"
+
+# USDC contracts on Polygon (check both in case the account uses either version)
+_USDC_CONTRACTS = [
+    "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # native USDC
+    "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e (bridged)
+]
+
+
+def _read_usdc_balance_from_chain(rpc_url: str, wallet_address: str) -> float:
+    """
+    Read USDC balance from Polygon via JSON-RPC eth_call — no auth required.
+    Sums native USDC + USDC.e balances (both have 6 decimals).
+    """
+    import httpx
+
+    selector = "70a08231"  # keccak256("balanceOf(address)")[:4]
+    addr_hex = wallet_address.lower().replace("0x", "").zfill(64)
+    call_data = f"0x{selector}{addr_hex}"
+
+    total = 0.0
+    for contract in _USDC_CONTRACTS:
+        try:
+            resp = httpx.post(
+                rpc_url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_call",
+                    "params": [{"to": contract, "data": call_data}, "latest"],
+                },
+                timeout=10,
+            )
+            result = resp.json().get("result", "0x")
+            if result and result not in ("0x", "0x0", "0x" + "0" * 64):
+                total += int(result, 16) / 1_000_000  # 6 decimals
+        except Exception:
+            pass
+    return total
+
+
 def _get_wallet_balance() -> float:
     """
-    Read proxy wallet USDC balance via CLOB API.
-    Falls back to LIVE_WALLET_BALANCE_USD from settings (Level 1 auth limitation:
-    get_balance_allowance requires Level 2 API credentials).
+    Read proxy wallet USDC balance. Priority order:
+    1. Polygon blockchain RPC — reads USDC contract directly, no auth needed
+    2. CLOB API — requires Level 2 credentials, usually fails with Level 1
+    3. LIVE_WALLET_BALANCE_USD — manual fallback from .env
     """
     from src.config.settings import settings
+
+    # 1. Blockchain (free, no API key)
+    wallet = settings.proxy_wallet_address
+    if wallet:
+        try:
+            rpc = settings.polygon_rpc_url or _DEFAULT_POLYGON_RPC
+            bal = _read_usdc_balance_from_chain(rpc, wallet)
+            if bal > 0:
+                logger.info(f"[live_trader] Wallet balance from blockchain: ${bal:.2f}")
+                return bal
+        except Exception as exc:
+            logger.warning(f"[live_trader] Blockchain balance read failed: {exc}")
+
+    # 2. CLOB API (Level 2 only — expected to fail with Level 1)
     try:
         from src.blockchain.polymarket_auth import get_clob_client
         client = get_clob_client()
@@ -83,12 +139,18 @@ def _get_wallet_balance() -> float:
             bal = float(resp or 0.0)
         if bal > 0:
             return bal
-    except Exception as exc:
-        logger.warning(f"[live_trader] Could not fetch wallet balance via API: {exc}")
+    except Exception:
+        pass
 
+    # 3. Manual fallback
     fallback = settings.live_wallet_balance_usd
     if fallback > 0:
-        logger.info(f"[live_trader] Using fallback wallet balance: ${fallback:.2f}")
+        logger.info(f"[live_trader] Using manual fallback balance: ${fallback:.2f}")
+    else:
+        logger.warning(
+            "[live_trader] Could not determine wallet balance via blockchain, API, "
+            "or LIVE_WALLET_BALANCE_USD — set LIVE_WALLET_BALANCE_USD in .env"
+        )
     return fallback
 
 
