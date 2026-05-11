@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Polymarket Bot",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.main",
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

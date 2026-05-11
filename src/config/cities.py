@@ -1,0 +1,32 @@
+CITIES_WHITELIST: dict[str, dict] = {
+    # US (Fahrenheit)
+    "New York":    {"aliases": ["NYC", "New York City"], "unit": "F",
+                   "lat": 40.7128, "lon": -74.0060, "station": "KNYC",
+                   "wunderground": "us/ny/new-york/KNYC"},
+    "Miami":       {"aliases": [], "unit": "F",
+                   "lat": 25.7617, "lon": -80.1918, "station": "KMIA",
+                   "wunderground": "us/fl/miami/KMIA"},
+    "Los Angeles": {"aliases": ["LA"], "unit": "C",
+                   "lat": 34.0522, "lon": -118.2437, "station": "KLAX",
+                   "wunderground": "us/ca/los-angeles/KLAX"},
+    "Austin":      {"aliases": [], "unit": "F",
+                   "lat": 30.2672, "lon": -97.7431, "station": "KAUS",
+                   "wunderground": "us/tx/austin/KAUS"},
+    "Chicago":     {"aliases": [], "unit": "F",
+                   "lat": 41.8781, "lon": -87.6298, "station": "KORD",
+                   "wunderground": "us/il/chicago/KORD"},
+
+    # International (Celsius)
+    "London":      {"aliases": [], "unit": "C",
+                   "lat": 51.5074, "lon": -0.1278, "station": "EGLL",
+                   "wunderground": "gb/london/EGLL"},
+    "Tokyo":       {"aliases": [], "unit": "C",
+                   "lat": 35.6762, "lon": 139.6503, "station": "RJTT",
+                   "wunderground": "jp/tokyo/RJTT"},
+    "Seoul":       {"aliases": [], "unit": "C",
+                   "lat": 37.5665, "lon": 126.9780, "station": "RKSI",
+                   "wunderground": "kr/seoul/RKSI"},
+    "Hong Kong":   {"aliases": ["HK"], "unit": "C",
+                   "lat": 22.3193, "lon": 114.1694, "station": "VHHH",
+                   "wunderground": "hk/hong-kong/VHHH"},
+}

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"C:\\\\Program Files\\\\Python311\\\\python.exe\" -m venv \"d:\\\\Polymarket Bot\\\\.venv\")",
+      "PowerShell(& \"d:\\\\Polymarket Bot\\\\.venv\\\\Scripts\\\\python.exe\" --version)"
+    ]
+  }
+}

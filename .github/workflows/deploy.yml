@@ -1,0 +1,33 @@
+name: Deploy Bot to DigitalOcean
+
+# Запускать скрипт при каждом push в ветку main (или master, проверьте как она у вас называется)
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачиваем свежий код из репозитория
+        uses: actions/checkout@v4
+
+      - name: Копируем файлы на сервер
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: root
+          password: ${{ secrets.SERVER_PASSWORD }}
+          source: "."
+          target: "/root"
+          overwrite: true
+
+      - name: Перезапускаем бота на сервере
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: root
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            systemctl restart bot

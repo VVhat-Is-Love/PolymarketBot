@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client",
+    "sqlalchemy>=2.0",
+    "alembic",
+    "pydantic-settings>=2.0",
+    "python-dotenv",
+    "requests",
+    "schedule",
+    "loguru",
+    "tenacity",
+    "openmeteo-requests",
+    "requests-cache",
+    "retry-requests",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/strategy", "src/data"]
+omit = ["tests/*"]
