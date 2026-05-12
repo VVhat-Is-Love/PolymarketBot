@@ -30,16 +30,40 @@ def get_clob_client() -> "_ClobClientType":
         if not settings.private_key:
             raise RuntimeError("PRIVATE_KEY is not set — cannot initialise ClobClient")
 
-        _client = ClobClient(
-            host=settings.polymarket_host,
-            chain_id=settings.chain_id,
-            key=settings.private_key,
-            # creds=None → Level 1 (private key signs orders; no API secret needed)
+        has_creds = bool(
+            settings.polymarket_api_key
+            and settings.polymarket_api_secret
+            and settings.polymarket_api_passphrase
         )
+
+        if has_creds:
+            from py_clob_client.clob_types import ApiCreds
+            creds = ApiCreds(
+                api_key=settings.polymarket_api_key,
+                api_secret=settings.polymarket_api_secret,
+                api_passphrase=settings.polymarket_api_passphrase,
+            )
+            _client = ClobClient(
+                host=settings.polymarket_host,
+                chain_id=settings.chain_id,
+                key=settings.private_key,
+                creds=creds,
+                signature_type=2,  # POLY_GNOSIS_SAFE — required for proxy wallet
+            )
+            level = "Level 2 (can place orders + query balance)"
+        else:
+            _client = ClobClient(
+                host=settings.polymarket_host,
+                chain_id=settings.chain_id,
+                key=settings.private_key,
+            )
+            level = "Level 1 (read-only — add API credentials to place orders)"
+
         logger.info(
             f"ClobClient initialised: host={settings.polymarket_host} "
             f"chain_id={settings.chain_id} "
-            f"wallet={settings.proxy_wallet_address[:10]}…"
+            f"wallet={settings.proxy_wallet_address[:10] if settings.proxy_wallet_address else 'N/A'}… "
+            f"auth={level}"
         )
         return _client
 

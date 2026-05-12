@@ -12,6 +12,7 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import time
 from loguru import logger
 
 
@@ -150,27 +151,40 @@ def run_telegram_bot() -> None:
         logger.error("[telegram_bot] python-telegram-bot not installed — bot disabled")
         return
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    while True:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    async def _run():
-        app = Application.builder().token(token).build()
-        app.add_handler(CommandHandler("status", cmd_status))
-        app.add_handler(CommandHandler("stop", cmd_stop))
-        app.add_handler(CommandHandler("start", cmd_start))
-        app.add_handler(CommandHandler("trades", cmd_trades))
-        app.add_handler(CommandHandler("risk", cmd_risk))
+        async def _run():
+            app = (
+                Application.builder()
+                .token(token)
+                .connect_timeout(30.0)
+                .read_timeout(30.0)
+                .write_timeout(30.0)
+                .pool_timeout(30.0)
+                .build()
+            )
+            app.add_handler(CommandHandler("status", cmd_status))
+            app.add_handler(CommandHandler("stop", cmd_stop))
+            app.add_handler(CommandHandler("start", cmd_start))
+            app.add_handler(CommandHandler("trades", cmd_trades))
+            app.add_handler(CommandHandler("risk", cmd_risk))
 
-        async with app:
-            await app.start()
-            logger.info("[telegram_bot] Starting polling…")
-            await app.updater.start_polling(drop_pending_updates=True)
-            logger.info("[telegram_bot] Polling active — waiting for commands")
-            await asyncio.Event().wait()  # block until thread is killed
+            async with app:
+                await app.start()
+                logger.info("[telegram_bot] Starting polling…")
+                await app.updater.start_polling(drop_pending_updates=True)
+                logger.info("[telegram_bot] Polling active — waiting for commands")
+                await asyncio.Event().wait()
 
-    try:
-        loop.run_until_complete(_run())
-    except Exception as exc:
-        logger.error(f"[telegram_bot] Fatal: {exc}")
-    finally:
-        loop.close()
+        try:
+            loop.run_until_complete(_run())
+            break  # clean exit — stop retrying
+        except Exception as exc:
+            logger.warning(f"[telegram_bot] Connection error: {exc} — retrying in 60s")
+            try:
+                loop.close()
+            except Exception:
+                pass
+            time.sleep(60)

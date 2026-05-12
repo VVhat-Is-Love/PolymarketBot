@@ -72,6 +72,68 @@ def _report_open_trades() -> None:
         session.close()
 
 
+def _report_live_status() -> None:
+    from sqlalchemy import select
+    from src.db.session import get_session
+    from src.db.models import LiveTrade
+    from src.strategy.live_trader import _get_wallet_balance
+
+    logger.info("=" * 55)
+    logger.info("LIVE ACCOUNT STATUS")
+    logger.info("=" * 55)
+
+    # Wallet balance
+    try:
+        wallet = _get_wallet_balance()
+        logger.info(f"  Wallet balance : ${wallet:.2f} USDC")
+    except Exception as exc:
+        logger.warning(f"  Wallet balance : ERROR — {exc}")
+
+    session = get_session()
+    try:
+        all_trades: list[LiveTrade] = list(
+            session.execute(select(LiveTrade)).scalars().all()
+        )
+
+        open_trades = [t for t in all_trades if t.status in ("pending", "open")]
+        filled = [t for t in all_trades if t.status == "filled"]
+        expired = [t for t in all_trades if t.status == "expired"]
+        cancelled = [t for t in all_trades if t.status == "cancelled"]
+
+        total_pnl = sum(t.pnl_usd or 0.0 for t in all_trades)
+        total_staked_filled = sum(t.stake_usd for t in filled)
+
+        logger.info(
+            f"  Open positions : {len(open_trades)} | "
+            f"Filled: {len(filled)} | Expired: {len(expired)} | Cancelled: {len(cancelled)}"
+        )
+        logger.info(
+            f"  Total staked   : ${total_staked_filled:.2f} (filled orders only)"
+        )
+        logger.info(f"  Total PnL      : ${total_pnl:+.2f}")
+
+        if open_trades:
+            logger.info("  --- Open positions ---")
+            for t in open_trades:
+                logger.info(
+                    f"    {t.city or t.group_id} {t.bin_label} | "
+                    f"stake=${t.stake_usd:.2f} @ ${t.target_price:.4f} | {t.status}"
+                )
+
+        if filled:
+            logger.info("  --- Last 5 filled ---")
+            for t in sorted(filled, key=lambda x: x.filled_at or x.placed_at, reverse=True)[:5]:
+                pnl = f"PnL ${t.pnl_usd:+.2f}" if t.pnl_usd is not None else "PnL ?"
+                logger.info(
+                    f"    {t.city or t.group_id} {t.bin_label} | "
+                    f"${t.stake_usd:.2f} @ ${t.filled_price or t.target_price:.4f} | {pnl}"
+                )
+    finally:
+        session.close()
+
+    logger.info("=" * 55)
+
+
 def main() -> None:
     _setup_logging()
 
@@ -85,6 +147,9 @@ def main() -> None:
 
     from src.config.settings import settings
     logger.info(f"Trading mode: {settings.trading_mode.upper()}")
+
+    if settings.trading_mode == "live":
+        _report_live_status()
 
     # ---- Thread 1: scheduler (data collection + trading) ----
     from src.scheduler import run_forever
