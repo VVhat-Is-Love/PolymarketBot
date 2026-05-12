@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     polygon_rpc_url: str = Field(default="")
     private_key: str = Field(default="")
     proxy_wallet_address: str = Field(default="")
+    eoa_wallet_address: str = Field(default="")
 
     telegram_bot_token: str = Field(default="")
     admin_telegram_id: str = Field(default="")

@@ -73,47 +73,116 @@ def _report_open_trades() -> None:
 
 
 def _report_live_status() -> None:
+    import requests as _req
     from sqlalchemy import select
     from src.db.session import get_session
     from src.db.models import LiveTrade
-    from src.strategy.live_trader import _get_wallet_balance
+    from src.config.settings import settings
 
-    logger.info("=" * 55)
-    logger.info("LIVE ACCOUNT STATUS")
-    logger.info("=" * 55)
+    sep = "=" * 58
+    logger.info(sep)
+    logger.info("  LIVE ACCOUNT STATUS")
+    logger.info(sep)
 
-    # Wallet balance
+    eoa = settings.eoa_wallet_address
+    proxy = settings.proxy_wallet_address
+
+    # ── On-chain: EOA wallet (MetaMask) ─────────────────────
     try:
-        wallet = _get_wallet_balance()
-        logger.info(f"  Wallet balance : ${wallet:.2f} USDC")
+        from src.blockchain.balance import get_usdc_balance, get_matic_balance
+        if eoa:
+            usdc_eoa = get_usdc_balance(eoa)
+            logger.info(f"  ✅  USDC в кошельке (EOA):          ${usdc_eoa:.2f}")
+            matic = get_matic_balance(eoa)
+            if matic < 0.1:
+                logger.warning(f"  ⚠️   MATIC (газ):                  {matic:.4f} — МАЛО!")
+            else:
+                logger.info(f"  ✅  MATIC (газ):                    {matic:.4f}")
+        else:
+            logger.warning("  ⚠️   EOA_WALLET_ADDRESS не задан — on-chain балансы пропущены")
     except Exception as exc:
-        logger.warning(f"  Wallet balance : ERROR — {exc}")
+        logger.warning(f"  ❌  On-chain балансы (EOA): {exc}")
 
+    # ── CLOB L2 auth + history ───────────────────────────────
+    try:
+        from src.blockchain.polymarket_auth import get_clob_client
+        client = get_clob_client()
+        orders = client.get_orders()
+        order_count = len(orders) if isinstance(orders, list) else "?"
+        logger.info(f"  ✅  CLOB L2 авторизация | Открытых ордеров: {order_count}")
+
+        trades_api = client.get_trades()
+        trade_count = len(trades_api) if isinstance(trades_api, list) else "?"
+        logger.info(f"  ✅  История трейдов (CLOB) | Всего: {trade_count}")
+    except Exception as exc:
+        logger.warning(f"  ❌  CLOB API: {exc}")
+
+    # ── Polymarket portfolio via data-api (proxy wallet) ────
+    if proxy:
+        try:
+            resp = _req.get(
+                "https://data-api.polymarket.com/value",
+                params={"user": proxy},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                item = data[0] if isinstance(data, list) and data else data
+                value = float(item.get("value", item.get("cashBalance", 0)))
+                logger.info(f"  ✅  Портфель Polymarket (proxy):    ${value:.2f} USDC")
+            else:
+                logger.warning(f"  ⚠️   data-api вернул {resp.status_code}: {resp.text[:80]}")
+        except Exception as exc:
+            logger.warning(f"  ⚠️   Портфель Polymarket: {exc}")
+
+        try:
+            resp2 = _req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": proxy},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            if resp2.status_code == 200:
+                positions = resp2.json()
+                if positions:
+                    logger.info(f"  ✅  Открытых позиций: {len(positions)}")
+                    for p in positions[:3]:
+                        title = p.get("title", "Unknown")[:38]
+                        outcome = p.get("outcome", "?")
+                        size = float(p.get("size", 0))
+                        price = float(p.get("currentPrice", 0))
+                        logger.info(f"       • {title} | {outcome} | {size:.2f} × ${price:.3f}")
+                else:
+                    logger.info("  ✅  Открытых позиций нет")
+        except Exception as exc:
+            logger.warning(f"  ⚠️   Позиции: {exc}")
+    else:
+        logger.warning("  ⚠️   PROXY_WALLET_ADDRESS не задан — портфель Polymarket пропущен")
+
+    # ── Local DB trade stats ─────────────────────────────────
     session = get_session()
     try:
         all_trades: list[LiveTrade] = list(
             session.execute(select(LiveTrade)).scalars().all()
         )
-
         open_trades = [t for t in all_trades if t.status in ("pending", "open")]
         filled = [t for t in all_trades if t.status == "filled"]
         expired = [t for t in all_trades if t.status == "expired"]
         cancelled = [t for t in all_trades if t.status == "cancelled"]
-
         total_pnl = sum(t.pnl_usd or 0.0 for t in all_trades)
-        total_staked_filled = sum(t.stake_usd for t in filled)
+        total_staked = sum(t.stake_usd for t in filled)
 
         logger.info(
-            f"  Open positions : {len(open_trades)} | "
-            f"Filled: {len(filled)} | Expired: {len(expired)} | Cancelled: {len(cancelled)}"
+            f"  ✅  DB сделки: открытых={len(open_trades)} | "
+            f"исполнено={len(filled)} | истекло={len(expired)} | отменено={len(cancelled)}"
         )
         logger.info(
-            f"  Total staked   : ${total_staked_filled:.2f} (filled orders only)"
+            f"       Поставлено (исполнено): ${total_staked:.2f} | PnL: ${total_pnl:+.2f}"
         )
-        logger.info(f"  Total PnL      : ${total_pnl:+.2f}")
 
         if open_trades:
-            logger.info("  --- Open positions ---")
+            logger.info("  --- Открытые позиции (DB) ---")
             for t in open_trades:
                 logger.info(
                     f"    {t.city or t.group_id} {t.bin_label} | "
@@ -121,17 +190,17 @@ def _report_live_status() -> None:
                 )
 
         if filled:
-            logger.info("  --- Last 5 filled ---")
+            logger.info("  --- Последние 5 исполненных ---")
             for t in sorted(filled, key=lambda x: x.filled_at or x.placed_at, reverse=True)[:5]:
-                pnl = f"PnL ${t.pnl_usd:+.2f}" if t.pnl_usd is not None else "PnL ?"
+                pnl_str = f"PnL ${t.pnl_usd:+.2f}" if t.pnl_usd is not None else "PnL ?"
                 logger.info(
                     f"    {t.city or t.group_id} {t.bin_label} | "
-                    f"${t.stake_usd:.2f} @ ${t.filled_price or t.target_price:.4f} | {pnl}"
+                    f"${t.stake_usd:.2f} @ ${t.filled_price or t.target_price:.4f} | {pnl_str}"
                 )
     finally:
         session.close()
 
-    logger.info("=" * 55)
+    logger.info(sep)
 
 
 def main() -> None:

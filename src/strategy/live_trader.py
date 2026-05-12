@@ -70,6 +70,21 @@ _balance_cache: Optional[tuple[float, datetime]] = None
 _BALANCE_TTL = timedelta(hours=1)
 
 
+def _fetch_balance_blockchain() -> Optional[float]:
+    """Read USDC balance directly from Polygon blockchain (native USDC contract)."""
+    try:
+        from src.config.settings import settings
+        from src.blockchain.balance import get_usdc_balance
+        wallet = settings.proxy_wallet_address
+        if not wallet:
+            return None
+        bal = get_usdc_balance(wallet)
+        return bal if bal > 0 else None
+    except Exception as exc:
+        logger.warning(f"[live_trader] Blockchain balance failed: {exc}")
+    return None
+
+
 def _fetch_balance_from_api() -> Optional[float]:
     """Query USDC collateral balance via CLOB API. Requires Level 2 credentials."""
     try:
@@ -82,7 +97,8 @@ def _fetch_balance_from_api() -> Optional[float]:
         if isinstance(resp, dict):
             raw = resp.get("balance") or resp.get("allowance")
             if raw is not None:
-                bal = float(raw)
+                # CLOB API returns raw USDC units (6 decimals); convert to USD
+                bal = float(raw) / 1e6
                 if bal > 0:
                     return bal
     except Exception as exc:
@@ -93,28 +109,34 @@ def _fetch_balance_from_api() -> Optional[float]:
 def _get_wallet_balance() -> float:
     """
     Return USDC balance, using a 1-hour cache to avoid hammering the API.
-    Priority: cached value → CLOB API (Level 2) → LIVE_WALLET_BALANCE_USD (.env).
+    Priority: cached → blockchain (web3) → CLOB API (Level 2) → LIVE_WALLET_BALANCE_USD (.env).
     """
     global _balance_cache
     from src.config.settings import settings
 
     now = datetime.utcnow()
 
-    # Return cached value if still fresh
     if _balance_cache is not None:
         cached_val, cached_at = _balance_cache
         if now - cached_at < _BALANCE_TTL:
             logger.debug(f"[live_trader] Wallet balance (cached): ${cached_val:.2f}")
             return cached_val
 
-    # Try CLOB API (works with Level 2 credentials)
-    bal = _fetch_balance_from_api()
+    # 1. Blockchain — reads native USDC directly, no API credentials needed
+    bal = _fetch_balance_blockchain()
     if bal is not None:
-        logger.info(f"[live_trader] Wallet balance from API: ${bal:.2f}")
+        logger.info(f"[live_trader] Wallet balance from blockchain: ${bal:.2f}")
         _balance_cache = (bal, now)
         return bal
 
-    # Fallback: manual env var
+    # 2. CLOB API — Level 2 credentials required
+    bal = _fetch_balance_from_api()
+    if bal is not None:
+        logger.info(f"[live_trader] Wallet balance from CLOB API: ${bal:.2f}")
+        _balance_cache = (bal, now)
+        return bal
+
+    # 3. Manual fallback
     fallback = settings.live_wallet_balance_usd
     if fallback > 0:
         logger.info(f"[live_trader] Wallet balance from .env: ${fallback:.2f}")
@@ -123,8 +145,7 @@ def _get_wallet_balance() -> float:
 
     logger.warning(
         "[live_trader] Wallet balance unknown. "
-        "Add API credentials (Level 2) for auto-fetch, "
-        "or set LIVE_WALLET_BALANCE_USD=<amount> in .env as fallback."
+        "Set POLYGON_RPC_URL in .env for automatic blockchain reading."
     )
     return 0.0
 

@@ -1,6 +1,7 @@
 """
-Polymarket CLOB client factory — Level 1 auth (private key, no API secret required).
-Chain ID 137 = Polygon mainnet.
+Polymarket CLOB client factory.
+Supports Level 1 (private key only) and Level 2 (+ API credentials).
+Use derive_api_credentials() once to generate credentials from your private key.
 """
 from __future__ import annotations
 
@@ -48,7 +49,8 @@ def get_clob_client() -> "_ClobClientType":
                 chain_id=settings.chain_id,
                 key=settings.private_key,
                 creds=creds,
-                signature_type=2,  # POLY_GNOSIS_SAFE — required for proxy wallet
+                signature_type=2,      # POLY_GNOSIS_SAFE — required for proxy wallet
+                funder=settings.proxy_wallet_address or None,
             )
             level = "Level 2 (can place orders + query balance)"
         else:
@@ -56,6 +58,7 @@ def get_clob_client() -> "_ClobClientType":
                 host=settings.polymarket_host,
                 chain_id=settings.chain_id,
                 key=settings.private_key,
+                funder=settings.proxy_wallet_address or None,
             )
             level = "Level 1 (read-only — add API credentials to place orders)"
 
@@ -73,3 +76,37 @@ def reset_clob_client() -> None:
     global _client
     with _lock:
         _client = None
+
+
+def derive_api_credentials() -> None:
+    """
+    Derive Level 2 API credentials from your private key (one-time setup).
+
+    Run this once:  python -c "from src.blockchain.polymarket_auth import derive_api_credentials; derive_api_credentials()"
+
+    Prints POLYMARKET_API_KEY / _SECRET / _PASSPHRASE to stdout.
+    Copy them into .env — do NOT run this again after saving (it may rotate the key).
+    """
+    from src.config.settings import settings
+    from py_clob_client.client import ClobClient
+
+    if not settings.private_key:
+        raise RuntimeError("PRIVATE_KEY is not set in .env")
+
+    client = ClobClient(
+        host=settings.polymarket_host,
+        chain_id=settings.chain_id,
+        key=settings.private_key,
+    )
+
+    creds = client.create_or_derive_api_creds()
+
+    print("\n" + "=" * 60)
+    print("  Polymarket API credentials (copy to .env)")
+    print("=" * 60)
+    print(f"POLYMARKET_API_KEY={creds.api_key}")
+    print(f"POLYMARKET_API_SECRET={creds.api_secret}")
+    print(f"POLYMARKET_API_PASSPHRASE={creds.api_passphrase}")
+    print("=" * 60)
+    print("  Save these to .env and restart the bot.")
+    print("=" * 60 + "\n")
