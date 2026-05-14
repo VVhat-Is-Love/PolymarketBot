@@ -103,13 +103,19 @@ def _report_live_status() -> None:
     except Exception as exc:
         logger.warning(f"  ❌  On-chain балансы (EOA): {exc}")
 
-    # ── CLOB L2 auth + history ───────────────────────────────
+    # ── CLOB V2 auth + balance + history ─────────────────────
+    client = None
     try:
         from src.blockchain.polymarket_auth import get_clob_client
+        from src.blockchain.balance import get_polymarket_cash_balance
+        from py_clob_client_v2 import OpenOrderParams
         client = get_clob_client()
-        orders = client.get_orders()
+        orders = client.get_open_orders(OpenOrderParams())
         order_count = len(orders) if isinstance(orders, list) else "?"
-        logger.info(f"  ✅  CLOB L2 авторизация | Открытых ордеров: {order_count}")
+        logger.info(f"  ✅  CLOB V2 авторизация | Открытых ордеров: {order_count}")
+
+        cash = get_polymarket_cash_balance(client)
+        logger.info(f"  ✅  Портфель Polymarket (pUSD):     ${cash:.2f}")
 
         trades_api = client.get_trades()
         trade_count = len(trades_api) if isinstance(trades_api, list) else "?"
@@ -117,25 +123,8 @@ def _report_live_status() -> None:
     except Exception as exc:
         logger.warning(f"  ❌  CLOB API: {exc}")
 
-    # ── Polymarket portfolio via data-api (proxy wallet) ────
+    # ── Polymarket open positions via data-api ────────────────
     if proxy:
-        try:
-            resp = _req.get(
-                "https://data-api.polymarket.com/value",
-                params={"user": proxy},
-                headers={"Accept": "application/json"},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                item = data[0] if isinstance(data, list) and data else data
-                value = float(item.get("value", item.get("cashBalance", 0)))
-                logger.info(f"  ✅  Портфель Polymarket (proxy):    ${value:.2f} USDC")
-            else:
-                logger.warning(f"  ⚠️   data-api вернул {resp.status_code}: {resp.text[:80]}")
-        except Exception as exc:
-            logger.warning(f"  ⚠️   Портфель Polymarket: {exc}")
-
         try:
             resp2 = _req.get(
                 "https://data-api.polymarket.com/positions",
@@ -145,6 +134,7 @@ def _report_live_status() -> None:
             )
             if resp2.status_code == 200:
                 positions = resp2.json()
+                logger.debug(f"[live_status] /positions raw count: {len(positions) if isinstance(positions, list) else '?'}")
                 if positions:
                     logger.info(f"  ✅  Открытых позиций: {len(positions)}")
                     for p in positions[:3]:
@@ -155,6 +145,8 @@ def _report_live_status() -> None:
                         logger.info(f"       • {title} | {outcome} | {size:.2f} × ${price:.3f}")
                 else:
                     logger.info("  ✅  Открытых позиций нет")
+            else:
+                logger.warning(f"  ⚠️   data-api /positions вернул {resp2.status_code}: {resp2.text[:120]}")
         except Exception as exc:
             logger.warning(f"  ⚠️   Позиции: {exc}")
     else:

@@ -1,7 +1,6 @@
 """
-Polymarket CLOB client factory.
-Supports Level 1 (private key only) and Level 2 (+ API credentials).
-Use derive_api_credentials() once to generate credentials from your private key.
+Polymarket CLOB V2 client factory.
+Uses py-clob-client-v2 (1.0.1+). Supports Level 1 and Level 2 auth.
 """
 from __future__ import annotations
 
@@ -11,14 +10,14 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 if TYPE_CHECKING:
-    from py_clob_client.client import ClobClient as _ClobClientType
+    from py_clob_client_v2 import ClobClient as _ClobClientType
 
 _lock = threading.Lock()
 _client: "_ClobClientType | None" = None
 
 
 def get_clob_client() -> "_ClobClientType":
-    """Return the singleton ClobClient (Level 1 auth).  Thread-safe."""
+    """Return the singleton V2 ClobClient. Thread-safe."""
     global _client
     if _client is not None:
         return _client
@@ -26,7 +25,7 @@ def get_clob_client() -> "_ClobClientType":
         if _client is not None:
             return _client
         from src.config.settings import settings
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2 import ClobClient
 
         if not settings.private_key:
             raise RuntimeError("PRIVATE_KEY is not set — cannot initialise ClobClient")
@@ -37,8 +36,12 @@ def get_clob_client() -> "_ClobClientType":
             and settings.polymarket_api_passphrase
         )
 
+        # POLY_PROXY (1): EOA key signs on behalf of the proxy wallet (funder).
+        # Required in V2 — without funder the API rejects orders as "maker address not allowed".
+        proxy = settings.proxy_wallet_address or None
+
         if has_creds:
-            from py_clob_client.clob_types import ApiCreds
+            from py_clob_client_v2 import ApiCreds
             creds = ApiCreds(
                 api_key=settings.polymarket_api_key,
                 api_secret=settings.polymarket_api_secret,
@@ -49,8 +52,8 @@ def get_clob_client() -> "_ClobClientType":
                 chain_id=settings.chain_id,
                 key=settings.private_key,
                 creds=creds,
-                signature_type=2,      # POLY_GNOSIS_SAFE — required for proxy wallet
-                funder=settings.proxy_wallet_address or None,
+                signature_type=1,   # POLY_PROXY
+                funder=proxy,
             )
             level = "Level 2 (can place orders + query balance)"
         else:
@@ -58,14 +61,14 @@ def get_clob_client() -> "_ClobClientType":
                 host=settings.polymarket_host,
                 chain_id=settings.chain_id,
                 key=settings.private_key,
-                funder=settings.proxy_wallet_address or None,
+                signature_type=1,   # POLY_PROXY
+                funder=proxy,
             )
             level = "Level 1 (read-only — add API credentials to place orders)"
 
         logger.info(
-            f"ClobClient initialised: host={settings.polymarket_host} "
+            f"ClobClient V2 initialised: host={settings.polymarket_host} "
             f"chain_id={settings.chain_id} "
-            f"wallet={settings.proxy_wallet_address[:10] if settings.proxy_wallet_address else 'N/A'}… "
             f"auth={level}"
         )
         return _client
@@ -88,7 +91,7 @@ def derive_api_credentials() -> None:
     Copy them into .env — do NOT run this again after saving (it may rotate the key).
     """
     from src.config.settings import settings
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2 import ClobClient
 
     if not settings.private_key:
         raise RuntimeError("PRIVATE_KEY is not set in .env")
@@ -99,7 +102,7 @@ def derive_api_credentials() -> None:
         key=settings.private_key,
     )
 
-    creds = client.create_or_derive_api_creds()
+    creds = client.create_or_derive_api_key()
 
     print("\n" + "=" * 60)
     print("  Polymarket API credentials (copy to .env)")

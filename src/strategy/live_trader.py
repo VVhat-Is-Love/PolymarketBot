@@ -348,13 +348,13 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                 f"total_stake=${total_stake:.2f} bins={len(role_stakes)}"
             )
 
-            # ---- Record in risk manager and place orders ----
-            risk_manager.record_bet_placed(group.group_id, total_stake, strategy="live")
+            # ---- Place orders (record in risk manager only after first success) ----
             notifier.send(
                 f"📤 Новая корзина: {group.city} {group.resolution_date}\n"
                 f"Stake: ${total_stake:.2f} | Bins: {len(role_stakes)}"
             )
 
+            risk_recorded = False
             for role, mkt, price, bin_stake in role_stakes:
                 size_shares = round(bin_stake / price, 6) if price > 0 else 0.0
                 token_id = mkt.token_id_yes or ""
@@ -399,6 +399,11 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                     session.commit()
                     logger.warning(f"[live_trader] Order placement failed for {mkt.market_id}")
                     continue
+
+                # Record in risk manager only after first successful order
+                if not risk_recorded:
+                    risk_manager.record_bet_placed(group.group_id, total_stake, strategy="live")
+                    risk_recorded = True
 
                 trade.order_id = order_id
                 trade.status = "open"

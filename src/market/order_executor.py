@@ -1,6 +1,5 @@
 """
-Order execution via Polymarket CLOB API.
-All order methods check RiskManager before placing.
+Order execution via Polymarket CLOB V2 API.
 Exponential backoff: 3 attempts with 1s / 2s / 4s delays.
 """
 from __future__ import annotations
@@ -10,10 +9,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 from loguru import logger
-from src.risk.risk_manager import risk_manager
 
 _BACKOFF = [1, 2, 4]
-_TIMEOUT = 10  # seconds, passed to underlying HTTP client where supported
 
 
 @dataclass
@@ -56,11 +53,11 @@ def place_limit_order(
     size: float,
 ) -> str | None:
     """
-    Place a limit order.  Returns order_id on success, None on failure.
-    Pre-checks RiskManager; if rejected, logs and returns None.
-    bet_size_usd = price * size (approximation for risk check).
+    Place a GTC limit order via CLOB V2.
+    Returns order_id on success, None on failure.
     """
-    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions, OrderType
+    from src.risk.risk_manager import risk_manager
 
     bet_size_approx = round(price * size, 4)
     allowed, reason = risk_manager.can_place_order(bet_size_approx)
@@ -71,18 +68,20 @@ def place_limit_order(
         )
         return None
 
-    # py-clob-client accepts side as a string: 'BUY' or 'SELL'
-    clob_side = side.upper()
-
     def _place():
         client = _get_client()
+        tick_size = client.get_tick_size(token_id)
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=size,
-            side=clob_side,  # 'BUY' or 'SELL'
+            side=side,  # "BUY" or "SELL" — V2 accepts both string and Side enum
         )
-        return client.create_and_post_order(order_args)
+        return client.create_and_post_order(
+            order_args=order_args,
+            options=PartialCreateOrderOptions(tick_size=tick_size),
+            order_type=OrderType.GTC,
+        )
 
     try:
         resp = _with_backoff(
@@ -102,10 +101,12 @@ def place_limit_order(
 
 
 def cancel_order(order_id: str) -> bool:
-    """Cancel an open order.  Returns True on success."""
+    """Cancel an open order. Returns True on success."""
+    from py_clob_client_v2 import OrderPayload
+
     def _cancel():
         client = _get_client()
-        return client.cancel(order_id)
+        return client.cancel_order(OrderPayload(orderID=order_id))
 
     try:
         _with_backoff(
@@ -120,7 +121,7 @@ def cancel_order(order_id: str) -> bool:
 
 
 def get_order_status(order_id: str) -> Literal["open", "filled", "cancelled", "unknown"]:
-    """Poll the CLOB API for current order status."""
+    """Poll the CLOB V2 API for current order status."""
     def _get():
         client = _get_client()
         return client.get_order(order_id)
@@ -131,7 +132,6 @@ def get_order_status(order_id: str) -> Literal["open", "filled", "cancelled", "u
             module="order_executor",
             method="get_order_status",
         )
-        # py-clob-client returns a dict; status field varies by version
         if isinstance(resp, dict):
             raw = (resp.get("status") or resp.get("orderStatus") or "").upper()
         else:
@@ -154,10 +154,11 @@ def get_order_status(order_id: str) -> Literal["open", "filled", "cancelled", "u
 
 def get_open_orders() -> list[Order]:
     """Return all currently open orders for this account."""
+    from py_clob_client_v2 import OpenOrderParams
+
     def _get():
         client = _get_client()
-        from py_clob_client.clob_types import OpenOrderParams
-        return client.get_orders(OpenOrderParams())
+        return client.get_open_orders(OpenOrderParams())
 
     try:
         resp = _with_backoff(

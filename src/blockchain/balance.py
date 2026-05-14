@@ -1,6 +1,8 @@
 """
 Polygon blockchain balance reader.
-Uses native USDC (0x3c499c542...) — NOT the old bridged USDC.e (0x2791...).
+- get_usdc_balance: native USDC on EOA (MetaMask wallet)
+- get_pusd_balance: pUSD (PolyUSD) on-chain balance for proxy/EOA wallet
+- get_polymarket_cash_balance: CLOB V2 API balance (funds inside the exchange)
 Falls back through public RPCs if POLYGON_RPC_URL fails or is unset.
 """
 from __future__ import annotations
@@ -114,3 +116,46 @@ def get_matic_balance(wallet_address: str) -> float:
     except Exception as exc:
         logger.warning(f"[balance] MATIC balance failed: {exc}")
         return 0.0
+
+# pUSD (PolyUSD) — Polymarket V2 collateral token on Polygon
+PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+
+
+def get_pusd_balance(wallet_address: str) -> float:
+    """Read pUSD (PolyUSD) on-chain balance. Polymarket V2 stores deposits in pUSD."""
+    from web3 import Web3
+
+    checksum = Web3.to_checksum_address(wallet_address)
+    for attempt in range(3):
+        try:
+            w3 = _get_web3()
+            pusd = w3.eth.contract(
+                address=Web3.to_checksum_address(PUSD_ADDRESS),
+                abi=_USDC_ABI,
+            )
+            raw = pusd.functions.balanceOf(checksum).call()
+            decimals = pusd.functions.decimals().call()
+            return raw / (10 ** decimals)
+        except Exception as exc:
+            logger.warning(f"[balance] pUSD read attempt {attempt + 1}/3 failed: {exc}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return 0.0
+
+
+def get_polymarket_cash_balance(client) -> float:
+    """
+    Read USDC balance held inside Polymarket exchange via CLOB V2 API.
+    Returns amount in USD. Uses get_balance_allowance (COLLATERAL asset type).
+    """
+    try:
+        from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+        resp = client.get_balance_allowance(
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        if isinstance(resp, dict):
+            raw = resp.get("balance") or resp.get("allowance") or 0
+            return float(raw) / 1e6
+    except Exception as exc:
+        logger.warning(f"[balance] CLOB cash balance failed: {exc}")
+    return 0.0
