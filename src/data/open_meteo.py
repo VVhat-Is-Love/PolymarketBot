@@ -76,6 +76,15 @@ def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 3)
                 "timezone": "auto",
             }
             responses = om.weather_api(FORECAST_URL, params=params)
+            
+            if not responses:
+                logger.warning(
+                    f"[{city}] model={model}: Open-Meteo returned empty response "
+                    f"(forecast_days={days}), skipping"
+                )
+                continue
+
+            
             model_snaps = _parse_daily(responses[0], model, city, days)
             snapshots.extend(model_snaps)
             logger.debug(f"Open-Meteo {model} → {city}: {len(model_snaps)} days")

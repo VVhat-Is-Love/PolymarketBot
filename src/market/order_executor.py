@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from loguru import logger
+from src.risk.risk_manager import risk_manager
 
 _BACKOFF = [1, 2, 4]
 
@@ -45,6 +46,10 @@ def _with_backoff(fn, *, module: str, method: str, market_id: str = ""):
     raise last_err
 
 
+_MIN_SHARES = 5.0   # Polymarket V2: minimum shares per order
+_MIN_USD    = 1.0   # Polymarket V2: minimum notional per order
+
+
 def place_limit_order(
     market_id: str,
     token_id: str,
@@ -57,9 +62,28 @@ def place_limit_order(
     Returns order_id on success, None on failure.
     """
     from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions, OrderType
-    from src.risk.risk_manager import risk_manager
 
-    bet_size_approx = round(price * size, 4)
+    # ── Polymarket V2 minimum-size pre-checks ─────────────────────────────────
+    # These are hard API limits; skip early to avoid burning 3 retry attempts.
+    if size < _MIN_SHARES:
+        logger.warning(
+            f"[order_executor] SKIPPED (below min shares): "
+            f"market_id={market_id} side={side} price={price} size={size:.4f} "
+            f"(min={_MIN_SHARES} shares)"
+        )
+        return None
+
+    notional = price * size
+    if notional < _MIN_USD:
+        logger.warning(
+            f"[order_executor] SKIPPED (below min notional): "
+            f"market_id={market_id} side={side} price={price} size={size:.4f} "
+            f"notional=${notional:.4f} (min=${_MIN_USD})"
+        )
+        return None
+    # ──────────────────────────────────────────────────────────────────────────
+
+    bet_size_approx = round(notional, 4)
     allowed, reason = risk_manager.can_place_order(bet_size_approx)
     if not allowed:
         logger.warning(
@@ -96,7 +120,12 @@ def place_limit_order(
             f"side={side} price={price} size={size:.4f} order_id={order_id}"
         )
         return order_id
-    except Exception:
+    except Exception as exc:
+        logger.error(
+            f"[order_executor] place_limit_order FAILED: market_id={market_id} "
+            f"side={side} price={price} size={size} "
+            f"error={type(exc).__name__}: {str(exc)[:300]}"
+        )
         return None
 
 

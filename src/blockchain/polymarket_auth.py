@@ -1,6 +1,12 @@
 """
 Polymarket CLOB V2 client factory.
 Uses py-clob-client-v2 (1.0.1+). Supports Level 1 and Level 2 auth.
+
+Working configuration (confirmed 2026-05-25):
+  signature_type=3  (POLY_1271 — ERC-1271 via proxy/deposit wallet)
+  funder=PROXY_WALLET_ADDRESS (0x9Ce3E9a1e408B2c635674020db6Ab685294BAC2B)
+  API key bound to EOA: 40c96989-75a0-df6f-76cf-73decc053622
+  Result: orders placed, status=matched, real blockchain transactions confirmed.
 """
 from __future__ import annotations
 
@@ -36,8 +42,9 @@ def get_clob_client() -> "_ClobClientType":
             and settings.polymarket_api_passphrase
         )
 
-        # POLY_PROXY (1): EOA key signs on behalf of the proxy wallet (funder).
-        # Required in V2 — without funder the API rejects orders as "maker address not allowed".
+        # POLY_1271 (3): ERC-1271 signature. EOA signs on behalf of the proxy wallet.
+        # funder = proxy wallet address registered as maker in V2 exchange.
+        # Confirmed working: order.signer=proxy_wallet, signature validated via ERC-1271.
         proxy = settings.proxy_wallet_address or None
 
         if has_creds:
@@ -52,7 +59,7 @@ def get_clob_client() -> "_ClobClientType":
                 chain_id=settings.chain_id,
                 key=settings.private_key,
                 creds=creds,
-                signature_type=1,   # POLY_PROXY
+                signature_type=3,   # POLY_1271 — confirmed working
                 funder=proxy,
             )
             level = "Level 2 (can place orders + query balance)"
@@ -61,7 +68,7 @@ def get_clob_client() -> "_ClobClientType":
                 host=settings.polymarket_host,
                 chain_id=settings.chain_id,
                 key=settings.private_key,
-                signature_type=1,   # POLY_PROXY
+                signature_type=3,   # POLY_1271
                 funder=proxy,
             )
             level = "Level 1 (read-only — add API credentials to place orders)"
@@ -69,6 +76,7 @@ def get_clob_client() -> "_ClobClientType":
         logger.info(
             f"ClobClient V2 initialised: host={settings.polymarket_host} "
             f"chain_id={settings.chain_id} "
+            f"funder={proxy} "
             f"auth={level}"
         )
         return _client

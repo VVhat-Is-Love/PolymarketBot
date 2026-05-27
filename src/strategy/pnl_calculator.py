@@ -1,17 +1,65 @@
 import json
 
 
+# ---------------------------------------------------------------------------
+# New functions — honest EV semantics
+# ---------------------------------------------------------------------------
+
+def basket_gross_return(sum_ask: float) -> float:
+    """
+    Gross return IF the basket contains the winner.
+
+    With equal share counts q on every bin:
+        cost          = q * sum_ask
+        payout_if_hit = q * $1
+        gross_return  = (1 - sum_ask) / sum_ask
+
+    IMPORTANT: this is NOT expected value. It assumes P(winner in basket) = 1.0
+    which is never true. The honest EV is basket_expected_value() below.
+    This function is kept only because checklist.py uses it as a pre-filter.
+    """
+    if not isinstance(sum_ask, (int, float)):
+        return 0.0
+    if not (0.0 < sum_ask < 1.0):
+        return 0.0
+    return (1.0 - sum_ask) / sum_ask
+
+
+def basket_expected_value(p_win_in_basket: float, sum_ask: float) -> float:
+    """
+    Honest EV per $1 of equal-share notional.
+
+    EV = P(winner in basket) - sum(ask prices)
+
+    This is the value that must be POSITIVE to enter a trade.
+    p_win_in_basket should be estimated independently (Gaussian aggregate,
+    normalised market prices) — never assumed to be 1.0.
+    """
+    return p_win_in_basket - sum_ask
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible wrapper — DO NOT REMOVE
+# ---------------------------------------------------------------------------
+
 def calculate_edge(basket_prices: list[float]) -> float:
     """
-    Simple edge model:
-      edge = (1 - sum_prices) / sum_prices
-    Positive edge means the basket is underpriced relative to implied probability of 1.
+    Deprecated wrapper kept for checklist.py compatibility.
+
+    checklist.py calls  calculate_edge([price1, price2, ...])  and expects
+    the function to sum the list internally. Replacing this with a direct
+    alias to basket_gross_return (which expects a pre-summed float) broke
+    that call site with 'float < list' — this wrapper restores the contract.
+
+    Does NOT compute true EV. Use basket_expected_value() for that.
     """
     total = sum(p for p in basket_prices if p is not None)
-    if total <= 0 or total >= 1.0:
-        return 0.0
-    return (1.0 - total) / total
+    return basket_gross_return(total)
 
+
+# ---------------------------------------------------------------------------
+# Basket serialisation / resolution  (unchanged from original)
+# ---------------------------------------------------------------------------
 
 def build_basket_json(basket_items: list) -> str:
     """Serialise basket to JSON for storage in paper_trades."""
@@ -51,6 +99,11 @@ def calculate_pnl(
     """
     Returns (pnl_usd, status).
 
+    With equal shares, every bin in the basket has the same share count q,
+    so the winning bin always pays exactly q * $1 = payout_if_hit regardless
+    of which specific bin wins. This is correct for the equal-share allocation
+    produced by basket_decision.py.
+
     status:
       'resolved_win'     – pnl > 0
       'resolved_partial' – basket bin won but payout < total stake
@@ -69,7 +122,7 @@ def calculate_pnl(
     if not shares:
         return -virtual_stake_usd, "resolved_loss"
 
-    payout = shares * 1.0  # each share pays $1 on win
+    payout = shares * 1.0   # each share pays $1 on win
     pnl = payout - virtual_stake_usd
 
     if pnl > 0:

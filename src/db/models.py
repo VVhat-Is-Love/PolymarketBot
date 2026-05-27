@@ -143,6 +143,10 @@ class PaperTrade(Base):
 
     rejection_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 'basket_wide' | 'basket_narrow' | 'tail_no' | 'manual'
+    strategy_name: Mapped[str] = mapped_column(
+        String(16), server_default="basket_wide", default="basket_wide"
+    )
 
 
 class RejectedMarket(Base):
@@ -202,6 +206,10 @@ class LiveTrade(Base):
     status: Mapped[str] = mapped_column(String, server_default="pending")
     # 'center' | 'plus1' | 'minus1' | 'plus2' | 'minus2'
     basket_role: Mapped[str | None] = mapped_column(String, nullable=True)
+    # 'basket_wide' | 'basket_narrow' | 'tail_no' | 'manual'
+    strategy_name: Mapped[str] = mapped_column(
+        String(16), server_default="basket_wide", default="basket_wide"
+    )
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

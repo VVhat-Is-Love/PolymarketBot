@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -7,7 +7,9 @@ from src.strategy.paper_trader import _get_latest_prices, _get_latest_snapshots,
 from src.db.models import MarketGroup, Market, MarketSnapshot, WeatherSnapshot, PaperTrade
 
 
-def _make_group(city="New York", metric="high_temp", resolution_date=date(2026, 5, 10)) -> MarketGroup:
+def _make_group(city="New York", metric="high_temp", resolution_date=None) -> MarketGroup:
+    if resolution_date is None:
+        resolution_date = date.today() + timedelta(days=10)
     g = MarketGroup()
     g.group_id = "test-group"
     g.city = city

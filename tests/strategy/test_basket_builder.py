@@ -1,3 +1,16 @@
+"""
+Tests for basket_builder.build_basket().
+
+The builder's job: given markets and a price dict, return a contiguous list of
+BasketItems anchored on the MARKET FAVOURITE (highest ask price), expanded to
+neighbouring bins up to basket_max_bins.
+
+KEY DESIGN DECISIONS (as of the current basket_builder):
+  * target_temp is accepted but IGNORED — selection is price-based.
+  * Stakes and shares are NOT set here (always 0.0 / None).
+    Sizing is the job of basket_decision._size_basket.
+  * Returns [] when no bins have valid prices.
+"""
 import pytest
 from unittest.mock import patch
 from src.db.models import Market
@@ -26,35 +39,104 @@ MARKETS = [
 PRICES = {m.market_id: 0.20 for m in MARKETS}
 
 
-def test_center_bin_found():
-    basket = build_basket(MARKETS, 72.0, PRICES)
+# ---------------------------------------------------------------------------
+# Basic behaviour
+# ---------------------------------------------------------------------------
+
+def test_favourite_is_in_basket():
+    """The bin with the highest ask price is always in the basket."""
+    prices = {m.market_id: 0.10 for m in MARKETS}
+    prices["m3"] = 0.55    # m3 is the clear favourite
+    basket = build_basket(MARKETS, 72.0, prices)
     ids = [item.market.market_id for item in basket]
-    assert "m3" in ids  # center bin 70-75 contains 72
+    assert "m3" in ids
 
 
-def test_outside_range_returns_empty():
-    basket = build_basket(MARKETS, 50.0, PRICES)
+def test_no_priced_bins_returns_empty():
+    """build_basket returns [] when no bins have valid prices."""
+    basket = build_basket(MARKETS, 72.0, {})
     assert basket == []
 
 
-def test_stake_allocated_equally():
-    with patch("src.strategy.basket_builder.ss") as mock_ss:
-        mock_ss.strategy_basket_neighbors = 1
-        mock_ss.strategy_basket_include_upside = False
-        mock_ss.strategy_virtual_stake_usd = 10.0
-        basket = build_basket(MARKETS, 72.0, PRICES)
-    # neighbors=1 → center + 1 each side = 3 bins
-    assert len(basket) == 3
-    for item in basket:
-        assert abs(item.stake_usd - 10.0 / 3) < 0.01
+def test_inactive_bins_excluded():
+    """Bins with is_active=False are not included."""
+    inactive_markets = list(MARKETS)
+    dead = _make_market("m99", 85.0, 90.0)
+    dead.is_active = False
+    inactive_markets.append(dead)
+    basket = build_basket(inactive_markets, 72.0, {**PRICES, "m99": 0.50})
+    ids = [item.market.market_id for item in basket]
+    assert "m99" not in ids
 
 
-def test_shares_calculated_from_price():
+# ---------------------------------------------------------------------------
+# basket_max_bins cap
+# ---------------------------------------------------------------------------
+
+def test_respects_basket_max_bins():
+    """build_basket never returns more than basket_max_bins bins."""
     with patch("src.strategy.basket_builder.ss") as mock_ss:
-        mock_ss.strategy_basket_neighbors = 0
-        mock_ss.strategy_basket_include_upside = False
-        mock_ss.strategy_virtual_stake_usd = 10.0
+        mock_ss.basket_max_bins = 3
         basket = build_basket(MARKETS, 72.0, PRICES)
+    assert len(basket) <= 3
+
+
+def test_single_bin_when_max_bins_is_1():
+    """With basket_max_bins=1, exactly the favourite is returned."""
+    prices = {m.market_id: 0.10 for m in MARKETS}
+    prices["m4"] = 0.60    # m4 is the favourite
+    with patch("src.strategy.basket_builder.ss") as mock_ss:
+        mock_ss.basket_max_bins = 1
+        basket = build_basket(MARKETS, 72.0, prices)
     assert len(basket) == 1
-    item = basket[0]
-    assert item.shares == pytest.approx(10.0 / 0.20, rel=1e-4)
+    assert basket[0].market.market_id == "m4"
+
+
+# ---------------------------------------------------------------------------
+# Sizing is NOT the builder's responsibility
+# ---------------------------------------------------------------------------
+
+def test_stake_not_set_by_builder():
+    """stake_usd is always 0.0 out of build_basket — set later by basket_decision."""
+    with patch("src.strategy.basket_builder.ss") as mock_ss:
+        mock_ss.basket_max_bins = 5
+        basket = build_basket(MARKETS, 72.0, PRICES)
+    for item in basket:
+        assert item.stake_usd == 0.0
+
+
+def test_shares_not_set_by_builder():
+    """shares is always None out of build_basket — set later by basket_decision."""
+    with patch("src.strategy.basket_builder.ss") as mock_ss:
+        mock_ss.basket_max_bins = 5
+        basket = build_basket(MARKETS, 72.0, PRICES)
+    for item in basket:
+        assert item.shares is None
+
+
+# ---------------------------------------------------------------------------
+# Expansion direction
+# ---------------------------------------------------------------------------
+
+def test_expands_to_both_sides_when_possible():
+    """When the favourite is in the middle, expansion reaches both neighbours."""
+    prices = {m.market_id: 0.10 for m in MARKETS}
+    prices["m3"] = 0.50    # m3 (middle bin) is the favourite
+    with patch("src.strategy.basket_builder.ss") as mock_ss:
+        mock_ss.basket_max_bins = 3
+        basket = build_basket(MARKETS, 72.0, prices)
+    ids = [item.market.market_id for item in basket]
+    assert "m3" in ids
+    # Both adjacent bins are included (m2 and m4 are symmetric and have equal price)
+    assert len(basket) == 3
+
+
+def test_skips_unpriced_bins():
+    """Bins missing from the price dict are skipped during expansion."""
+    prices = {m.market_id: 0.20 for m in MARKETS}
+    del prices["m2"]    # gap: m1, [no m2], m3, m4, m5
+    with patch("src.strategy.basket_builder.ss") as mock_ss:
+        mock_ss.basket_max_bins = 5
+        basket = build_basket(MARKETS, 72.0, prices)
+    ids = [item.market.market_id for item in basket]
+    assert "m2" not in ids

@@ -95,11 +95,19 @@ def _mock_ss(
     return m
 
 
-def _mock_bss(*, neighbors: int = 1, include_upside: bool = False, stake: float = 10.0):
+def _mock_bss(
+    *,
+    neighbors: int = 1,
+    include_upside: bool = False,
+    stake: float = 10.0,
+    basket_max_bins: int = 5,
+):
     m = MagicMock()
     m.strategy_basket_neighbors = neighbors
     m.strategy_basket_include_upside = include_upside
     m.strategy_virtual_stake_usd = stake
+    # basket_builder.build_basket() uses basket_max_bins (int) to cap expansion
+    m.basket_max_bins = basket_max_bins
     return m
 
 
@@ -207,21 +215,26 @@ def test_rejects_market_too_young():
 
 
 def test_rejects_consensus_near_edge():
-    """Consensus close to the basket boundary (outer 20%) should be rejected."""
-    # Consensus ~68°F. With neighbors=0, basket = single bin 65-70.
-    # basket range: 65-70, width=5, inner 60%: 66-69.
-    # Consensus at ~68.2°F is within inner range, so we need a tighter basket.
-    # Use a 1-bin setup where consensus is at 65.5°F (5% from left edge of 65-70).
-    # basket_lo=65, basket_hi=70, width=5, inner_lo=66, inner_hi=69.
-    # 65.5 < 66 → consensus_near_edge
+    """Consensus close to the basket boundary (outer 20%) should be rejected.
+
+    Setup: m3 (65-70°F) is the clear market favourite — basket_max_bins=1 so only
+    m3 is selected. Consensus at ~65.5°F is just inside the left edge of the 65-70
+    bin but outside the inner 60% zone (inner_lo=66).
+
+    basket_lo=65, basket_hi=70, width=5, inner_lo=66, inner_hi=69.
+    65.5 < inner_lo(66) → consensus_near_edge rejection.
+    """
+    # Make m3 the obvious favourite so build_basket picks it with basket_max_bins=1
+    prices_m3_fav = {m.market_id: 0.05 for m in MARKETS}
+    prices_m3_fav["m3"] = 0.70
     edge_forecasts = [
-        _make_forecast(18.6, 13.0, "open_meteo:ecmwf_ifs025"),  # 18.6C→65.5F
+        _make_forecast(18.6, 13.0, "open_meteo:ecmwf_ifs025"),  # 18.6°C → ~65.5°F
         _make_forecast(18.7, 13.1, "open_meteo:gfs_global"),
         _make_forecast(18.5, 12.9, "open_meteo:icon_global"),
     ]
     with patch("src.strategy.checklist.ss", _mock_ss(max_model_disagreement_c=1.0)), \
-         patch("src.strategy.basket_builder.ss", _mock_bss(neighbors=0, include_upside=False)):
-        result = evaluate_checklist(_make_group(), MARKETS, PRICES, edge_forecasts)
+         patch("src.strategy.basket_builder.ss", _mock_bss(basket_max_bins=1)):
+        result = evaluate_checklist(_make_group(), MARKETS, prices_m3_fav, edge_forecasts)
 
     assert result.passed is False
     assert result.rejection_reason is not None

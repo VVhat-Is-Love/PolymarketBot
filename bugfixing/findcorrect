@@ -1,0 +1,48 @@
+# bugfixing/test_final_working.py
+from py_clob_client_v2 import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions, ApiCreds
+from py_clob_client_v2.order_utils.model.side import Side
+from src.config.settings import settings
+import time
+
+PROXY = "0x9Ce3E9a1e408B2c635674020db6Ab685294BAC2B"
+
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    chain_id=137,
+    key=settings.private_key,
+    creds=ApiCreds(
+        api_key=settings.polymarket_api_key,
+        api_secret=settings.polymarket_api_secret,
+        api_passphrase=settings.polymarket_api_passphrase,
+    ),
+    signature_type=3,
+    funder=PROXY,
+)
+
+markets = client.get_sampling_markets(next_cursor="")
+token_id = markets["data"][0]["tokens"][0]["token_id"]
+question = markets["data"][0].get("question", "")[:50]
+print(f"Рынок: {question}")
+
+resp = client.create_and_post_order(
+    order_args=OrderArgs(
+        token_id=token_id,
+        price=0.02,
+        side=Side.BUY,
+        size=5,
+    ),
+    options=PartialCreateOrderOptions(tick_size="0.01"),
+    order_type=OrderType.GTC,
+)
+print(f"✅ Ордер размещён: {resp}")
+
+order_id = resp.get("orderID")
+if order_id:
+    time.sleep(3)
+    # Правильный метод отмены в V2
+    open_orders = client.get_open_orders()
+    print(f"Открытых ордеров: {len(open_orders) if isinstance(open_orders, list) else open_orders}")
+    
+    cancel = client.cancel_all()
+    print(f"✅ Все ордера отменены: {cancel}")

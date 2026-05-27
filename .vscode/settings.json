@@ -8,5 +8,6 @@
         "**/__pycache__": true,
         "**/*.pyc": true,
         ".venv": true
-    }
+    },
+    "git.ignoreLimitWarning": true
 }

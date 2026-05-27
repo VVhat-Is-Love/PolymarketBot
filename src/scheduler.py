@@ -10,9 +10,9 @@ from src.market.markets import discover_and_save_weather_markets
 from src.data.open_meteo import fetch_and_save_all_cities
 from src.db.session import get_session
 from src.db.repository import MarketGroupRepository, MarketSnapshotRepository
-from src.db.models import MarketGroup, Market, MarketSnapshot, PaperTrade, DailySummary
+from src.db.models import MarketGroup, Market, MarketSnapshot, PaperTrade, DailySummary, LiveTrade
 from src.strategy.paper_trader import run_paper_trade_engine, run_resolve_paper_trades
-from src.strategy.live_trader import run_live_trade_engine
+from src.strategy.live_trader import run_live_trade_engine, run_tail_engine
 from src.notifications.telegram import get_notifier
 
 _gamma = GammaClient()
@@ -109,8 +109,11 @@ def _job_paper_trade_engine() -> None:
     logger.info("JOB: paper trade engine")
     try:
         run_paper_trade_engine()
-    except Exception as e:
-        logger.error(f"Paper trade engine job failed: {e}")
+    # except Exception as e:
+    #     logger.error(f"Paper trade engine job failed: {e}")
+    except Exception as exc:
+        logger.exception("Paper trade engine job failed")
+
 
 
 def _job_live_trade_engine() -> None:
@@ -119,7 +122,8 @@ def _job_live_trade_engine() -> None:
         return
     logger.info("JOB: live trade engine")
     try:
-        run_live_trade_engine(gamma=_gamma)
+        run_live_trade_engine(gamma=_gamma)   # Strategy A (basket_wide) + B (basket_narrow)
+        run_tail_engine()                      # Strategy C (tail_no — NO time-decay)
     except Exception as e:
         logger.error(f"Live trade engine job failed: {e}")
 
@@ -177,6 +181,7 @@ def _job_daily_summary() -> None:
         day_start = datetime.combine(yesterday, datetime.min.time())
         day_end = datetime.combine(date.today(), datetime.min.time())
 
+        # ── Paper trades (simulation) ──────────────────────────────────────
         resolved = list(
             session.execute(
                 select(PaperTrade).where(
@@ -196,7 +201,6 @@ def _job_daily_summary() -> None:
         basket_misses = sum(1 for t in resolved if t.status == "resolved_basket_miss")
         total_pnl = sum(t.pnl_usd or 0.0 for t in resolved)
 
-        # High water mark: cumulative PnL across all resolved trades ever
         all_resolved = list(
             session.execute(
                 select(PaperTrade).where(PaperTrade.status != "open")
@@ -207,18 +211,55 @@ def _job_daily_summary() -> None:
         best = max(resolved, key=lambda t: t.pnl_usd or 0.0, default=None)
         worst = min(resolved, key=lambda t: t.pnl_usd or 0.0, default=None)
 
+        # ── Live trades ────────────────────────────────────────────────────
+        live_resolved = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.resolved_at >= day_start,
+                    LiveTrade.resolved_at < day_end,
+                    LiveTrade.pnl_usd.isnot(None),
+                )
+            ).scalars().all()
+        )
+        live_pnl = sum(t.pnl_usd or 0.0 for t in live_resolved)
+        live_wins = sum(1 for t in live_resolved if (t.pnl_usd or 0.0) > 0)
+        live_losses = len(live_resolved) - live_wins
+        live_staked = sum(t.stake_usd or 0.0 for t in live_resolved)
+        live_roi = (live_pnl / live_staked * 100) if live_staked > 0 else 0.0
+
+        # By strategy for live trades
+        live_by_strat: dict[str, dict] = {}
+        for t in live_resolved:
+            s = t.strategy_name or "unknown"
+            if s not in live_by_strat:
+                live_by_strat[s] = {"pnl": 0.0, "wins": 0, "losses": 0}
+            live_by_strat[s]["pnl"] += t.pnl_usd or 0.0
+            if (t.pnl_usd or 0.0) > 0:
+                live_by_strat[s]["wins"] += 1
+            else:
+                live_by_strat[s]["losses"] += 1
+
+        live_best = max(live_resolved, key=lambda t: t.pnl_usd or 0.0, default=None)
+        live_worst = min(live_resolved, key=lambda t: t.pnl_usd or 0.0, default=None)
+
+        # ── Persist daily summary ──────────────────────────────────────────
         summary_data = {
             "date": str(yesterday),
-            "total_pnl": total_pnl,
-            "trades": len(resolved),
-            "wins": wins,
-            "losses": losses,
-            "basket_misses": basket_misses,
+            "paper_pnl": total_pnl,
+            "paper_trades": len(resolved),
+            "paper_wins": wins,
+            "paper_losses": losses,
+            "paper_basket_misses": basket_misses,
+            "live_pnl": live_pnl,
+            "live_trades": len(live_resolved),
+            "live_wins": live_wins,
+            "live_losses": live_losses,
+            "live_staked": live_staked,
+            "live_roi_pct": live_roi,
             "open": len(open_trades),
             "hwm": hwm,
         }
 
-        # Upsert daily summary
         existing = session.get(DailySummary, yesterday)
         if existing:
             existing.total_pnl = total_pnl
@@ -244,8 +285,8 @@ def _job_daily_summary() -> None:
             ))
         session.commit()
 
-        # Build Telegram message
-        rate_str = f"{wins/len(resolved)*100:.0f}%" if resolved else "N/A"
+        # ── Build Telegram message ─────────────────────────────────────────
+        rate_str = f"{wins / len(resolved) * 100:.0f}%" if resolved else "N/A"
         best_str = (
             f"🔝 {best.city or best.group_id}: ${best.pnl_usd:+.2f}"
             if best and best.pnl_usd else ""
@@ -254,21 +295,41 @@ def _job_daily_summary() -> None:
             f"💸 {worst.city or worst.group_id}: ${worst.pnl_usd:+.2f}"
             if worst and worst.pnl_usd else ""
         )
+
+        # Paper section
         msg = (
-            f"📅 Итоги дня: {yesterday}\n\n"
-            f"💰 PNL за день: ${total_pnl:+.2f}\n"
-            f"📈 High Water Mark: ${hwm:+.2f}\n"
-            f"💼 Открытых позиций: {len(open_trades)}\n\n"
-            f"Сделки ({len(resolved)}):\n"
-            f"  ✅ resolved_win: {wins}\n"
-            f"  ❌ resolved_loss: {losses}\n"
-            f"  🚫 basket_miss: {basket_misses}\n"
+            f"📅 <b>Итоги дня: {yesterday}</b>\n\n"
+            f"📝 <b>Бумажная торговля</b> ({len(resolved)} сделок)\n"
+            f"  💰 PnL: ${total_pnl:+.2f}\n"
+            f"  ✅ Win: {wins} | ❌ Loss: {losses} | 🚫 Basket miss: {basket_misses}\n"
             f"  Winrate: {rate_str}\n"
+            f"  📈 HWM: ${hwm:+.2f}\n"
+            f"  💼 Открытых: {len(open_trades)}\n"
         )
         if best_str:
-            msg += f"\n{best_str}"
+            msg += f"  {best_str}\n"
         if worst_str:
-            msg += f"\n{worst_str}"
+            msg += f"  {worst_str}\n"
+
+        # Live section
+        if live_resolved:
+            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%" if live_resolved else "N/A"
+            msg += (
+                f"\n💸 <b>Live торговля</b> ({len(live_resolved)} сделок)\n"
+                f"  💰 PnL: ${live_pnl:+.2f} | ROI: {live_roi:+.1f}%\n"
+                f"  ✅ Win: {live_wins} | ❌ Loss: {live_losses} | Winrate: {live_rate}\n"
+                f"  📦 Поставлено: ${live_staked:.2f}\n"
+            )
+            if live_by_strat:
+                msg += "  По стратегиям:\n"
+                for strat, sv in sorted(live_by_strat.items()):
+                    msg += f"    {strat}: ${sv['pnl']:+.2f} ({sv['wins']}W/{sv['losses']}L)\n"
+            if live_best and live_best.pnl_usd:
+                msg += f"  🔝 {live_best.city or '?'} {live_best.bin_label}: ${live_best.pnl_usd:+.2f}\n"
+            if live_worst and live_worst.pnl_usd and live_worst is not live_best:
+                msg += f"  💸 {live_worst.city or '?'} {live_worst.bin_label}: ${live_worst.pnl_usd:+.2f}\n"
+        else:
+            msg += "\n💸 <b>Live торговля</b>: нет закрытых сделок за день\n"
 
         if notifier.send(msg):
             if existing:
@@ -280,8 +341,9 @@ def _job_daily_summary() -> None:
             session.commit()
 
         logger.info(
-            f"Daily summary {yesterday}: {len(resolved)} trades "
-            f"PnL=${total_pnl:+.2f} ({wins}W/{losses}L/{basket_misses}BM)"
+            f"Daily summary {yesterday}: paper {len(resolved)} trades PnL=${total_pnl:+.2f} "
+            f"({wins}W/{losses}L/{basket_misses}BM) | "
+            f"live {len(live_resolved)} trades PnL=${live_pnl:+.2f} ROI={live_roi:+.1f}%"
         )
     except Exception as e:
         logger.error(f"Daily summary job failed: {e}")

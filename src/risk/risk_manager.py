@@ -167,6 +167,26 @@ class RiskManager:
             self._emergency_stop_reason = ""
             logger.info("RiskManager: emergency stop cleared")
 
+    # ------------------------------------------------------------------
+    # Runtime limit setters (called by Telegram bot /setlimit, /setstake)
+    # Changes are in-memory only and reset on process restart.
+    # ------------------------------------------------------------------
+
+    def set_daily_loss_limit(self, value: float) -> None:
+        with self._lock:
+            self._daily_loss_limit_usd = value
+            logger.info(f"RiskManager: daily_loss_limit_usd → ${value:.2f}")
+
+    def set_max_single_bet(self, value: float) -> None:
+        with self._lock:
+            self._max_single_bet_usd = value
+            logger.info(f"RiskManager: max_single_bet_usd → ${value:.2f}")
+
+    def set_total_stop_loss(self, value: float) -> None:
+        with self._lock:
+            self._total_stop_loss_usd = value
+            logger.info(f"RiskManager: total_stop_loss_usd → ${value:.2f}")
+
 
 # Module-level singleton — shared across scheduler and Telegram bot threads
 risk_manager = RiskManager()

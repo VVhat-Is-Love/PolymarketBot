@@ -67,7 +67,7 @@ def test_cancel_order_returns_true_on_success():
 
 def test_cancel_order_returns_false_on_error():
     mock_client = MagicMock()
-    mock_client.cancel.side_effect = Exception("api down")
+    mock_client.cancel_order.side_effect = Exception("api down")  # V2 method name
 
     with patch("src.market.order_executor._get_client", return_value=mock_client), \
          patch("src.market.order_executor.time.sleep"):
@@ -117,7 +117,7 @@ def test_get_open_orders_parses_list():
         {"id": "a2", "asset_id": "m2", "side": "BUY", "price": "0.30", "original_size": "3.0"},
     ]
     mock_client = MagicMock()
-    mock_client.get_orders.return_value = raw
+    mock_client.get_open_orders.return_value = raw  # V2 method name
 
     with patch("src.market.order_executor._get_client", return_value=mock_client):
         from src.market.order_executor import get_open_orders
@@ -130,7 +130,7 @@ def test_get_open_orders_parses_list():
 
 def test_get_open_orders_returns_empty_on_error():
     mock_client = MagicMock()
-    mock_client.get_orders.side_effect = Exception("network")
+    mock_client.get_open_orders.side_effect = Exception("network")  # V2 method name
 
     with patch("src.market.order_executor._get_client", return_value=mock_client), \
          patch("src.market.order_executor.time.sleep"):
