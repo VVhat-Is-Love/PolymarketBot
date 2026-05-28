@@ -772,9 +772,12 @@ async def cmd_risk(update, context) -> None:
         f"⚠️ <b>Risk Limits</b>\n\n"
         f"💵 Макс. ставка:       ${s.max_single_bet_usd:.2f}  (/setstake)\n"
         f"📅 Макс. ставок/день:  {s.max_daily_bets}  (использовано: {s.daily_bets_count})\n"
-        f"🔗 Макс. одновременно: {s.max_concurrent_bets}  (открыто: {s.concurrent_open_bets})\n"
         f"📉 Дневной лимит:      ${s.daily_loss_limit_usd:.2f}  (исп.: ${s.daily_loss:.2f})  (/setlimit daily)\n"
-        f"💥 Общий стоп-лосс:    ${s.total_stop_loss_usd:.2f}  (исп.: ${s.total_loss:.2f})  (/setlimit total)\n"
+        f"💥 Общий стоп-лосс:    ${s.total_stop_loss_usd:.2f}  (исп.: ${s.total_loss:.2f})  (/setlimit total)\n\n"
+        f"💼 <b>Капитал в работе</b>\n"
+        f"  🧺 Basket: ${s.basket_deployed_usd:.2f} / ${s.basket_max_usd:.2f}\n"
+        f"  🎯 Tail:   ${s.tail_deployed_usd:.2f} / ${s.tail_max_usd:.2f}\n"
+        f"  📊 Итого:  ${s.total_deployed_usd:.2f} / ${s.total_deployed_cap_usd:.2f}\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 

@@ -14,10 +14,14 @@ def _make_rm(**kwargs):
         order_timeout_minutes=30,
         kelly_fraction=0.25,
         trading_mode="live",
+        # Capital cap settings (P1-6)
+        max_basket_legs_open=12,
+        max_tail_positions=3,
+        total_deployed_cap_usd=40.0,
+        basket_max_usd=26.0,
+        tail_max_usd=18.0,
     )
     defaults.update(kwargs)
-
-    mock_settings = type("S", (), defaults)()
 
     with patch("src.risk.risk_manager.RiskManager._load_settings"):
         from src.risk.risk_manager import RiskManager
@@ -29,13 +33,21 @@ def _make_rm(**kwargs):
         rm._max_concurrent_bets = defaults["max_concurrent_bets"]
         rm._daily_loss_limit_usd = defaults["daily_loss_limit_usd"]
         rm._total_stop_loss_usd = defaults["total_stop_loss_usd"]
+        rm._max_basket_legs_open = defaults["max_basket_legs_open"]
+        rm._max_tail_positions = defaults["max_tail_positions"]
+        rm._total_deployed_cap_usd = defaults["total_deployed_cap_usd"]
+        rm._basket_max_usd = defaults["basket_max_usd"]
+        rm._tail_max_usd = defaults["tail_max_usd"]
         rm._reset_daily_state()
         rm._total_loss = 0.0
         rm._emergency_stop = False
         rm._emergency_stop_reason = ""
         rm._open_bets = {}
+        rm._reserved_usd = 0.0
+        rm._basket_legs_open = 0
         # Disable DB sync so tests run against pure in-memory state
         rm._load_live_stats = lambda: None
+        rm._get_deployed_by_strategy = lambda: {}
         return rm
 
 

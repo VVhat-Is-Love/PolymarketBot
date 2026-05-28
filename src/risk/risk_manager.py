@@ -27,6 +27,13 @@ class RiskStatus:
     max_concurrent_bets: int
     daily_loss_limit_usd: float
     total_stop_loss_usd: float
+    # Deployed capital by strategy
+    basket_deployed_usd: float = 0.0
+    tail_deployed_usd: float = 0.0
+    total_deployed_usd: float = 0.0
+    total_deployed_cap_usd: float = 0.0
+    basket_max_usd: float = 0.0
+    tail_max_usd: float = 0.0
 
 
 class RiskManager:
@@ -39,6 +46,9 @@ class RiskManager:
         self._emergency_stop_reason: str = ""
         # group_id → bet_size_usd for currently open bets
         self._open_bets: dict[str, float] = {}
+        # In-session reservations: notional pre-approved but not yet in DB
+        self._reserved_usd: float = 0.0
+        self._basket_legs_open: int = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -51,6 +61,11 @@ class RiskManager:
         self._max_concurrent_bets = settings.max_concurrent_bets
         self._daily_loss_limit_usd = settings.daily_loss_limit_usd
         self._total_stop_loss_usd = settings.total_stop_loss_usd
+        self._max_basket_legs_open = settings.max_basket_legs_open
+        self._max_tail_positions = settings.max_tail_positions
+        self._total_deployed_cap_usd = settings.total_deployed_cap_usd
+        self._basket_max_usd = settings.basket_max_usd
+        self._tail_max_usd = settings.tail_max_usd
 
     def _reset_daily_state(self) -> None:
         self._today = date.today()
@@ -166,6 +181,30 @@ class RiskManager:
         except Exception as exc:
             logger.error(f"RiskManager: failed to persist emergency stop to DB: {exc}")
 
+    def _get_deployed_by_strategy(self) -> dict[str, float]:
+        """DB query: sum of stake_usd per strategy for non-resolved trades."""
+        try:
+            from sqlalchemy import select, func
+            from src.db.session import get_session
+            from src.db.models import LiveTrade
+
+            session = get_session()
+            try:
+                rows = session.execute(
+                    select(
+                        LiveTrade.strategy_name,
+                        func.coalesce(func.sum(LiveTrade.stake_usd), 0.0),
+                    )
+                    .where(LiveTrade.status.in_(["pending", "open", "filled"]))
+                    .group_by(LiveTrade.strategy_name)
+                ).all()
+                return {name: float(val) for name, val in rows}
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"RiskManager: _get_deployed_by_strategy failed: {exc}")
+            return {}
+
     def is_emergency_stopped(self) -> bool:
         """Check DB directly — safe to call at startup before _load_live_stats."""
         try:
@@ -185,6 +224,110 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def can_place_basket(self, notional: float, n_legs: int) -> tuple[bool, str]:
+        """
+        Check if we can deploy `notional` USD across `n_legs` basket bins.
+        Checks: emergency stop, daily loss, total deployed cap, basket cap, leg slots.
+        Reserves the notional in-memory until release_basket_reservation() is called.
+        """
+        with self._lock:
+            self._maybe_roll_day()
+            self._load_live_stats()
+
+            if self._emergency_stop:
+                return False, f"Emergency stop: {self._emergency_stop_reason}"
+
+            if self._daily_loss >= self._daily_loss_limit_usd:
+                return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
+
+            if self._total_loss >= self._total_stop_loss_usd:
+                reason = (
+                    f"Total loss ${self._total_loss:.2f} >= "
+                    f"TOTAL_STOP_LOSS ${self._total_stop_loss_usd:.2f}"
+                )
+                self._emergency_stop = True
+                self._emergency_stop_reason = reason
+                self._persist_emergency_stop(True, reason)
+                return False, reason
+
+            deployed = self._get_deployed_by_strategy()
+            basket_deployed = (
+                deployed.get("basket_wide", 0.0) + deployed.get("basket_narrow", 0.0)
+            )
+            total_deployed = sum(deployed.values()) + self._reserved_usd
+
+            if total_deployed + notional > self._total_deployed_cap_usd:
+                return False, (
+                    f"total_cap ${total_deployed + notional:.2f}"
+                    f">${self._total_deployed_cap_usd:.2f}"
+                )
+
+            if basket_deployed + notional > self._basket_max_usd:
+                return False, (
+                    f"basket_cap ${basket_deployed + notional:.2f}"
+                    f">${self._basket_max_usd:.2f}"
+                )
+
+            if self._basket_legs_open + n_legs > self._max_basket_legs_open:
+                return False, (
+                    f"basket_slots {self._basket_legs_open + n_legs}"
+                    f">{self._max_basket_legs_open}"
+                )
+
+            # Reserve to prevent double-counting within same scheduler cycle
+            self._reserved_usd += notional
+            self._basket_legs_open += n_legs
+            return True, "ok"
+
+    def can_place_tail(self, notional: float) -> tuple[bool, str]:
+        """
+        Check if we can deploy `notional` USD in a tail NO position.
+        Checks: emergency stop, daily loss, total deployed cap, tail cap.
+        """
+        with self._lock:
+            self._maybe_roll_day()
+            self._load_live_stats()
+
+            if self._emergency_stop:
+                return False, f"Emergency stop: {self._emergency_stop_reason}"
+
+            if self._daily_loss >= self._daily_loss_limit_usd:
+                return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
+
+            if self._total_loss >= self._total_stop_loss_usd:
+                reason = (
+                    f"Total loss ${self._total_loss:.2f} >= "
+                    f"TOTAL_STOP_LOSS ${self._total_stop_loss_usd:.2f}"
+                )
+                self._emergency_stop = True
+                self._emergency_stop_reason = reason
+                self._persist_emergency_stop(True, reason)
+                return False, reason
+
+            deployed = self._get_deployed_by_strategy()
+            tail_deployed = deployed.get("tail_no", 0.0)
+            total_deployed = sum(deployed.values()) + self._reserved_usd
+
+            if total_deployed + notional > self._total_deployed_cap_usd:
+                return False, (
+                    f"total_cap ${total_deployed + notional:.2f}"
+                    f">${self._total_deployed_cap_usd:.2f}"
+                )
+
+            if tail_deployed + notional > self._tail_max_usd:
+                return False, (
+                    f"tail_cap ${tail_deployed + notional:.2f}"
+                    f">${self._tail_max_usd:.2f}"
+                )
+
+            return True, "ok"
+
+    def release_basket_reservation(self, notional: float, n_legs: int) -> None:
+        """Release in-memory reservation after basket placement completes (success or failure)."""
+        with self._lock:
+            self._reserved_usd = max(0.0, self._reserved_usd - notional)
+            self._basket_legs_open = max(0, self._basket_legs_open - n_legs)
 
     def can_place_order(self, bet_size_usd: float) -> tuple[bool, str]:
         """
@@ -276,6 +419,12 @@ class RiskManager:
         with self._lock:
             self._maybe_roll_day()
             self._load_live_stats()  # always show live DB values
+            deployed = self._get_deployed_by_strategy()
+            basket_deployed = (
+                deployed.get("basket_wide", 0.0) + deployed.get("basket_narrow", 0.0)
+            )
+            tail_deployed = deployed.get("tail_no", 0.0)
+            total_deployed = sum(deployed.values())
             return RiskStatus(
                 daily_pnl=self._daily_pnl,
                 daily_loss=self._daily_loss,
@@ -289,6 +438,12 @@ class RiskManager:
                 max_concurrent_bets=self._max_concurrent_bets,
                 daily_loss_limit_usd=self._daily_loss_limit_usd,
                 total_stop_loss_usd=self._total_stop_loss_usd,
+                basket_deployed_usd=basket_deployed,
+                tail_deployed_usd=tail_deployed,
+                total_deployed_usd=total_deployed,
+                total_deployed_cap_usd=self._total_deployed_cap_usd,
+                basket_max_usd=self._basket_max_usd,
+                tail_max_usd=self._tail_max_usd,
             )
 
     def set_emergency_stop(self, reason: str) -> None:
