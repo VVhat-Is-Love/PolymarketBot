@@ -18,15 +18,41 @@ from src.notifications.telegram import get_notifier
 _gamma = GammaClient()
 
 
+_discovery_zero_count: int = 0  # G2-8: consecutive zero-event discovery counter
+
+
 def _job_discover_markets() -> None:
+    global _discovery_zero_count
     logger.info("JOB: market discovery")
     try:
         saved = discover_and_save_weather_markets(_gamma)
         if saved > 0:
+            _discovery_zero_count = 0
             logger.info(f"Discovery added {saved} markets — triggering immediate snapshot")
             _job_snapshot_markets()
+        else:
+            _discovery_zero_count += 1
+            logger.warning(
+                f"[discovery] 0 new markets (cycle #{_discovery_zero_count})"
+            )
+            # G2-8: alert owner if discovery returns 0 for two consecutive cycles
+            if _discovery_zero_count >= 2:
+                _notifier_alert(
+                    f"⚠️ Gamma discovery: 0 рынков найдено {_discovery_zero_count} цикла подряд. "
+                    f"Gamma API может быть недоступен или изменился формат событий."
+                )
+                _discovery_zero_count = 0  # reset counter after alert
     except Exception as e:
         logger.error(f"Market discovery job failed: {e}")
+
+
+def _notifier_alert(msg: str) -> None:
+    """Send alert to owner only (not client). Used for operational issues."""
+    try:
+        notifier = get_notifier()
+        notifier.send(msg)
+    except Exception as exc:
+        logger.warning(f"[notifier_alert] Failed to send alert: {exc}")
 
 
 def _job_snapshot_markets() -> None:

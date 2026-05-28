@@ -67,7 +67,7 @@ class GammaClient:
     def _get(self, path: str, params: dict | None = None) -> list | dict:
         url = f"{GAMMA_BASE}{path}"
         try:
-            resp = self._session.get(url, params=params, timeout=30)
+            resp = self._session.get(url, params=params, timeout=60)  # G2-8: 30→60s
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 5))
                 logger.warning(f"Gamma 429 rate-limit — Retry-After: {retry_after}s")
