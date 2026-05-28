@@ -39,6 +39,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from loguru import logger
+
 if TYPE_CHECKING:
     from src.db.models import Market
 
