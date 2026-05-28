@@ -14,8 +14,6 @@ from src.db.session import get_session
 from src.strategy.config import strategy_settings as ss
 from src.strategy.checklist import evaluate_checklist
 from src.strategy.pnl_calculator import build_basket_json, find_winning_market, calculate_pnl
-from src.notifications.telegram import get_notifier
-
 if TYPE_CHECKING:
     from src.market.gamma_client import GammaClient
 
@@ -347,7 +345,6 @@ def run_resolve_paper_trades(gamma: "GammaClient | None" = None) -> None:
     from src.data.open_meteo import fetch_actual_temperature
     from src.config.cities import CITIES_WHITELIST
 
-    notifier = get_notifier()
     session = get_session()
     try:
         today = date.today()
@@ -435,13 +432,10 @@ def run_resolve_paper_trades(gamma: "GammaClient | None" = None) -> None:
                         )
                         weather_winner = find_winning_market(trade.basket_json, actual_temp_native)
                         if weather_winner != winner_id:
-                            msg = (
-                                f"⚠️ Resolution mismatch: {group.city} {group.resolution_date}\n"
-                                f"Gamma API winner: {winner_id}\n"
-                                f"Weather winner: {weather_winner} (temp={actual_temp_native:.1f}°)"
+                            logger.warning(
+                                f"Resolution mismatch: {group.city} {group.resolution_date} "
+                                f"Gamma={winner_id} Weather={weather_winner} (temp={actual_temp_native:.1f}°)"
                             )
-                            logger.warning(msg)
-                            notifier.send(msg)
 
                 # ── Determine basket_miss and calculate PnL ───────────
                 is_basket_miss = winner_id is not None and winner_id not in basket_ids
@@ -477,14 +471,6 @@ def run_resolve_paper_trades(gamma: "GammaClient | None" = None) -> None:
                     if stored_temp is not None else
                     f"RESOLVED: {group.city} {group.resolution_date} "
                     f"status={status} pnl=${pnl:+.2f} via={resolved_via}"
-                )
-
-                # ── Telegram notification ──────────────────────────────
-                emoji = {"resolved_win": "✅", "resolved_loss": "❌", "resolved_basket_miss": "🚫"}.get(status, "📋")
-                notifier.send(
-                    f"{emoji} Позиция закрыта: {group.city} {group.resolution_date}\n"
-                    f"Статус: {status}\n"
-                    f"PNL: ${pnl:+.2f}"
                 )
 
             except Exception as e:

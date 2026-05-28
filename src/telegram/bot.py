@@ -6,7 +6,7 @@ Runs as a separate thread alongside the scheduler.
 Commands:
   /status           — full dashboard: balance, PnL, positions, risk
   /pnl [period]     — PnL breakdown (today|week|month|all)
-  /trades [filter]  — list trades (open|pending|filled|all)
+  /trades [filter]  — list positions (open|all|history|pending)
   /trade <id>       — detailed trade card by ID prefix
   /setlimit <t> <v> — update risk limit with confirmation (daily|bet|total)
   /setstake <v>     — update MAX_SINGLE_BET_USD with confirmation
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, date
 from loguru import logger
 
 
@@ -100,12 +100,10 @@ async def cmd_status(update, context) -> None:
     try:
         from src.config.settings import settings as cfg
         from src.risk.risk_manager import risk_manager
-        from src.strategy.live_trader import _get_wallet_balance
-        from src.telegram.stats import pnl_stats, summary_counts, open_positions_value
+        from src.telegram.stats import pnl_stats, summary_counts, get_portfolio_breakdown
 
-        wallet = _get_wallet_balance()
-        portfolio = open_positions_value()
-        s = risk_manager.get_status()
+        portfolio = get_portfolio_breakdown()   # cash + positions from Polymarket API
+        s = risk_manager.get_status()           # live DB-backed risk counters
         pnl_today = pnl_stats("today")
         pnl_all = pnl_stats("all")
         counts = summary_counts()
@@ -117,15 +115,17 @@ async def cmd_status(update, context) -> None:
             if s.daily_loss_limit_usd > 0 else "N/A"
         )
 
+        pos_pnl_sign = "+" if portfolio["positions_pnl"] >= 0 else ""
         text = (
             f"🤖 <b>Bot Status — {mode} режим</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Баланс: ${wallet:.2f} (USDC)\n"
-            f"📊 Портфель: ${portfolio:.2f}\n\n"
+            f"🏦 Polymarket (своб.):  ${portfolio['cash_balance']:.2f}\n"
+            f"📦 Позиций: {portfolio['positions_count']}  (${portfolio['positions_value']:.2f}  PnL: {pos_pnl_sign}${portfolio['positions_pnl']:.2f})\n"
+            f"💼 Кошелёк итого:        ${portfolio['total']:.2f}\n\n"
             f"📈 PnL сегодня:  ${pnl_today['pnl']:+.2f}  ({pnl_today['count']} сделок)\n"
             f"📦 PnL всего:    ${pnl_all['pnl']:+.2f}\n"
             f"🏔 High Water Mark: ${counts['hwm']:+.2f}\n\n"
-            f"🔴 Открытых позиций: {counts['open']}\n"
+            f"🔴 Открытых/pending: {counts['open']}\n"
             f"⏳ Ожидают исхода:   {counts['awaiting']}\n"
             f"✅ Исполнено сегодня: {counts['filled_today']}\n\n"
             f"📉 Дневной лимит потерь: ${s.daily_loss:.2f} / ${s.daily_loss_limit_usd:.2f} ({loss_pct})\n"
@@ -186,6 +186,82 @@ async def cmd_pnl(update, context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /trades helpers
+# ---------------------------------------------------------------------------
+
+_CITY_EMOJI: dict[str, str] = {
+    "london": "🇬🇧", "tokyo": "🇯🇵", "seoul": "🇰🇷",
+    "atlanta": "🇺🇸", "dallas": "🇺🇸", "miami": "🇺🇸",
+    "new york": "🇺🇸", "chicago": "🇺🇸", "los angeles": "🇺🇸",
+    "moscow": "🇷🇺", "paris": "🇫🇷", "berlin": "🇩🇪",
+    "beijing": "🇨🇳", "shanghai": "🇨🇳", "sydney": "🇦🇺",
+    "dubai": "🇦🇪", "singapore": "🇸🇬", "toronto": "🇨🇦",
+}
+
+
+def _city_emoji(title: str) -> str:
+    t = title.lower()
+    for city, em in _CITY_EMOJI.items():
+        if city in t:
+            return em
+    return "🌍"
+
+
+def _pnl_emoji(pnl: float, pnl_pct: float) -> str:
+    if pnl > 0:
+        return "✅"
+    if pnl_pct <= -90:
+        return "💀"
+    if pnl_pct <= -50:
+        return "⚠️"
+    if pnl_pct <= -20:
+        return "❌"
+    return ""
+
+
+def _classify_position(p: dict) -> str:
+    """Classify a position dict as 'won', 'lost', or 'active'."""
+    if p.get("redeemable") or p["cur_price"] >= 0.99:
+        return "won"
+    if p["cur_price"] <= 0.01:
+        return "lost"
+    return "active"
+
+
+def _format_position_line(p: dict) -> str:
+    em = _city_emoji(p["title"])
+    avg_c = p["avg_price"] * 100
+    cur_c = p["cur_price"] * 100       # cur_price — correct API field name
+    pnl = p["pnl"]
+    pnl_pct = p["pnl_pct"]
+    pnl_em = _pnl_emoji(pnl, pnl_pct)
+    redeemable_tag = " 💰 забрать!" if p.get("redeemable") else ""
+    sign = "+" if pnl >= 0 else ""
+    pct_sign = "+" if pnl_pct >= 0 else ""
+    return (
+        f"\n{em} {p['title']}{redeemable_tag}\n"
+        f"{p['outcome']} | {p['size']:.1f} долей | {avg_c:.1f}¢→{cur_c:.1f}¢\n"
+        f"Вложено: ${p['cost']:.2f} → Сейчас: ${p['current_value']:.2f}\n"
+        f"PnL: {sign}${pnl:.2f} ({pct_sign}{pnl_pct:.1f}%) {pnl_em}"
+    )
+
+
+def _positions_summary(positions: list[dict]) -> str:
+    total_cost = sum(p["cost"] for p in positions)
+    total_value = sum(p["current_value"] for p in positions)
+    total_pnl = sum(p["pnl"] for p in positions)
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+    tot_sign = "+" if total_pnl >= 0 else ""
+    tot_pct_sign = "+" if total_pnl_pct >= 0 else ""
+    return (
+        f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Вложено: ${total_cost:.2f}\n"
+        f"📈 Текущая стоимость: ${total_value:.2f}\n"
+        f"🎰 Итого PnL: {tot_sign}${total_pnl:.2f} ({tot_pct_sign}{total_pnl_pct:.1f}%)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # /trades [filter]
 # ---------------------------------------------------------------------------
 
@@ -193,60 +269,175 @@ async def cmd_pnl(update, context) -> None:
 async def cmd_trades(update, context) -> None:
     try:
         filter_status = (context.args[0] if context.args else "open").lower()
-        if filter_status not in ("open", "pending", "filled", "cancelled", "all"):
+        if filter_status not in ("open", "all", "history", "pending", "filled", "cancelled"):
             await update.message.reply_text(
-                "❓ Используй: /trades [open|pending|filled|cancelled|all]"
+                "❓ Используй: /trades [open|all|history|pending]"
             )
             return
 
-        from src.telegram.stats import get_trades, get_current_price
+        lines: list[str] = []
 
-        trades = get_trades(filter_status, limit=10)
-        labels = {
-            "open":      "Открытые позиции",
-            "pending":   "Ожидают исполнения",
-            "filled":    "Исполненные",
-            "cancelled": "Отменённые / истёкшие",
-            "all":       "Все сделки",
-        }
-        status_emoji = {
-            "filled": "✅", "open": "⏳", "pending": "🕐",
-            "expired": "⏰", "cancelled": "❌",
-        }
+        # ── open (default): active + won (redeemable) from API + pending DB ──
+        if filter_status in ("open", "pending"):
+            if filter_status == "open":
+                from src.telegram.stats import get_real_polymarket_positions
+                all_positions = get_real_polymarket_positions()
+                # Show active + redeemable (won but not yet collected); hide lost
+                positions = [p for p in all_positions if _classify_position(p) != "lost"]
 
-        if not trades:
-            await update.message.reply_text(f"📋 {labels[filter_status]}: нет данных")
-            return
+                MAX_SHOW = 10
+                shown = positions[:MAX_SHOW]
+                rest = len(positions) - MAX_SHOW
 
-        lines = [
-            f"📋 <b>{labels[filter_status]} ({len(trades)})</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-        ]
+                if shown:
+                    lines.append(
+                        f"📊 <b>Позиции на Polymarket ({len(positions)} активных)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+                    )
+                    for p in shown:
+                        lines.append(_format_position_line(p))
+                    if rest > 0:
+                        lines.append(f"\n…и ещё {rest} позиций | /trades all")
+                    lines.append(_positions_summary(shown))
+                else:
+                    lines.append("📊 <b>Позиции на Polymarket</b>\nНет активных позиций")
 
-        for t in trades:
-            em = status_emoji.get(t.status, "❓")
-            short_id = (t.id or "")[:8]
-            entry_price = t.filled_price or t.target_price or 0.0
-            placed = t.placed_at.strftime("%d.%m %H:%M") if t.placed_at else "—"
+            # ── Pending limit orders from local DB ──────────────────────────
+            from src.telegram.stats import get_trades, get_resolution_dates
+            pending_trades = get_trades("pending", limit=20)
+            if pending_trades:
+                group_ids = [t.group_id for t in pending_trades if t.group_id]
+                res_dates = get_resolution_dates(group_ids)
+                lines.append(
+                    f"\n⏳ <b>Ожидают исполнения (лимитки, из ДБ) ({len(pending_trades)})</b>"
+                )
+                for t in pending_trades:
+                    short_id = (t.id or "")[:8]
+                    entry_price = t.target_price or 0.0
+                    res_date = res_dates.get(t.group_id or "")
+                    res_str = res_date.strftime("%d.%m") if res_date else "?"
+                    city = t.city or (t.group_id or "")[:8] or "?"
+                    lines.append(
+                        f"[{short_id}] {city} {t.bin_label} → ${t.stake_usd or 0:.2f} @ ${entry_price:.4f}"
+                    )
+                lines.append("(не исполнены, рынок мог закрыться)")
+            elif filter_status == "pending":
+                lines.append("⏳ <b>Ожидают исполнения</b>\nНет ожидающих ордеров")
 
-            pnl_str = ""
-            if t.pnl_usd is not None:
-                pct = (t.pnl_usd / t.stake_usd * 100) if t.stake_usd else 0.0
-                pnl_str = f"  PnL: ${t.pnl_usd:+.2f} ({pct:+.1f}%)\n"
-            elif t.status in ("open", "filled") and t.resolved_at is None:
-                cur = get_current_price(t.market_id)
-                if cur is not None and entry_price > 0 and t.size_shares:
-                    unreal = (cur - entry_price) * t.size_shares
-                    unreal_pct = (cur - entry_price) / entry_price * 100
-                    pnl_str = f"  PnL: ${unreal:+.2f} ({unreal_pct:+.1f}%) нереал.\n"
+        # ── all: 3-way split — won / active / lost ──────────────────────────
+        elif filter_status == "all":
+            from src.telegram.stats import get_real_polymarket_positions
+            all_positions = get_real_polymarket_positions()
 
-            block = (
-                f"[{short_id}] {em} {t.city or t.group_id or '?'} | {t.bin_label}\n"
-                f"  ${t.stake_usd or 0:.2f} @ ${entry_price:.4f} | {t.strategy_name}\n"
-                f"{pnl_str}"
-                f"  Открыта: {placed}"
-            )
-            lines.append(block)
+            won = [p for p in all_positions if _classify_position(p) == "won"]
+            active = [p for p in all_positions if _classify_position(p) == "active"]
+            lost = [p for p in all_positions if _classify_position(p) == "lost"]
+
+            lines.append(f"📊 <b>Все позиции на Polymarket</b>\n━━━━━━━━━━━━━━━━━━━━━━━━")
+
+            if won:
+                lines.append(f"\n✅ <b>Выигравшие ({len(won)}) — можно забрать</b>")
+                for p in won:
+                    lines.append(_format_position_line(p))
+                lines.append(_positions_summary(won))
+
+            if active:
+                lines.append(f"\n🟢 <b>Активные ({len(active)})</b>")
+                for p in active:
+                    lines.append(_format_position_line(p))
+                lines.append(_positions_summary(active))
+
+            if lost:
+                lines.append(f"\n❌ <b>Проигравшие ({len(lost)})</b>")
+                for p in lost:
+                    em = _city_emoji(p["title"])
+                    lines.append(
+                        f"  {em} {p['title']} | {p['outcome']} | "
+                        f"{p['size']:.1f} долей | ставка ${p['cost']:.2f}"
+                    )
+
+            if not all_positions:
+                lines.append("Нет позиций")
+
+        # ── history / filled / cancelled: local DB ───────────────────────────
+        else:
+            db_filter = "history" if filter_status == "history" else filter_status
+            from src.telegram.stats import get_trades, get_resolution_dates
+            trades = get_trades(db_filter, limit=20)
+            labels = {
+                "history":   "История сделок",
+                "filled":    "Исполненные",
+                "cancelled": "Отменённые / истёкшие",
+            }
+            status_emoji = {
+                "filled": "✅", "open": "⏳", "pending": "🕐",
+                "expired": "⏰", "cancelled": "❌",
+            }
+
+            if not trades:
+                await update.message.reply_text(
+                    f"📋 {labels.get(filter_status, filter_status)}: нет данных"
+                )
+                return
+
+            group_ids = [t.group_id for t in trades if t.group_id]
+            res_dates = get_resolution_dates(group_ids)
+
+            basket_groups: dict[str, list] = {}
+            for t in sorted(
+                trades,
+                key=lambda t: (t.group_id or str(t.id), t.placed_at or datetime.min),
+            ):
+                key = t.group_id or str(t.id)
+                basket_groups.setdefault(key, []).append(t)
+
+            lines = [
+                f"📋 <b>{labels.get(filter_status, filter_status)} ({len(trades)})</b>",
+                "━━━━━━━━━━━━━━━━━━━━━━━━",
+            ]
+            for group_key, group_trades in basket_groups.items():
+                res_date = res_dates.get(group_key)
+                res_str = res_date.strftime("%d.%m") if res_date else "?"
+                is_basket = len(group_trades) > 1
+
+                if is_basket:
+                    total_stake = sum(t.stake_usd or 0.0 for t in group_trades)
+                    city = group_trades[0].city or group_key[:8]
+                    strategy = group_trades[0].strategy_name or "?"
+                    lines.append(
+                        f"\n🧺 <b>КОРЗИНА: {city} {res_str}</b>"
+                        f" ({len(group_trades)} бина · ${total_stake:.2f} · {strategy})"
+                    )
+                    for t in group_trades:
+                        em = status_emoji.get(t.status, "❓")
+                        short_id = (t.id or "")[:8]
+                        entry_price = t.filled_price or t.target_price or 0.0
+                        if t.pnl_usd is not None:
+                            pct = (t.pnl_usd / t.stake_usd * 100) if t.stake_usd else 0.0
+                            pnl_part = f"${t.pnl_usd:+.2f} ({pct:+.1f}%)"
+                        else:
+                            pnl_part = "—"
+                        lines.append(
+                            f"  ↳ [{short_id}] {em} {t.bin_label}"
+                            f"  ${t.stake_usd or 0:.2f} @ ${entry_price:.4f}  {pnl_part}"
+                        )
+                else:
+                    t = group_trades[0]
+                    em = status_emoji.get(t.status, "❓")
+                    short_id = (t.id or "")[:8]
+                    entry_price = t.filled_price or t.target_price or 0.0
+                    placed = t.placed_at.strftime("%d.%m %H:%M") if t.placed_at else "—"
+                    city_str = t.city or "?"
+                    pnl_line = ""
+                    if t.pnl_usd is not None:
+                        pct = (t.pnl_usd / t.stake_usd * 100) if t.stake_usd else 0.0
+                        pnl_line = f"\nPnL: ${t.pnl_usd:+.2f} ({pct:+.1f}%)"
+                    lines.append(
+                        f"\n[{short_id}] {em} {city_str} | Max Temp {res_str}\n"
+                        f"Бин: {t.bin_label} | Стратегия: {t.strategy_name}\n"
+                        f"Ставка: ${t.stake_usd or 0:.2f} @ ${entry_price:.4f}{pnl_line}\n"
+                        f"Размещён: {placed}"
+                    )
 
         await _reply(update, "\n".join(lines))
     except Exception as exc:
@@ -280,7 +471,16 @@ async def cmd_trade(update, context) -> None:
         if trade.pnl_usd is not None:
             pct = (trade.pnl_usd / trade.stake_usd * 100) if trade.stake_usd else 0.0
             pnl_str = f"${trade.pnl_usd:+.2f} ({pct:+.1f}%)"
-        elif cur_price is not None and entry_price > 0 and trade.size_shares:
+        elif trade.status == "pending":
+            pnl_str = "⏳ ордер не исполнен"
+        elif (
+            trade.status == "open"
+            and trade.filled_price is not None
+            and trade.resolved_at is None
+            and cur_price is not None
+            and entry_price > 0
+            and trade.size_shares
+        ):
             unreal = (cur_price - entry_price) * trade.size_shares
             unreal_pct = (cur_price - entry_price) / entry_price * 100
             pnl_str = f"${unreal:+.2f} ({unreal_pct:+.1f}%) нереал."

@@ -136,6 +136,116 @@ def _job_resolve_paper_trades() -> None:
         logger.error(f"Resolve paper trades job failed: {e}")
 
 
+def _job_expire_stale_pending() -> None:
+    """Mark pending limit orders older than 2 hours as expired (FIX 5)."""
+    from datetime import timedelta
+    logger.debug("JOB: expire stale pending orders")
+    session = get_session()
+    try:
+        cutoff = datetime.utcnow() - timedelta(hours=2)
+        stale = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.status == "pending",
+                    LiveTrade.placed_at < cutoff,
+                )
+            ).scalars().all()
+        )
+        if stale:
+            for t in stale:
+                t.status = "expired"
+            session.commit()
+            logger.info(f"[expire_pending] Expired {len(stale)} stale pending orders (>2h)")
+    except Exception as e:
+        logger.error(f"Expire stale pending job failed: {e}")
+    finally:
+        session.close()
+
+
+def _job_resolve_live_trades() -> None:
+    """
+    For every filled-but-unresolved LiveTrade, poll Gamma prices.
+    When price_yes → 0 or 1 the market has resolved — record PnL and
+    send a Telegram notification. Runs every 30 min.
+    """
+    session = get_session()
+    notifier = get_notifier()
+    try:
+        unresolved: list[LiveTrade] = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.status == "filled",
+                    LiveTrade.resolved_at.is_(None),
+                )
+            ).scalars().all()
+        )
+
+        if not unresolved:
+            logger.debug("[resolve_live] No unresolved filled trades")
+            return
+
+        logger.info(f"[resolve_live] Checking {len(unresolved)} unresolved live trades")
+
+        # Batch by group_id to minimise Gamma API calls
+        by_group: dict[str, list[LiveTrade]] = {}
+        for t in unresolved:
+            by_group.setdefault(t.group_id or t.market_id, []).append(t)
+
+        for group_id, trades in by_group.items():
+            try:
+                prices = _gamma.get_prices_for_group(group_id)
+                if not prices:
+                    continue
+
+                for t in trades:
+                    price_yes = prices.get(t.market_id)
+                    if price_yes is None:
+                        continue
+
+                    if price_yes > 0.99:
+                        yes_won = True
+                    elif price_yes < 0.01:
+                        yes_won = False
+                    else:
+                        continue  # market still live
+
+                    shares = t.size_shares or 0.0
+                    stake = t.stake_usd or 0.0
+                    bought_yes = (t.strategy_name != "tail_no")
+
+                    if bought_yes:
+                        pnl = (shares - stake) if yes_won else -stake
+                    else:  # bought NO shares
+                        pnl = (shares - stake) if (not yes_won) else -stake
+
+                    t.pnl_usd = round(pnl, 4)
+                    t.resolved_at = datetime.utcnow()
+                    session.commit()
+
+                    outcome_em = "✅" if pnl > 0 else "❌"
+                    city = t.city or group_id[:8]
+                    logger.info(
+                        f"[resolve_live] {city} {t.bin_label} "
+                        f"({'YES' if bought_yes else 'NO'} "
+                        f"{'ВЫИГРАл' if pnl > 0 else 'ПРОИГРАл'}) "
+                        f"PnL=${pnl:+.2f}"
+                    )
+                    side_tag = "YES" if bought_yes else "NO"
+                    pnl_sign = "+" if pnl >= 0 else "−"
+                    notifier.send(
+                        f"{outcome_em} {city} {t.bin_label} {side_tag} — "
+                        f"закрыта {pnl_sign}${abs(pnl):.2f}"
+                    )
+
+            except Exception as e:
+                logger.error(f"[resolve_live] Error for group {group_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"[resolve_live] Job failed: {e}")
+    finally:
+        session.close()
+
+
 def _job_paper_trade_summary() -> None:
     session = get_session()
     try:
@@ -207,9 +317,6 @@ def _job_daily_summary() -> None:
             ).scalars().all()
         )
         hwm = sum(t.pnl_usd or 0.0 for t in all_resolved)
-
-        best = max(resolved, key=lambda t: t.pnl_usd or 0.0, default=None)
-        worst = min(resolved, key=lambda t: t.pnl_usd or 0.0, default=None)
 
         # ── Live trades ────────────────────────────────────────────────────
         live_resolved = list(
@@ -286,50 +393,37 @@ def _job_daily_summary() -> None:
         session.commit()
 
         # ── Build Telegram message ─────────────────────────────────────────
-        rate_str = f"{wins / len(resolved) * 100:.0f}%" if resolved else "N/A"
-        best_str = (
-            f"🔝 {best.city or best.group_id}: ${best.pnl_usd:+.2f}"
-            if best and best.pnl_usd else ""
-        )
-        worst_str = (
-            f"💸 {worst.city or worst.group_id}: ${worst.pnl_usd:+.2f}"
-            if worst and worst.pnl_usd else ""
-        )
+        msg = f"📅 <b>Итоги дня: {yesterday}</b>\n\n"
 
-        # Paper section
-        msg = (
-            f"📅 <b>Итоги дня: {yesterday}</b>\n\n"
-            f"📝 <b>Бумажная торговля</b> ({len(resolved)} сделок)\n"
-            f"  💰 PnL: ${total_pnl:+.2f}\n"
-            f"  ✅ Win: {wins} | ❌ Loss: {losses} | 🚫 Basket miss: {basket_misses}\n"
-            f"  Winrate: {rate_str}\n"
-            f"  📈 HWM: ${hwm:+.2f}\n"
-            f"  💼 Открытых: {len(open_trades)}\n"
-        )
-        if best_str:
-            msg += f"  {best_str}\n"
-        if worst_str:
-            msg += f"  {worst_str}\n"
-
-        # Live section
+        # LIVE section — always first and prominent
         if live_resolved:
-            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%" if live_resolved else "N/A"
+            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%"
             msg += (
-                f"\n💸 <b>Live торговля</b> ({len(live_resolved)} сделок)\n"
-                f"  💰 PnL: ${live_pnl:+.2f} | ROI: {live_roi:+.1f}%\n"
-                f"  ✅ Win: {live_wins} | ❌ Loss: {live_losses} | Winrate: {live_rate}\n"
-                f"  📦 Поставлено: ${live_staked:.2f}\n"
+                f"💼 <b>LIVE СДЕЛКИ</b>\n"
+                f"💰 PnL: ${live_pnl:+.2f} ({len(live_resolved)} сделок)\n"
+                f"✅ Побед: {live_wins} | ❌ Поражений: {live_losses}\n"
+                f"Winrate: {live_rate} | ROI: {live_roi:+.1f}%\n"
             )
             if live_by_strat:
-                msg += "  По стратегиям:\n"
                 for strat, sv in sorted(live_by_strat.items()):
-                    msg += f"    {strat}: ${sv['pnl']:+.2f} ({sv['wins']}W/{sv['losses']}L)\n"
+                    msg += f"  {strat}: ${sv['pnl']:+.2f} ({sv['wins']}W/{sv['losses']}L)\n"
             if live_best and live_best.pnl_usd:
-                msg += f"  🔝 {live_best.city or '?'} {live_best.bin_label}: ${live_best.pnl_usd:+.2f}\n"
+                msg += f"🔝 {live_best.city or '?'} {live_best.bin_label}: ${live_best.pnl_usd:+.2f}\n"
             if live_worst and live_worst.pnl_usd and live_worst is not live_best:
-                msg += f"  💸 {live_worst.city or '?'} {live_worst.bin_label}: ${live_worst.pnl_usd:+.2f}\n"
+                msg += f"💸 {live_worst.city or '?'} {live_worst.bin_label}: ${live_worst.pnl_usd:+.2f}\n"
         else:
-            msg += "\n💸 <b>Live торговля</b>: нет закрытых сделок за день\n"
+            msg += "💼 <b>Живых сделок сегодня не было</b>\n"
+
+        # PAPER section — always shown, clearly labelled as test/informational
+        rate_str = f"{wins / len(resolved) * 100:.0f}%" if resolved else "N/A"
+        msg += f"\n📝 <b>PAPER</b> (тест, не реальные деньги)\n"
+        if resolved:
+            msg += (
+                f"PnL: ${total_pnl:+.2f} ({len(resolved)} сделок) — информационно\n"
+                f"✅ {wins}W / ❌ {losses}L / 🚫 {basket_misses}BM | Winrate: {rate_str}\n"
+            )
+        else:
+            msg += "Сделок за день нет\n"
 
         if notifier.send(msg):
             if existing:
@@ -361,22 +455,26 @@ def setup_scheduler() -> None:
     schedule.every(15).minutes.do(_job_live_trade_engine)
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(60).minutes.do(_job_paper_trade_summary)
+    schedule.every(30).minutes.do(_job_expire_stale_pending)
+    schedule.every(30).minutes.do(_job_resolve_live_trades)
     schedule.every().day.at("00:05").do(_job_daily_summary)
     mode = settings.trading_mode.upper()
     logger.info(
         f"Scheduler ready [{mode}]: discover=30 min | snapshots=10 min | "
         "open-meteo=60 min | deactivate=60 min | "
-        "paper-trade=15 min | live-trade=15 min | resolve=60 min | "
-        "summary=60 min | daily=00:05 UTC"
+        "paper-trade=15 min | live-trade=15 min | resolve-paper=60 min | "
+        "resolve-live=30 min | expire-pending=30 min | summary=60 min | daily=00:05 UTC"
     )
 
 
 def run_initial_jobs() -> None:
     logger.info("Running initial data collection on startup...")
+    _job_expire_stale_pending()
     _job_discover_markets()
     _job_fetch_open_meteo()
     _job_snapshot_markets()
     _job_resolve_paper_trades()
+    _job_resolve_live_trades()
     _job_paper_trade_engine()
     _job_live_trade_engine()
     _job_paper_trade_summary()

@@ -1,6 +1,6 @@
 """
 Central risk controller — all trading decisions pass through here.
-State is held in memory (thread-safe) and mirrored to the DB.
+State is held in memory (thread-safe) and refreshed from DB before each check/display.
 """
 from __future__ import annotations
 
@@ -62,6 +62,75 @@ class RiskManager:
             logger.info("RiskManager: rolling daily state for new UTC day")
             self._reset_daily_state()
 
+    def _load_live_stats(self) -> None:
+        """
+        Refresh counters from DB so they survive process restarts.
+        Safe to call inside self._lock; catches all errors and falls back
+        to in-memory values.
+        """
+        try:
+            from sqlalchemy import select, func
+            from src.db.session import get_session
+            from src.db.models import LiveTrade
+
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            session = get_session()
+            try:
+                # -- Daily bet count (all trades placed today) --
+                self._daily_bets_count = int(
+                    session.execute(
+                        select(func.count()).select_from(LiveTrade).where(
+                            LiveTrade.placed_at >= today_start
+                        )
+                    ).scalar() or 0
+                )
+
+                # -- Concurrent open / pending positions --
+                rows = session.execute(
+                    select(
+                        LiveTrade.group_id,
+                        LiveTrade.id,
+                        LiveTrade.stake_usd,
+                    ).where(LiveTrade.status.in_(["pending", "open"]))
+                ).all()
+                self._open_bets = {
+                    (r.group_id or r.id): (r.stake_usd or 0.0) for r in rows
+                }
+
+                # -- Daily loss (filled trades today with negative PnL) --
+                v = session.execute(
+                    select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
+                        LiveTrade.filled_at >= today_start,
+                        LiveTrade.pnl_usd < 0,
+                    )
+                ).scalar() or 0.0
+                self._daily_loss = abs(float(v))
+
+                # -- Total loss (all-time, negative PnL) --
+                v = session.execute(
+                    select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
+                        LiveTrade.pnl_usd < 0,
+                    )
+                ).scalar() or 0.0
+                self._total_loss = abs(float(v))
+
+                # -- Daily PnL (resolved today) --
+                v = session.execute(
+                    select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
+                        LiveTrade.resolved_at >= today_start,
+                        LiveTrade.pnl_usd.isnot(None),
+                    )
+                ).scalar() or 0.0
+                self._daily_pnl = float(v)
+
+            finally:
+                session.close()
+
+        except Exception as exc:
+            logger.warning(
+                f"RiskManager: DB sync failed — using cached in-memory values: {exc}"
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -74,6 +143,7 @@ class RiskManager:
         """
         with self._lock:
             self._maybe_roll_day()
+            self._load_live_stats()  # sync from DB before checking limits
 
             # 1. Emergency stop
             if self._emergency_stop:
@@ -140,6 +210,7 @@ class RiskManager:
     def get_status(self) -> RiskStatus:
         with self._lock:
             self._maybe_roll_day()
+            self._load_live_stats()  # always show live DB values
             return RiskStatus(
                 daily_pnl=self._daily_pnl,
                 daily_loss=self._daily_loss,

@@ -34,6 +34,8 @@ def _make_rm(**kwargs):
         rm._emergency_stop = False
         rm._emergency_stop_reason = ""
         rm._open_bets = {}
+        # Disable DB sync so tests run against pure in-memory state
+        rm._load_live_stats = lambda: None
         return rm
 
 

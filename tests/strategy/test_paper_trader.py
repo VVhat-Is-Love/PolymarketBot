@@ -249,10 +249,7 @@ def test_run_resolve_paper_trades_no_open_trades():
     """Resolve job exits cleanly when there are no open trades."""
     from src.strategy.paper_trader import run_resolve_paper_trades
 
-    with patch("src.strategy.paper_trader.get_session") as mock_get_session, \
-         patch("src.strategy.paper_trader.get_notifier") as mock_notifier:
-        mock_notifier.return_value.enabled = False
-        mock_notifier.return_value.send = MagicMock(return_value=False)
+    with patch("src.strategy.paper_trader.get_session") as mock_get_session:
         session = MagicMock()
         mock_get_session.return_value = session
         session.execute.return_value.scalars.return_value.all.return_value = []
@@ -299,13 +296,9 @@ def test_run_resolve_paper_trades_basket_miss():
     market_m3.bin_max = 75.0
 
     with patch("src.strategy.paper_trader.get_session") as mock_gs, \
-         patch("src.strategy.paper_trader.get_notifier") as mock_notifier, \
          patch("src.data.open_meteo.fetch_actual_temperature", return_value=None), \
          patch("src.config.cities.CITIES_WHITELIST",
                {"New York": {"lat": 40.7, "lon": -74.0, "station": "JFK", "unit": "F"}}):
-        mock_notifier.return_value.enabled = False
-        mock_notifier.return_value.send = MagicMock(return_value=False)
-
         session = MagicMock()
         mock_gs.return_value = session
 

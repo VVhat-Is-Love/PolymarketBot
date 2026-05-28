@@ -11,7 +11,7 @@ from loguru import logger
 from sqlalchemy import select, func
 
 from src.db.session import get_session
-from src.db.models import LiveTrade, MarketSnapshot
+from src.db.models import LiveTrade, MarketGroup, MarketSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +240,7 @@ def get_trades(filter_status: str = "open", limit: int = 10) -> list[LiveTrade]:
             "pending":   ["pending"],
             "filled":    ["filled"],
             "cancelled": ["cancelled", "expired"],
+            "history":   ["filled", "cancelled", "expired"],
             "all":       ["pending", "open", "filled", "cancelled", "expired"],
         }
         statuses = status_map.get(filter_status, ["pending", "open"])
@@ -290,3 +291,134 @@ def get_current_price(market_id: str) -> float | None:
         return snap.price_yes if snap else None
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Resolution dates for market groups
+# ---------------------------------------------------------------------------
+
+def get_resolution_dates(group_ids: list[str]) -> dict[str, date]:
+    """Return {group_id: resolution_date} for the given group IDs."""
+    if not group_ids:
+        return {}
+    session = get_session()
+    try:
+        rows = session.execute(
+            select(MarketGroup.group_id, MarketGroup.resolution_date).where(
+                MarketGroup.group_id.in_(group_ids)
+            )
+        ).all()
+        return {r.group_id: r.resolution_date for r in rows}
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Real Polymarket positions (authoritative source)
+# ---------------------------------------------------------------------------
+
+def get_real_polymarket_positions() -> list[dict]:
+    """
+    Fetch all positions from Polymarket data-api.
+    All monetary values (cost, current_value, pnl, pnl_pct) are pre-computed
+    by the API — not recalculated locally.
+
+    Key field note: the API uses 'curPrice' (NOT 'currentPrice').
+
+    Returns [] on any network/HTTP error (errors logged).
+    Classification helpers (won / active / lost) live in bot.py callers.
+    """
+    import requests
+    from src.config.settings import settings
+
+    if not settings.proxy_wallet_address:
+        logger.warning("[positions] PROXY_WALLET_ADDRESS не задан")
+        return []
+
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={
+                "user": settings.proxy_wallet_address,
+                "sizeThreshold": 0.1,
+                "sortBy": "CURRENT",
+                "sortDirection": "DESC",
+                "limit": 100,
+            },
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json() or []
+    except Exception as e:
+        logger.error(f"[positions] data-api запрос упал: {e}")
+        return []
+
+    if raw:
+        logger.debug(f"[positions] sample raw position: {raw[0]}")
+
+    positions = []
+    for p in raw:
+        cur_price = float(p.get("curPrice", 0))      # curPrice — правильное имя поля
+        avg_price = float(p.get("avgPrice", 0))
+        positions.append({
+            "title": p.get("title", "Unknown"),
+            "outcome": p.get("outcome", "?"),
+            "size": float(p.get("size", 0)),
+            "avg_price": avg_price,
+            "cur_price": cur_price,
+            "cost": float(p.get("initialValue", 0)),
+            "current_value": float(p.get("currentValue", 0)),
+            "pnl": float(p.get("cashPnl", 0)),
+            "pnl_pct": float(p.get("percentPnl", 0)),
+            "redeemable": bool(p.get("redeemable", False)),
+            "end_date": p.get("endDate", ""),
+            "condition_id": p.get("conditionId", ""),
+        })
+    return positions
+
+
+# ---------------------------------------------------------------------------
+# Portfolio breakdown (cash + open positions)
+# ---------------------------------------------------------------------------
+
+def get_portfolio_breakdown() -> dict:
+    """
+    Returns:
+      cash_balance     — free USDC inside Polymarket (via CLOB API)
+      positions_value  — sum(size * currentPrice) for open positions (via data-api)
+      positions_count  — number of open positions
+      positions_pnl    — total unrealized PnL across all positions
+      total            — cash_balance + positions_value
+    Each key falls back to 0.0 on error; errors are logged as warnings.
+    """
+    result = {
+        "cash_balance": 0.0,
+        "positions_value": 0.0,
+        "positions_count": 0,
+        "positions_pnl": 0.0,
+        "total": 0.0,
+    }
+
+    # 1. Free USDC inside the exchange via CLOB V2 API
+    try:
+        from src.blockchain.polymarket_auth import get_clob_client
+        from src.blockchain.balance import get_polymarket_cash_balance
+        client = get_clob_client()
+        result["cash_balance"] = get_polymarket_cash_balance(client)
+    except Exception as exc:
+        logger.warning(f"[stats] cash_balance fetch failed: {exc}")
+
+    # 2. Current market value of open positions via Polymarket data-api
+    try:
+        positions = get_real_polymarket_positions()
+        # Exclude clearly lost positions (cur_price ~0 and not redeemable)
+        relevant = [p for p in positions if p["cur_price"] > 0.01 or p["redeemable"]]
+        result["positions_value"] = sum(p["current_value"] for p in relevant)
+        result["positions_count"] = len(relevant)
+        result["positions_pnl"] = sum(p["pnl"] for p in relevant)
+    except Exception as exc:
+        logger.warning(f"[stats] positions_value fetch failed: {exc}")
+
+    result["total"] = result["cash_balance"] + result["positions_value"]
+    return result
