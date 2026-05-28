@@ -140,6 +140,88 @@ def _job_resolve_paper_trades() -> None:
         logger.error(f"Resolve paper trades job failed: {e}")
 
 
+def _job_reconcile_orders() -> None:
+    """
+    Non-blocking reconciliation: poll CLOB status for all open/pending orders.
+    Runs every 2 minutes — replaces the blocking _poll_until_filled_or_timeout loop.
+    Orders older than ORDER_TIMEOUT_MINUTES are cancelled and marked expired.
+    """
+    from datetime import timedelta
+    from src.config.settings import settings
+    from src.market.order_executor import get_order_status, cancel_order
+    from src.notifications.telegram import get_notifier
+
+    notifier = get_notifier()
+    session = get_session()
+    try:
+        timeout = timedelta(minutes=settings.order_timeout_minutes)
+        now = datetime.utcnow()
+
+        pending_open = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.status.in_(["open", "pending"]),
+                    LiveTrade.order_id.isnot(None),
+                )
+            ).scalars().all()
+        )
+
+        if not pending_open:
+            return
+
+        logger.debug(f"[reconcile] Checking {len(pending_open)} open/pending orders")
+
+        for t in pending_open:
+            try:
+                clob_status = get_order_status(t.order_id)
+            except Exception as exc:
+                logger.warning(f"[reconcile] Status check failed for {t.order_id[:12]}…: {exc}")
+                continue
+
+            placed_at = t.placed_at or now
+
+            if clob_status == "filled":
+                t.status = "filled"
+                t.filled_price = t.target_price
+                t.filled_at = now
+                session.commit()
+                city = t.city or t.group_id or "?"
+                logger.info(f"[reconcile] FILLED: {city} {t.bin_label} order={t.order_id[:12]}…")
+                notifier.send(
+                    f"✅ Исполнен [{t.strategy_name}]: {city} {t.bin_label} | "
+                    f"${t.target_price:.4f} × {t.size_shares:.4f}"
+                )
+
+            elif clob_status == "cancelled":
+                t.status = "cancelled"
+                t.cancelled_at = now
+                session.commit()
+                logger.info(
+                    f"[reconcile] CANCELLED by exchange: {t.city or '?'} {t.bin_label}"
+                )
+
+            elif (now - placed_at) > timeout:
+                # Order timed out — cancel it
+                try:
+                    cancel_order(t.order_id)
+                except Exception:
+                    pass
+                t.status = "expired"
+                t.cancelled_at = now
+                session.commit()
+                city = t.city or t.group_id or "?"
+                logger.warning(
+                    f"[reconcile] EXPIRED (>{settings.order_timeout_minutes}m): "
+                    f"{city} {t.bin_label} order={t.order_id[:12]}…"
+                )
+                notifier.send(f"⏰ Истёк [{t.strategy_name}]: {city} {t.bin_label}")
+
+    except Exception as exc:
+        logger.error(f"[reconcile] Job failed: {exc}")
+    finally:
+        session.close()
+
+
 def _job_expire_stale_pending() -> None:
     """Mark pending limit orders older than 2 hours as expired (FIX 5)."""
     from datetime import timedelta
@@ -470,6 +552,7 @@ def setup_scheduler() -> None:
         schedule.every(15).minutes.do(_job_live_trade_engine)
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(60).minutes.do(_job_paper_trade_summary)
+    schedule.every(2).minutes.do(_job_reconcile_orders)
     schedule.every(30).minutes.do(_job_expire_stale_pending)
     schedule.every(30).minutes.do(_job_resolve_live_trades)
     schedule.every().day.at("00:05").do(_job_daily_summary)

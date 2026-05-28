@@ -262,7 +262,8 @@ def _place_basket_orders(
                 logger.warning(f"[{strategy_name}] Order failed for {group.city} {o.bin_label}")
                 continue
 
-            # Write to DB only after confirmed order placement (P1-7 fix)
+            # Write to DB only after confirmed order placement — status "open" (P1-7/P1-8)
+            # Fill detection is handled by _job_reconcile_orders (non-blocking, every 2 min)
             trade = LiveTrade(
                 id=str(uuid.uuid4()),
                 group_id=group.group_id,
@@ -282,34 +283,10 @@ def _place_basket_orders(
             session.add(trade)
             session.commit()
             placed_order_ids.append(order_id)
-
-            final_status = _poll_until_filled_or_timeout(
-                order_id=order_id,
-                timeout_minutes=settings.order_timeout_minutes,
+            logger.info(
+                f"[{strategy_name}] ORDER PLACED: {group.city} {o.bin_label} "
+                f"order_id={order_id[:16]}…"
             )
-
-            if final_status == "filled":
-                trade.status = "filled"
-                trade.filled_price = o.ask_price
-                trade.filled_at = datetime.utcnow()
-                session.commit()
-                logger.info(
-                    f"[{strategy_name}] ORDER FILLED: {group.city} {o.bin_label} "
-                    f"@ {o.ask_price:.4f} × {o.shares:.4f} shares"
-                )
-                notifier.send(
-                    f"✅ Заполнен [{strategy_name}]: {group.city} {o.bin_label} | "
-                    f"${o.ask_price:.4f} × {o.shares:.4f}"
-                )
-            else:
-                cancel_order(order_id)
-                trade.status = "expired"
-                trade.cancelled_at = datetime.utcnow()
-                session.commit()
-                logger.warning(
-                    f"[{strategy_name}] ORDER EXPIRED: {group.city} {o.bin_label} — cancelled"
-                )
-                notifier.send(f"⏰ Истёк [{strategy_name}]: {group.city} {o.bin_label}")
 
         if placed_order_ids:
             risk_manager.record_bet_placed(group.group_id, total_notional, strategy=strategy_name)
