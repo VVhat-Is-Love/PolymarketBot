@@ -199,8 +199,28 @@ def scan_tails(
             result.skipped.append(f"{label}:dust_yes={yes_price:.3f}")
             continue
 
-        no_ask = no_asks.get(m.market_id) if no_asks else (1.0 - yes_price)
-        if no_ask is None or not (0.0 < no_ask < 1.0):
+        if no_asks is not None:
+            no_ask = no_asks.get(m.market_id)
+            if no_ask is None:
+                result.skipped.append(f"{label}:no_order_book")
+                continue
+        else:
+            # Approximation: add slippage buffer to account for spread
+            raw_approx = 1.0 - yes_price
+            no_ask = min(0.99, raw_approx * (1.0 + ss.tail_slippage_buffer))
+            logger.debug(f"[tail] {label}: approx no_ask={no_ask:.4f} (raw={raw_approx:.4f})")
+
+        if not (0.0 < no_ask < 1.0):
+            continue
+
+        # Price band guard: only trade within the viable NO ask range
+        if hasattr(ss, 'tail_min_no_ask') and (
+            no_ask < ss.tail_min_no_ask or no_ask > ss.tail_max_no_ask
+        ):
+            result.skipped.append(
+                f"{label}:out_of_band_no_ask={no_ask:.3f} "
+                f"[{ss.tail_min_no_ask:.2f},{ss.tail_max_no_ask:.2f}]"
+            )
             continue
 
         p_model_no = 1.0 - yes_probs.get(m.market_id, 0.0)
