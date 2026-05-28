@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     # Set to your actual Polymarket USDC balance so Kelly stake is calculated correctly.
     live_wallet_balance_usd: float = Field(default=0.0)
 
+    # Order entry price mode (G2-3)
+    # 'ask' = best_ask + entry_tick (marketable limit, higher fill rate)
+    # 'mid' = passive limit at mid-price (cheaper but may not fill on thin markets)
+    entry_price_mode: str = Field(default="ask")
+    entry_tick: float = Field(default=0.01)  # added on top of best_ask in 'ask' mode
+
+    # Notification routing (G2-4)
+    # Comma-separated Telegram chat IDs for each audience
+    paper_notify_chat_ids: str = Field(default="")   # owner only
+    live_notify_chat_ids: str = Field(default="")    # owner + client
+    client_chat_ids: str = Field(default="")         # client receives only reconciled PnL
+
     # === STAGE 4+ ===
     anthropic_api_key: str = Field(default="")
     redis_url: str = Field(default="")

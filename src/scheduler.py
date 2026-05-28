@@ -248,11 +248,98 @@ def _job_expire_stale_pending() -> None:
         session.close()
 
 
+def _job_reconcile_pnl() -> None:
+    """
+    G2-1: Reconcile live trade PnL against Polymarket Data API.
+
+    Source of truth: /activity (cash flows) + /positions (open MTM).
+    Matches by condition_id. Marks reconciled_with_polymarket=True once confirmed.
+    Runs every 15 min. Only touches trades with condition_id set.
+    """
+    from src.config.settings import settings
+    from src.market.polymarket_data import get_activity, realized_pnl_by_condition
+    from src.notifications.telegram import get_notifier
+
+    if not settings.proxy_wallet_address:
+        logger.debug("[reconcile_pnl] No proxy_wallet_address — skip")
+        return
+
+    notifier = get_notifier()
+    session = get_session()
+    try:
+        # Fetch all trades that have condition_id but are not yet reconciled
+        unreconciled: list[LiveTrade] = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.condition_id.isnot(None),
+                    LiveTrade.reconciled_with_polymarket == False,  # noqa: E712
+                    LiveTrade.status.in_(["filled", "open", "expired", "cancelled"]),
+                )
+            ).scalars().all()
+        )
+
+        if not unreconciled:
+            logger.debug("[reconcile_pnl] No unreconciled trades with condition_id")
+            return
+
+        logger.info(f"[reconcile_pnl] Checking {len(unreconciled)} trades against Data API")
+
+        activity = get_activity(settings.proxy_wallet_address)
+        pnl_map = realized_pnl_by_condition(activity)
+
+        for t in unreconciled:
+            cid = t.condition_id
+            if cid not in pnl_map:
+                continue  # no activity for this condition yet (market still open)
+
+            realized = pnl_map[cid]
+
+            # Determine if the position has been settled:
+            # A settled position has at least one REDEEM or SELL in the activity map.
+            has_cash_in = any(
+                (a.get("conditionId") == cid and
+                 (a.get("type") == "REDEEM" or
+                  (a.get("type") == "TRADE" and a.get("side", "").upper() == "SELL")))
+                for a in activity
+            )
+            if not has_cash_in and realized < 0:
+                # Only BUY activity — position still open, skip
+                continue
+
+            old_pnl = t.pnl_usd
+            t.pnl_usd = round(realized, 4)
+            t.reconciled_with_polymarket = True
+            t.resolved_at = t.resolved_at or datetime.utcnow()
+
+            # Update status to resolved if it was still "open"
+            if t.status in ("open", "pending"):
+                t.status = "filled"
+
+            session.commit()
+
+            pnl_sign = "+" if realized >= 0 else ""
+            city = t.city or t.group_id or "?"
+            logger.info(
+                f"[reconcile_pnl] ✅ Reconciled: {city} {t.bin_label} "
+                f"PnL={pnl_sign}${realized:.2f} (was {old_pnl})"
+            )
+            outcome_em = "✅" if realized > 0 else "❌"
+            notifier.send(
+                f"{outcome_em} [{t.strategy_name}] {city} {t.bin_label} — "
+                f"закрыта {pnl_sign}${abs(realized):.2f} (сверено Polymarket)"
+            )
+
+    except Exception as exc:
+        logger.error(f"[reconcile_pnl] Job failed: {exc}")
+    finally:
+        session.close()
+
+
 def _job_resolve_live_trades() -> None:
     """
-    For every filled-but-unresolved LiveTrade, poll Gamma prices.
-    When price_yes → 0 or 1 the market has resolved — record PnL and
-    send a Telegram notification. Runs every 30 min.
+    LEGACY: weather-based resolution for trades WITHOUT condition_id.
+    For trades that were placed before G2-1 (no Polymarket matching keys).
+    New trades use _job_reconcile_pnl instead.
     """
     session = get_session()
     notifier = get_notifier()
@@ -431,21 +518,24 @@ def _job_daily_summary() -> None:
         live_hwm = sum(t.pnl_usd or 0.0 for t in all_live_resolved)
         hwm = paper_hwm + live_hwm
 
-        # ── Live trades ────────────────────────────────────────────────────
+        # ── Live trades — grouped by placed_at date (G2-2) ────────────────
+        # Use placed_at (entry date) not resolved_at: resolution can lag 1-2 days
         live_resolved = list(
             session.execute(
                 select(LiveTrade).where(
-                    LiveTrade.resolved_at >= day_start,
-                    LiveTrade.resolved_at < day_end,
+                    LiveTrade.placed_at >= day_start,
+                    LiveTrade.placed_at < day_end,
                     LiveTrade.pnl_usd.isnot(None),
                 )
             ).scalars().all()
         )
         live_pnl = sum(t.pnl_usd or 0.0 for t in live_resolved)
+        # win/loss by sign of pnl_usd (redemption-cost), not by cash-flow direction (G2-2)
         live_wins = sum(1 for t in live_resolved if (t.pnl_usd or 0.0) > 0)
-        live_losses = len(live_resolved) - live_wins
+        live_losses = sum(1 for t in live_resolved if (t.pnl_usd or 0.0) < 0)
         live_staked = sum(t.stake_usd or 0.0 for t in live_resolved)
         live_roi = (live_pnl / live_staked * 100) if live_staked > 0 else 0.0
+        all_reconciled = all(t.reconciled_with_polymarket for t in live_resolved)
 
         # By strategy for live trades
         live_by_strat: dict[str, dict] = {}
@@ -505,40 +595,65 @@ def _job_daily_summary() -> None:
             ))
         session.commit()
 
-        # ── Build Telegram message ─────────────────────────────────────────
-        msg = f"📅 <b>Итоги дня: {yesterday}</b>\n\n"
+        # ── Build Telegram messages (G2-2/G2-4) ───────────────────────────
+        # Owner message: full details including paper
+        owner_msg = f"📅 <b>Итоги дня: {yesterday}</b>\n\n"
 
-        # LIVE section — always first and prominent
         if live_resolved:
-            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%"
-            msg += (
+            live_staked_total = sum(t.stake_usd or 0.0 for t in live_resolved)
+            live_received = live_staked_total + live_pnl
+            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%" if live_resolved else "N/A"
+            reconcile_flag = "✅" if all_reconciled else "⚠️ не сверено"
+            owner_msg += (
                 f"💼 <b>LIVE СДЕЛКИ</b>\n"
-                f"💰 PnL: ${live_pnl:+.2f} ({len(live_resolved)} сделок)\n"
-                f"✅ Побед: {live_wins} | ❌ Поражений: {live_losses}\n"
+                f"Вложено: ${live_staked_total:.2f}   Получено: ${live_received:.2f}"
+                f"   Итог: ${live_pnl:+.2f}\n"
+                f"Сделок: {len(live_resolved)} | Побед: {live_wins} | Поражений: {live_losses}\n"
                 f"Winrate: {live_rate} | ROI: {live_roi:+.1f}%\n"
+                f"Сверено с Polymarket: {reconcile_flag}\n"
             )
             if live_by_strat:
                 for strat, sv in sorted(live_by_strat.items()):
-                    msg += f"  {strat}: ${sv['pnl']:+.2f} ({sv['wins']}W/{sv['losses']}L)\n"
+                    owner_msg += f"  {strat}: ${sv['pnl']:+.2f} ({sv['wins']}W/{sv['losses']}L)\n"
             if live_best and live_best.pnl_usd:
-                msg += f"🔝 {live_best.city or '?'} {live_best.bin_label}: ${live_best.pnl_usd:+.2f}\n"
+                owner_msg += f"🔝 {live_best.city or '?'} {live_best.bin_label}: ${live_best.pnl_usd:+.2f}\n"
             if live_worst and live_worst.pnl_usd and live_worst is not live_best:
-                msg += f"💸 {live_worst.city or '?'} {live_worst.bin_label}: ${live_worst.pnl_usd:+.2f}\n"
+                owner_msg += f"💸 {live_worst.city or '?'} {live_worst.bin_label}: ${live_worst.pnl_usd:+.2f}\n"
         else:
-            msg += "💼 <b>Живых сделок сегодня не было</b>\n"
+            owner_msg += "💼 <b>Живых сделок сегодня не было</b>\n"
 
-        # PAPER section — always shown, clearly labelled as test/informational
         rate_str = f"{wins / len(resolved) * 100:.0f}%" if resolved else "N/A"
-        msg += f"\n📝 <b>PAPER</b> (тест, не реальные деньги)\n"
+        owner_msg += f"\n📝 <b>PAPER</b> (тест, не реальные деньги)\n"
         if resolved:
-            msg += (
+            owner_msg += (
                 f"PnL: ${total_pnl:+.2f} ({len(resolved)} сделок) — информационно\n"
                 f"✅ {wins}W / ❌ {losses}L / 🚫 {basket_misses}BM | Winrate: {rate_str}\n"
             )
         else:
-            msg += "Сделок за день нет\n"
+            owner_msg += "Сделок за день нет\n"
 
-        if notifier.send(msg):
+        # Client message: only if all trades reconciled with Polymarket (G2-2 gate)
+        client_msg: str | None = None
+        if live_resolved and all_reconciled:
+            live_staked_total = sum(t.stake_usd or 0.0 for t in live_resolved)
+            live_received = live_staked_total + live_pnl
+            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%"
+            client_msg = (
+                f"📅 <b>День {yesterday}</b> (по дате открытия сделок)\n\n"
+                f"💼 Вложено: ${live_staked_total:.2f}   Получено: ${live_received:.2f}\n"
+                f"💰 Итог: ${live_pnl:+.2f}\n"
+                f"Сделок: {len(live_resolved)} | Побед: {live_wins} | Поражений: {live_losses}\n"
+                f"Сверено с Polymarket: ✅"
+            )
+
+        # Send to owner (all modes)
+        sent = notifier.send(owner_msg)
+        # Send to client (live mode only, reconciled only)
+        from src.config.settings import settings as _s
+        if client_msg and _s.trading_mode.lower() == "live":
+            _send_to_clients(client_msg)
+
+        if sent:
             if existing:
                 existing.sent_at = datetime.utcnow()
             else:
@@ -556,6 +671,26 @@ def _job_daily_summary() -> None:
         logger.error(f"Daily summary job failed: {e}")
     finally:
         session.close()
+
+
+def _send_to_clients(msg: str) -> None:
+    """Send msg to client chat IDs (G2-4). Silently skips if not configured."""
+    from src.config.settings import settings
+    raw = settings.client_chat_ids or ""
+    chat_ids = [c.strip() for c in raw.split(",") if c.strip()]
+    if not chat_ids:
+        return
+    try:
+        import requests as _req
+        token = settings.telegram_bot_token
+        for cid in chat_ids:
+            _req.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": cid, "text": msg, "parse_mode": "HTML"},
+                timeout=10,
+            )
+    except Exception as exc:
+        logger.warning(f"[send_to_clients] Failed: {exc}")
 
 
 def setup_scheduler() -> None:
@@ -580,6 +715,7 @@ def setup_scheduler() -> None:
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(60).minutes.do(_job_paper_trade_summary)
     schedule.every(2).minutes.do(_job_reconcile_orders)
+    schedule.every(15).minutes.do(_job_reconcile_pnl)
     schedule.every(30).minutes.do(_job_expire_stale_pending)
     schedule.every(30).minutes.do(_job_resolve_live_trades)
     schedule.every().sunday.at("04:00").do(_job_cleanup_snapshots)
@@ -600,6 +736,7 @@ def run_initial_jobs() -> None:
     _job_fetch_open_meteo()
     _job_snapshot_markets()
     _job_resolve_paper_trades()
+    _job_reconcile_pnl()       # G2-1: reconcile first, so live summary is correct
     _job_resolve_live_trades()
     _job_paper_trade_engine()
     _job_live_trade_engine()

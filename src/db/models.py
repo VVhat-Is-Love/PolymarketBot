@@ -229,6 +229,14 @@ class LiveTrade(Base):
     actual_temp: Mapped[float | None] = mapped_column(Float, nullable=True)
     city: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Polymarket matching keys (G2-1: PnL reconciliation via Data API)
+    condition_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    token_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    basket_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    reconciled_with_polymarket: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
+
 
 class ChecklistEvaluation(Base):
     __tablename__ = "checklist_evaluations"

@@ -210,6 +210,19 @@ def _poll_until_filled_or_timeout(
 # Order placement helper — shared by Strategy A and B
 # ---------------------------------------------------------------------------
 
+def _entry_price(ask_price: float, settings) -> float:
+    """
+    G2-3: Return the order entry price.
+    In 'ask' mode (default): best_ask + entry_tick, capped at 0.99.
+    This makes the limit order marketable — higher fill probability.
+    """
+    mode = getattr(settings, "entry_price_mode", "ask")
+    if mode == "ask":
+        tick = getattr(settings, "entry_tick", 0.01)
+        return min(0.99, round(ask_price + tick, 4))
+    return ask_price  # 'mid' mode: passive limit
+
+
 def _place_basket_orders(
     session: Session,
     group: MarketGroup,
@@ -236,6 +249,8 @@ def _place_basket_orders(
         logger.info(f"[{strategy_name}] Basket risk-block {group.city}: {reason}")
         return
 
+    # Shared basket_id links all legs for partial-fill detection (G2-5)
+    basket_id = str(uuid.uuid4())
     placed_order_ids: list[str] = []
 
     try:
@@ -254,6 +269,7 @@ def _place_basket_orders(
         for o in decision.bins:
             mkt = markets_by_id.get(o.market_id)
             token_id = (mkt.token_id_yes if mkt else None) or ""
+            condition_id = (mkt.condition_id if mkt else None)
 
             if not token_id:
                 logger.warning(
@@ -262,12 +278,15 @@ def _place_basket_orders(
                 )
                 continue
 
+            # G2-3: use best_ask price mode (marketable limit = faster fill)
+            entry_price = _entry_price(o.ask_price, settings)
+
             # Place order FIRST — risk already checked at basket level (skip_risk_check=True)
             order_id = place_limit_order(
                 market_id=o.market_id,
                 token_id=token_id,
                 side="BUY",
-                price=o.ask_price,
+                price=entry_price,
                 size=o.shares,
                 skip_risk_check=True,
             )
@@ -283,7 +302,7 @@ def _place_basket_orders(
                 group_id=group.group_id,
                 market_id=o.market_id,
                 bin_label=o.bin_label,
-                target_price=o.ask_price,
+                target_price=entry_price,
                 size_shares=o.shares,
                 stake_usd=o.stake_usd,
                 basket_role="basket",
@@ -293,13 +312,16 @@ def _place_basket_orders(
                 order_id=order_id,
                 side="buy",
                 placed_at=datetime.utcnow(),
+                condition_id=condition_id,
+                token_id=token_id,
+                basket_id=basket_id,
             )
             session.add(trade)
             session.commit()
             placed_order_ids.append(order_id)
             logger.info(
                 f"[{strategy_name}] ORDER PLACED: {group.city} {o.bin_label} "
-                f"order_id={order_id[:16]}…"
+                f"price={entry_price:.4f} order_id={order_id[:16]}…"
             )
 
         if placed_order_ids:
@@ -683,6 +705,8 @@ def run_tail_engine() -> None:
                         city=group.city,
                         status="pending",
                         side="buy",
+                        condition_id=(mkt.condition_id if mkt else None),
+                        token_id=token_no,
                     )
                     session.add(trade)
                     session.commit()
