@@ -63,9 +63,13 @@ class StrategySettings(BaseSettings):
     tail_min_hours_to_close: float = Field(default=3.0)   # don't enter < N hours (too late)
     tail_kelly_fraction: float = Field(default=0.20)   # fractional Kelly multiplier
     tail_max_position_pct: float = Field(default=0.20) # max single NO position as pct of wallet
-    tail_max_position_usd: float = Field(default=12.0) # hard cap per NO position
-    tail_max_portfolio_pct: float = Field(default=0.60) # max total NO portfolio as pct of wallet
+    tail_max_position_usd: float = Field(default=6.0)  # hard cap per NO position (was 12)
+    tail_max_portfolio_pct: float = Field(default=0.35) # max total NO portfolio as pct of wallet (was 0.60)
     tail_sigma_c: float = Field(default=2.0)           # wider Gaussian sigma for tail model (°C)
+    # Interim guards for no_ask approximation (P0-3 / until P1-5 provides real order book)
+    tail_min_no_ask: float = Field(default=0.85)       # below = event too likely to be worth it
+    tail_max_no_ask: float = Field(default=0.94)       # above = payoff too thin for 100% loss risk
+    tail_slippage_buffer: float = Field(default=0.01)  # buffer added on top of approximated ask
 
 
 strategy_settings = StrategySettings()

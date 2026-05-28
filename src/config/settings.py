@@ -36,12 +36,19 @@ class Settings(BaseSettings):
 
     # Risk Management
     max_single_bet_usd: float = Field(default=3.0)
-    max_daily_bets: int = Field(default=5)
-    max_concurrent_bets: int = Field(default=5)
+    max_daily_bets: int = Field(default=10)
+    max_concurrent_bets: int = Field(default=15)   # legacy; separate caps used below
     daily_loss_limit_usd: float = Field(default=10.0)
     total_stop_loss_usd: float = Field(default=20.0)
-    order_timeout_minutes: int = Field(default=30)
+    order_timeout_minutes: int = Field(default=5)
     kelly_fraction: float = Field(default=0.25)
+
+    # Separate capital caps per strategy
+    max_basket_legs_open: int = Field(default=12)
+    max_tail_positions: int = Field(default=3)
+    total_deployed_cap_usd: float = Field(default=40.0)
+    basket_max_usd: float = Field(default=26.0)
+    tail_max_usd: float = Field(default=18.0)
 
     trading_mode: str = Field(default="paper")  # 'paper' | 'live'
     # Fallback balance if CLOB API balance query fails (Level 1 auth limitation).
