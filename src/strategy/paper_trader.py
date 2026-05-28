@@ -65,26 +65,49 @@ def _get_latest_snapshots(
 
 
 def _get_forecasts_for_group(session: Session, group: MarketGroup) -> list[WeatherSnapshot]:
-    """Latest multi-model Open-Meteo forecasts for group's city + resolution_date."""
-    rows = (
-        session.execute(
-            select(WeatherSnapshot).where(
-                WeatherSnapshot.city == group.city,
-                WeatherSnapshot.forecast_date == group.resolution_date,
-                WeatherSnapshot.source.startswith("open_meteo:"),  # type: ignore[union-attr]
+    """
+    Latest multi-model Open-Meteo forecasts for group's city + resolution_date.
+    Falls back to ±1 day for European cities where UTC conversion shifts the date.
+    """
+    from datetime import timedelta
+
+    def _deduped_query(target_date) -> list[WeatherSnapshot]:
+        rows = (
+            session.execute(
+                select(WeatherSnapshot).where(
+                    WeatherSnapshot.city == group.city,
+                    WeatherSnapshot.forecast_date == target_date,
+                    WeatherSnapshot.source.startswith("open_meteo:"),  # type: ignore[union-attr]
+                )
+                .order_by(WeatherSnapshot.snapshot_time.desc())
             )
-            .order_by(WeatherSnapshot.snapshot_time.desc())
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    seen: set[str] = set()
-    unique: list[WeatherSnapshot] = []
-    for row in rows:
-        if row.source not in seen:
-            seen.add(row.source)
-            unique.append(row)
-    return unique
+        seen: set[str] = set()
+        unique: list[WeatherSnapshot] = []
+        for row in rows:
+            if row.source not in seen:
+                seen.add(row.source)
+                unique.append(row)
+        return unique
+
+    forecasts = _deduped_query(group.resolution_date)
+    if forecasts:
+        return forecasts
+
+    # G2-6: TZ-shift fallback for European cities (UTC+1/+2)
+    for delta in (-1, 1):
+        alt_date = group.resolution_date + timedelta(days=delta)
+        fallback = _deduped_query(alt_date)
+        if fallback:
+            logger.debug(
+                f"[paper_trader] {group.city}: no forecast for {group.resolution_date}, "
+                f"using {alt_date} (TZ-shift fallback)"
+            )
+            return fallback
+
+    return []
 
 
 def _find_winner_from_gamma(

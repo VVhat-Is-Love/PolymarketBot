@@ -155,25 +155,51 @@ def _get_latest_snapshots(
 
 
 def _get_forecasts(session: Session, group: MarketGroup) -> list[WeatherSnapshot]:
-    rows = (
-        session.execute(
-            select(WeatherSnapshot).where(
-                WeatherSnapshot.city == group.city,
-                WeatherSnapshot.forecast_date == group.resolution_date,
-                WeatherSnapshot.source.startswith("open_meteo:"),  # type: ignore[union-attr]
+    """
+    Return one snapshot per model for group's city + resolution_date.
+    Falls back to resolution_date ± 1 day when data is missing — this handles
+    the UTC timezone shift: European cities (UTC+2) have Open-Meteo returning
+    midnight local as 22:00 UTC, shifting the stored forecast_date by -1 day.
+    """
+    from datetime import timedelta
+
+    def _query_date(d) -> list[WeatherSnapshot]:
+        rows = (
+            session.execute(
+                select(WeatherSnapshot).where(
+                    WeatherSnapshot.city == group.city,
+                    WeatherSnapshot.forecast_date == d,
+                    WeatherSnapshot.source.startswith("open_meteo:"),  # type: ignore[union-attr]
+                )
+                .order_by(WeatherSnapshot.snapshot_time.desc())
             )
-            .order_by(WeatherSnapshot.snapshot_time.desc())
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    seen: set[str] = set()
-    deduped: list[WeatherSnapshot] = []
-    for r in rows:
-        if r.source not in seen:
-            seen.add(r.source)
-            deduped.append(r)
-    return deduped
+        seen: set[str] = set()
+        deduped: list[WeatherSnapshot] = []
+        for r in rows:
+            if r.source not in seen:
+                seen.add(r.source)
+                deduped.append(r)
+        return deduped
+
+    forecasts = _query_date(group.resolution_date)
+    if forecasts:
+        return forecasts
+
+    # G2-6: TZ-shift fallback — try day-1 then day+1
+    for delta in (-1, 1):
+        alt_date = group.resolution_date + timedelta(days=delta)
+        fallback = _query_date(alt_date)
+        if fallback:
+            logger.debug(
+                f"[live_trader] {group.city}: no forecast for {group.resolution_date}, "
+                f"using {alt_date} (TZ-shift fallback)"
+            )
+            return fallback
+
+    return []
 
 
 def _quick_consensus(group: MarketGroup, forecasts: list[WeatherSnapshot]) -> float | None:

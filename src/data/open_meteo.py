@@ -59,7 +59,7 @@ def _parse_daily(response, model: str, city: str, days: int) -> list[WeatherSnap
     return snapshots
 
 
-def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 3) -> list[WeatherSnapshot]:
+def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 5) -> list[WeatherSnapshot]:
     """Fetch daily high/low from 3 global models for the given city."""
     om = _build_client()
     snapshots: list[WeatherSnapshot] = []
