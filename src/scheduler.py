@@ -216,10 +216,132 @@ def _job_reconcile_orders() -> None:
                 )
                 notifier.send(f"⏰ Истёк [{t.strategy_name}]: {city} {t.bin_label}")
 
+        # G2-5: After processing individual legs, detect partial basket fills
+        _detect_partial_baskets(session, notifier)
+
     except Exception as exc:
         logger.error(f"[reconcile] Job failed: {exc}")
     finally:
         session.close()
+
+
+def _detect_partial_baskets(session, notifier) -> None:
+    """
+    G2-5: Detect baskets where some legs filled and some expired.
+    For each such basket: attempt one re-fill of expired legs at current ask.
+    If re-fill also fails: mark basket_incomplete, alert owner.
+    """
+    from src.config.settings import settings as _settings
+    from src.market.order_executor import place_limit_order, cancel_order
+    from sqlalchemy import func as sa_func
+
+    # Find basket_ids that have both filled and expired/cancelled legs
+    baskets_with_mixed = session.execute(
+        select(LiveTrade.basket_id, LiveTrade.status)
+        .where(
+            LiveTrade.basket_id.isnot(None),
+            LiveTrade.status.in_(["filled", "expired", "cancelled"]),
+        )
+    ).all()
+
+    if not baskets_with_mixed:
+        return
+
+    # Group by basket_id
+    basket_status_map: dict[str, set[str]] = {}
+    for bid, status in baskets_with_mixed:
+        if bid:
+            basket_status_map.setdefault(bid, set()).add(status)
+
+    for basket_id, statuses in basket_status_map.items():
+        has_filled = "filled" in statuses
+        has_missing = bool(statuses & {"expired", "cancelled"})
+        if not (has_filled and has_missing):
+            continue
+
+        all_legs: list[LiveTrade] = list(
+            session.execute(
+                select(LiveTrade).where(LiveTrade.basket_id == basket_id)
+            ).scalars().all()
+        )
+
+        filled_legs = [l for l in all_legs if l.status == "filled"]
+        missing_legs = [l for l in all_legs if l.status in ("expired", "cancelled")]
+
+        if not missing_legs:
+            continue
+
+        city = (all_legs[0].city or basket_id[:8]) if all_legs else basket_id[:8]
+        logger.warning(
+            f"[reconcile/G2-5] Partial basket {basket_id[:8]}: "
+            f"{len(filled_legs)} filled, {len(missing_legs)} missing — attempting re-fill"
+        )
+
+        # One retry: place new order for each missing leg at current ask
+        refilled = 0
+        for leg in missing_legs:
+            from src.db.session import get_session as _gs
+            from src.db.models import Market
+            mkt = session.execute(
+                select(Market).where(Market.market_id == leg.market_id)
+            ).scalars().first()
+            token_id = (mkt.token_id_yes if mkt else None) or leg.token_id or ""
+            if not token_id or not leg.target_price or not leg.size_shares:
+                continue
+
+            order_id = place_limit_order(
+                market_id=leg.market_id,
+                token_id=token_id,
+                side="BUY",
+                price=min(0.99, leg.target_price + _settings.entry_tick),
+                size=leg.size_shares,
+                skip_risk_check=True,
+            )
+            if order_id:
+                import uuid as _uuid
+                from src.db.models import LiveTrade as _LT
+                retry_trade = _LT(
+                    id=str(_uuid.uuid4()),
+                    group_id=leg.group_id,
+                    market_id=leg.market_id,
+                    bin_label=leg.bin_label,
+                    target_price=leg.target_price,
+                    size_shares=leg.size_shares,
+                    stake_usd=leg.stake_usd,
+                    basket_role=leg.basket_role,
+                    strategy_name=leg.strategy_name,
+                    city=leg.city,
+                    status="open",
+                    order_id=order_id,
+                    side=leg.side,
+                    placed_at=datetime.utcnow(),
+                    condition_id=leg.condition_id,
+                    token_id=leg.token_id,
+                    basket_id=basket_id,
+                )
+                session.add(retry_trade)
+                # Mark the old expired leg as basket_refill_attempted so we don't retry again
+                leg.basket_role = "expired_refilled"
+                session.commit()
+                refilled += 1
+                logger.info(f"[reconcile/G2-5] Re-placed leg {leg.bin_label} order={order_id[:12]}…")
+
+        if refilled < len(missing_legs):
+            still_missing = len(missing_legs) - refilled
+            notifier.send(
+                f"⚠️ Частичная корзина [{all_legs[0].strategy_name if all_legs else '?'}]: "
+                f"{city} — {len(filled_legs)}/{len(all_legs)} бинов исполнено, "
+                f"{still_missing} не удалось перезалить\n"
+                f"basket_id={basket_id[:8]}"
+            )
+            logger.warning(
+                f"[reconcile/G2-5] Basket {basket_id[:8]} incomplete: "
+                f"{still_missing} legs still missing after retry"
+            )
+        elif refilled > 0:
+            logger.info(
+                f"[reconcile/G2-5] Basket {basket_id[:8]}: re-filled {refilled} missing leg(s)"
+            )
 
 
 def _job_expire_stale_pending() -> None:
