@@ -208,107 +208,122 @@ def _place_basket_orders(
 ) -> None:
     """
     Place real CLOB limit orders for an accepted basket decision.
-    Records each bin as a LiveTrade row, polls for fills, handles timeouts.
+    Single basket-level risk check → place order → write DB → poll fill.
+    On any exception after partial placement, cancels all placed orders.
     """
     from src.market.order_executor import place_limit_order, cancel_order
 
-    markets_by_id = {m.market_id: m for m in markets}
-    risk_recorded = False
+    total_notional = decision.total_cost_usd
+    n_legs = len(decision.bins)
 
-    bin_labels = " / ".join(o.bin_label for o in decision.bins)
-    notifier.send(
-        f"🟢 Новая сделка [{strategy_name}]\n"
-        f"{group.city} {group.resolution_date} | {len(decision.bins)} бин(а)\n"
-        f"Бины: {bin_labels}\n"
-        f"Стоимость: ${decision.total_cost_usd:.2f} | "
-        f"Выплата: ${decision.payout_if_hit_usd:.2f} ({decision.gross_return_pct:+.1%})\n"
-        f"EV: ${decision.expected_value_usd:+.2f} | "
-        f"P(model)={decision.p_model:.0%} P(mkt)={decision.p_market:.0%}"
-    )
+    # Single basket-level risk gate (P1-7: replaces per-leg can_place_order)
+    ok, reason = risk_manager.can_place_basket(total_notional, n_legs)
+    if not ok:
+        logger.info(f"[{strategy_name}] Basket risk-block {group.city}: {reason}")
+        return
 
-    for o in decision.bins:
-        mkt = markets_by_id.get(o.market_id)
-        token_id = (mkt.token_id_yes if mkt else None) or ""
+    placed_order_ids: list[str] = []
 
-        trade = LiveTrade(
-            id=str(uuid.uuid4()),
-            group_id=group.group_id,
-            market_id=o.market_id,
-            bin_label=o.bin_label,
-            target_price=o.ask_price,
-            size_shares=o.shares,
-            stake_usd=o.stake_usd,
-            basket_role="basket",
-            strategy_name=strategy_name,
-            city=group.city,
-            status="pending",
-            side="buy",
-        )
-        session.add(trade)
-        session.commit()
-
-        if not token_id:
-            logger.warning(
-                f"[{strategy_name}] No token_id_yes for {o.market_id} "
-                f"({group.city} {o.bin_label}) — skip"
-            )
-            trade.status = "cancelled"
-            session.commit()
-            continue
-
-        order_id = place_limit_order(
-            market_id=o.market_id,
-            token_id=token_id,
-            side="BUY",
-            price=o.ask_price,
-            size=o.shares,
+    try:
+        markets_by_id = {m.market_id: m for m in markets}
+        bin_labels = " / ".join(o.bin_label for o in decision.bins)
+        notifier.send(
+            f"🟢 Новая сделка [{strategy_name}]\n"
+            f"{group.city} {group.resolution_date} | {len(decision.bins)} бин(а)\n"
+            f"Бины: {bin_labels}\n"
+            f"Стоимость: ${decision.total_cost_usd:.2f} | "
+            f"Выплата: ${decision.payout_if_hit_usd:.2f} ({decision.gross_return_pct:+.1%})\n"
+            f"EV: ${decision.expected_value_usd:+.2f} | "
+            f"P(model)={decision.p_model:.0%} P(mkt)={decision.p_market:.0%}"
         )
 
-        if not order_id:
-            trade.status = "cancelled"
-            trade.cancelled_at = datetime.utcnow()
+        for o in decision.bins:
+            mkt = markets_by_id.get(o.market_id)
+            token_id = (mkt.token_id_yes if mkt else None) or ""
+
+            if not token_id:
+                logger.warning(
+                    f"[{strategy_name}] No token_id_yes for {o.market_id} "
+                    f"({group.city} {o.bin_label}) — skip leg"
+                )
+                continue
+
+            # Place order FIRST — risk already checked at basket level (skip_risk_check=True)
+            order_id = place_limit_order(
+                market_id=o.market_id,
+                token_id=token_id,
+                side="BUY",
+                price=o.ask_price,
+                size=o.shares,
+                skip_risk_check=True,
+            )
+
+            if not order_id:
+                logger.warning(f"[{strategy_name}] Order failed for {group.city} {o.bin_label}")
+                continue
+
+            # Write to DB only after confirmed order placement (P1-7 fix)
+            trade = LiveTrade(
+                id=str(uuid.uuid4()),
+                group_id=group.group_id,
+                market_id=o.market_id,
+                bin_label=o.bin_label,
+                target_price=o.ask_price,
+                size_shares=o.shares,
+                stake_usd=o.stake_usd,
+                basket_role="basket",
+                strategy_name=strategy_name,
+                city=group.city,
+                status="open",
+                order_id=order_id,
+                side="buy",
+                placed_at=datetime.utcnow(),
+            )
+            session.add(trade)
             session.commit()
-            logger.warning(f"[{strategy_name}] Order placement failed for {o.market_id}")
-            continue
+            placed_order_ids.append(order_id)
 
-        # Record the basket cost in risk manager on the first successful order
-        if not risk_recorded:
-            risk_manager.record_bet_placed(
-                group.group_id, decision.total_cost_usd, strategy=strategy_name
+            final_status = _poll_until_filled_or_timeout(
+                order_id=order_id,
+                timeout_minutes=settings.order_timeout_minutes,
             )
-            risk_recorded = True
 
-        trade.order_id = order_id
-        trade.status = "open"
-        session.commit()
+            if final_status == "filled":
+                trade.status = "filled"
+                trade.filled_price = o.ask_price
+                trade.filled_at = datetime.utcnow()
+                session.commit()
+                logger.info(
+                    f"[{strategy_name}] ORDER FILLED: {group.city} {o.bin_label} "
+                    f"@ {o.ask_price:.4f} × {o.shares:.4f} shares"
+                )
+                notifier.send(
+                    f"✅ Заполнен [{strategy_name}]: {group.city} {o.bin_label} | "
+                    f"${o.ask_price:.4f} × {o.shares:.4f}"
+                )
+            else:
+                cancel_order(order_id)
+                trade.status = "expired"
+                trade.cancelled_at = datetime.utcnow()
+                session.commit()
+                logger.warning(
+                    f"[{strategy_name}] ORDER EXPIRED: {group.city} {o.bin_label} — cancelled"
+                )
+                notifier.send(f"⏰ Истёк [{strategy_name}]: {group.city} {o.bin_label}")
 
-        final_status = _poll_until_filled_or_timeout(
-            order_id=order_id,
-            timeout_minutes=settings.order_timeout_minutes,
-        )
+        if placed_order_ids:
+            risk_manager.record_bet_placed(group.group_id, total_notional, strategy=strategy_name)
 
-        if final_status == "filled":
-            trade.status = "filled"
-            trade.filled_price = o.ask_price
-            trade.filled_at = datetime.utcnow()
-            session.commit()
-            logger.info(
-                f"[{strategy_name}] ORDER FILLED: {group.city} {o.bin_label} "
-                f"@ {o.ask_price:.4f} × {o.shares:.4f} shares"
-            )
-            notifier.send(
-                f"✅ Заполнен [{strategy_name}]: {group.city} {o.bin_label} | "
-                f"${o.ask_price:.4f} × {o.shares:.4f}"
-            )
-        else:
-            cancel_order(order_id)
-            trade.status = "expired"
-            trade.cancelled_at = datetime.utcnow()
-            session.commit()
-            logger.warning(
-                f"[{strategy_name}] ORDER EXPIRED: {group.city} {o.bin_label} — cancelled"
-            )
-            notifier.send(f"⏰ Истёк [{strategy_name}]: {group.city} {o.bin_label}")
+    except Exception as exc:
+        logger.error(f"[{strategy_name}] Basket error {group.city}: {exc}")
+        for oid in placed_order_ids:
+            try:
+                cancel_order(oid)
+            except Exception:
+                pass
+        raise
+    finally:
+        risk_manager.release_basket_reservation(total_notional, n_legs)
 
 
 # ---------------------------------------------------------------------------
@@ -403,13 +418,6 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                     f"[live_trader] {group.city} {group.resolution_date}: "
                     f"checklist rejected — {result.rejection_reason}"
                 )
-                continue
-
-            # Risk gate: can we place any order right now?
-            can_trade, reason = risk_manager.can_place_order(settings.max_single_bet_usd)
-            if not can_trade:
-                logger.warning(f"[live_trader] Risk blocked for {group.city}: {reason}")
-                notifier.send(f"🚨 Risk block: {reason}")
                 continue
 
             basket_items = result.basket

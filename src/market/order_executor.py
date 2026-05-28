@@ -56,15 +56,16 @@ def place_limit_order(
     side: Literal["BUY", "SELL"],
     price: float,
     size: float,
+    skip_risk_check: bool = False,
 ) -> str | None:
     """
     Place a GTC limit order via CLOB V2.
     Returns order_id on success, None on failure.
+    skip_risk_check=True: caller already did a basket-level check (P1-7).
     """
     from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions, OrderType
 
     # ── Polymarket V2 minimum-size pre-checks ─────────────────────────────────
-    # These are hard API limits; skip early to avoid burning 3 retry attempts.
     if size < _MIN_SHARES:
         logger.warning(
             f"[order_executor] SKIPPED (below min shares): "
@@ -83,14 +84,15 @@ def place_limit_order(
         return None
     # ──────────────────────────────────────────────────────────────────────────
 
-    bet_size_approx = round(notional, 4)
-    allowed, reason = risk_manager.can_place_order(bet_size_approx)
-    if not allowed:
-        logger.warning(
-            f"[order_executor] place_limit_order blocked by RiskManager: "
-            f"market_id={market_id} reason={reason}"
-        )
-        return None
+    if not skip_risk_check:
+        bet_size_approx = round(notional, 4)
+        allowed, reason = risk_manager.can_place_order(bet_size_approx)
+        if not allowed:
+            logger.warning(
+                f"[order_executor] place_limit_order blocked by RiskManager: "
+                f"market_id={market_id} reason={reason}"
+            )
+            return None
 
     def _place():
         client = _get_client()
