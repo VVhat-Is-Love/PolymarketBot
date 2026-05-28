@@ -6,7 +6,7 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
+    retry_if_exception,
 )
 from loguru import logger
 
@@ -49,16 +49,30 @@ class GammaClient:
     def _record_success(self) -> None:
         self._consecutive_failures = 0
 
+    @staticmethod
+    def _is_retryable(exc: BaseException) -> bool:
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return True
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            # Retry on transient server errors and rate limiting
+            return exc.response.status_code in (429, 500, 502, 503, 504)
+        return False  # 400/403/404 — not retryable
+
     @retry(
-        stop=stop_after_attempt(3),
+        stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
+        retry=retry_if_exception(_is_retryable.__func__),
         reraise=True,
     )
     def _get(self, path: str, params: dict | None = None) -> list | dict:
         url = f"{GAMMA_BASE}{path}"
         try:
             resp = self._session.get(url, params=params, timeout=30)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 5))
+                logger.warning(f"Gamma 429 rate-limit — Retry-After: {retry_after}s")
+                time.sleep(retry_after)
+                resp.raise_for_status()
             resp.raise_for_status()
             return resp.json()
         except requests.HTTPError as e:
