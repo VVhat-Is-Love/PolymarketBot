@@ -12,8 +12,6 @@ class StrategySettings(BaseSettings):
     strategy_max_basket_sum: float = Field(default=0.96)
     strategy_min_model_agreement: int = Field(default=3)
     strategy_max_model_disagreement_c: float = Field(default=1.0)
-    strategy_basket_neighbors: int = Field(default=1)
-    strategy_basket_include_upside: bool = Field(default=True)
     strategy_virtual_stake_usd: float = Field(default=10.0)
     strategy_time_horizon_hours: int = Field(default=48)
     strategy_min_hours_to_close: int = Field(default=6)

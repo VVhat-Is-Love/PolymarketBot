@@ -367,6 +367,24 @@ def _job_paper_trade_summary() -> None:
         session.close()
 
 
+def _job_cleanup_snapshots() -> None:
+    """Weekly cleanup: delete MarketSnapshot rows older than 7 days (P2-13)."""
+    from sqlalchemy import delete as sa_delete
+    session = get_session()
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        result = session.execute(
+            sa_delete(MarketSnapshot).where(MarketSnapshot.snapshot_time < cutoff)
+        )
+        session.commit()
+        logger.info(f"[cleanup_snapshots] Deleted {result.rowcount} snapshot rows older than 7 days")
+    except Exception as exc:
+        logger.error(f"[cleanup_snapshots] Failed: {exc}")
+        session.rollback()
+    finally:
+        session.close()
+
+
 def _job_daily_summary() -> None:
     """Build and store a full daily PnL report; send to Telegram if configured."""
     logger.info("JOB: daily summary")
@@ -402,7 +420,16 @@ def _job_daily_summary() -> None:
                 select(PaperTrade).where(PaperTrade.status != "open")
             ).scalars().all()
         )
-        hwm = sum(t.pnl_usd or 0.0 for t in all_resolved)
+        paper_hwm = sum(t.pnl_usd or 0.0 for t in all_resolved)
+
+        # HWM includes live PnL (P2-18 fix: was paper-only)
+        all_live_resolved = list(
+            session.execute(
+                select(LiveTrade).where(LiveTrade.pnl_usd.isnot(None))
+            ).scalars().all()
+        )
+        live_hwm = sum(t.pnl_usd or 0.0 for t in all_live_resolved)
+        hwm = paper_hwm + live_hwm
 
         # ── Live trades ────────────────────────────────────────────────────
         live_resolved = list(
@@ -555,6 +582,7 @@ def setup_scheduler() -> None:
     schedule.every(2).minutes.do(_job_reconcile_orders)
     schedule.every(30).minutes.do(_job_expire_stale_pending)
     schedule.every(30).minutes.do(_job_resolve_live_trades)
+    schedule.every().sunday.at("04:00").do(_job_cleanup_snapshots)
     schedule.every().day.at("00:05").do(_job_daily_summary)
     mode = settings.trading_mode.upper()
     logger.info(

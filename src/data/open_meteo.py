@@ -190,6 +190,7 @@ def fetch_and_save_all_cities() -> int:
     session = get_session()
     repo = WeatherSnapshotRepository(session)
     saved = 0
+    no_data_cities: list[str] = []
 
     for city, cfg in CITIES_WHITELIST.items():
         snaps = fetch_multi_model_forecast(city, cfg["lat"], cfg["lon"])
@@ -199,8 +200,19 @@ def fetch_and_save_all_cities() -> int:
 
         _log_city_forecast(city, cfg.get("unit", "F"), snaps)
 
+        if not snaps:
+            no_data_cities.append(city)
+
     session.close()
     logger.info(f"Open-Meteo total snapshots saved: {saved}")
+
+    if no_data_cities:
+        logger.warning(
+            f"[open_meteo] No data from any model for {len(no_data_cities)} cities: "
+            f"{', '.join(no_data_cities[:10])}"
+            + (f" (+{len(no_data_cities)-10} more)" if len(no_data_cities) > 10 else "")
+        )
+
     return saved
 
 

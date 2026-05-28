@@ -60,4 +60,13 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="")
 
 
+    def __repr__(self) -> str:
+        d = self.model_dump()
+        for secret_field in ("private_key", "polymarket_api_key", "polymarket_api_secret",
+                              "polymarket_api_passphrase", "telegram_bot_token", "openweather_api_key"):
+            if d.get(secret_field):
+                d[secret_field] = "***"
+        return f"Settings({d})"
+
+
 settings = Settings()

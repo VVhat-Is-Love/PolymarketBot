@@ -121,18 +121,32 @@ def _get_wallet_balance() -> float:
 def _get_latest_snapshots(
     session: Session, market_ids: list[str]
 ) -> dict[str, dict]:
+    """Batch query: one SQL instead of N queries (P2-12 fix)."""
+    if not market_ids:
+        return {}
+
+    # Subquery: max snapshot_time per market_id
+    latest_sub = (
+        select(
+            MarketSnapshot.market_id,
+            sa_func.max(MarketSnapshot.snapshot_time).label("ts"),
+        )
+        .where(MarketSnapshot.market_id.in_(market_ids))
+        .group_by(MarketSnapshot.market_id)
+        .subquery()
+    )
+    rows = session.execute(
+        select(MarketSnapshot).join(
+            latest_sub,
+            (MarketSnapshot.market_id == latest_sub.c.market_id)
+            & (MarketSnapshot.snapshot_time == latest_sub.c.ts),
+        )
+    ).scalars().all()
+
+    snap_map = {row.market_id: row for row in rows}
     result: dict[str, dict] = {}
     for mid in market_ids:
-        row = (
-            session.execute(
-                select(MarketSnapshot)
-                .where(MarketSnapshot.market_id == mid)
-                .order_by(MarketSnapshot.snapshot_time.desc())
-                .limit(1)
-            )
-            .scalars()
-            .first()
-        )
+        row = snap_map.get(mid)
         result[mid] = {
             "price_yes": row.price_yes if row else None,
             "best_bid": row.best_bid if row else None,
@@ -352,6 +366,9 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
             )
             return
 
+        rejection_counts: dict[str, int] = {}
+        trades_placed = 0
+
         for group in groups:
             # Skip if this group already has an open/pending live trade
             existing = session.execute(
@@ -391,6 +408,8 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
             result = evaluate_checklist(group, markets, prices, forecasts)
 
             if not result.passed:
+                reason_key = (result.rejection_reason or "unknown").split(":")[0]
+                rejection_counts[reason_key] = rejection_counts.get(reason_key, 0) + 1
                 logger.debug(
                     f"[live_trader] {group.city} {group.resolution_date}: "
                     f"checklist rejected — {result.rejection_reason}"
@@ -482,6 +501,15 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                     )
             else:
                 logger.debug(f"[basket_narrow] disabled via bot — skip {group.city}")
+
+        if rejection_counts or trades_placed:
+            summary = ", ".join(
+                f"{k}={v}" for k, v in sorted(rejection_counts.items(), key=lambda x: -x[1])
+            )
+            logger.info(
+                f"[live_trader] Run complete: {len(groups)} groups | "
+                f"placed={trades_placed} | rejections: {summary or 'none'}"
+            )
 
     except Exception:
         logger.exception("[live_trader] Engine error in run_live_trade_engine")
