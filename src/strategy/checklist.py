@@ -1,7 +1,7 @@
 import json
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date as date_type
 
 from src.db.models import MarketGroup, Market, WeatherSnapshot
 from src.strategy.config import strategy_settings as ss
@@ -75,6 +75,16 @@ def evaluate_checklist(
             consensus_offset=consensus_offset,
         )
 
+    # ── 0. Late-window entry filter (optional) ────────────────────────
+    entry_window_h = _safe_float(getattr(ss, 'basket_entry_window_hours', 0.0)) or 0.0
+    if entry_window_h > 0:
+        closes_at = datetime.combine(group.resolution_date, datetime.max.time())
+        hours_to_resolution = (closes_at - datetime.utcnow()).total_seconds() / 3600
+        if hours_to_resolution > entry_window_h:
+            return _reject(
+                f"outside_entry_window:{hours_to_resolution:.0f}h>{entry_window_h:.0f}h"
+            )
+
     # ── 1. Rules ──────────────────────────────────────────────────────
     rules_ok = bool(group.weather_station)
     if not rules_ok:
@@ -129,14 +139,25 @@ def evaluate_checklist(
         for item in basket
     }
 
-    # ── 4a. Cold-start: minimum bin price ─────────────────────────────
+    # ── 4a. Cold-start: bin price band [min_bin_price, 1 - min_bin_price] ──
     min_bin_price = _safe_float(ss.strategy_min_bin_price) or 0.0
+    max_bin_price = 1.0 - min_bin_price  # symmetric ceiling
     if min_bin_price > 0:
         for item in basket:
             price = item.price_yes
-            if price is not None and price < min_bin_price:
+            if price is None:
+                continue
+            if price < min_bin_price:
                 return _reject(
-                    f"cold_start_price:{item.market.bin_label}={price:.4f}<{min_bin_price}",
+                    f"cold_start_price_lo:{item.market.bin_label}={price:.4f}<{min_bin_price}",
+                    rules_ok=True,
+                    consensus_ok=True,
+                    consensus_temp=consensus_temp,
+                    bin_volumes_snapshot=bin_volumes_snapshot,
+                )
+            if price > max_bin_price:
+                return _reject(
+                    f"cold_start_price_hi:{item.market.bin_label}={price:.4f}>{max_bin_price:.4f}",
                     rules_ok=True,
                     consensus_ok=True,
                     consensus_temp=consensus_temp,

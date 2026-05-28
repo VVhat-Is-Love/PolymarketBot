@@ -28,6 +28,10 @@ class StrategySettings(BaseSettings):
     min_edge_threshold: float = Field(default=0.05)   # kept for backwards compat
     edge_sigma_c: float = Field(default=1.5)           # Gaussian sigma in °C for diagnostics
 
+    # Late-window entry gate — only enter baskets within N hours of resolution
+    # None/0 = disabled (enter at any time within the time horizon)
+    basket_entry_window_hours: float = Field(default=0.0)  # 0 = disabled
+
     # Basket stake floor — guarantee a minimum entry size per basket before trim-logic.
     # floor = max(min_basket_stake_usd, wallet_balance × min_basket_stake_pct),
     # then capped at MAX_SINGLE_BET_USD so it never exceeds the hard risk limit.
