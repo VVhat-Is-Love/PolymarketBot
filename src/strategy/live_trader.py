@@ -530,6 +530,7 @@ def run_tail_engine() -> None:
     from src.market.order_executor import place_limit_order
     from src.notifications.telegram import get_notifier
     from src.strategy.tail_seller import scan_tails
+    from src.market.clob_client import get_no_ask_prices
 
     session = get_session()
     notifier = get_notifier()
@@ -604,6 +605,26 @@ def run_tail_engine() -> None:
                 closes_at = datetime.combine(group.resolution_date, dtime(23, 59))
                 hours_to_close = (closes_at - now).total_seconds() / 3600
 
+                # Fetch real NO-token asks from CLOB order book (P1-5)
+                no_token_ids = [m.token_id_no for m in markets if m.token_id_no]
+                no_asks: dict[str, float | None] | None = None
+                if no_token_ids:
+                    try:
+                        book_prices = get_no_ask_prices(no_token_ids)
+                        no_asks = {
+                            m.market_id: book_prices.get(m.token_id_no)
+                            for m in markets
+                            if m.token_id_no
+                        }
+                        logger.debug(
+                            f"[tail] {group.city}: fetched {len(no_asks)} NO asks"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[tail] {group.city}: NO ask fetch failed, using approx: {exc}"
+                        )
+                        no_asks = None  # fall back to approximation
+
                 scan = scan_tails(
                     markets=markets,
                     prices=prices,
@@ -613,6 +634,7 @@ def run_tail_engine() -> None:
                     available_capital=wallet,
                     no_capital_in_use=no_in_use,
                     ss=ss,
+                    no_asks=no_asks,
                 )
 
                 for reason in scan.skipped:

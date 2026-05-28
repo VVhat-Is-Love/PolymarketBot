@@ -114,3 +114,25 @@ def get_book_snapshot(token_id: str) -> dict | None:
     if result is None:
         result = _fallback_http(token_id)
     return result
+
+
+def get_no_ask_prices(token_ids: list[str]) -> dict[str, float | None]:
+    """
+    Fetch the best ask for each NO token from the CLOB order book.
+    Returns {token_id: best_ask} — None when book is empty or unavailable.
+    Sequential with _REQUEST_DELAY between calls.
+    """
+    result: dict[str, float | None] = {}
+    for token_id in token_ids:
+        if not token_id:
+            continue
+        try:
+            snap = _fallback_http(token_id)
+            result[token_id] = snap.get("best_ask") if snap else None
+        except BookUnavailable:
+            result[token_id] = None
+        except Exception as exc:
+            logger.debug(f"[clob_client] NO ask fetch {token_id[:12]}…: {exc}")
+            result[token_id] = None
+        time.sleep(_REQUEST_DELAY)
+    return result
