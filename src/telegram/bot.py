@@ -849,6 +849,18 @@ async def _callback_router(update, context) -> None:
             )
             return
 
+        # ── mode switch: mode:live:confirm ───────────────────────────────
+        if data == "mode:live:confirm":
+            _apply_mode_switch("live")
+            logger.info("[telegram_bot] Mode switched to LIVE via confirmation callback")
+            await query.edit_message_text(
+                "✅ Режим переключён в <b>LIVE</b>.\n"
+                "⚠️ Бот размещает реальные ордера.\n"
+                "Для остановки: /mode paper или /stop",
+                parse_mode="HTML",
+            )
+            return
+
         # ── reset_stop: rs:confirm ───────────────────────────────────────
         if data == "rs:confirm":
             from src.risk.risk_manager import risk_manager
@@ -905,6 +917,81 @@ async def _callback_router(update, context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /mode [paper|live]  — switch trading mode with confirmation (G2-4)
+# ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_mode(update, context) -> None:
+    """Show or switch trading mode. Switching to 'live' requires two-stage confirmation."""
+    from src.config.settings import settings
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    current = settings.trading_mode.lower()
+
+    if not context.args:
+        em = "💵 LIVE" if current == "live" else "📝 PAPER"
+        await update.message.reply_text(
+            f"Текущий режим: <b>{em}</b>\n\n"
+            f"Сменить: /mode paper | /mode live",
+            parse_mode="HTML",
+        )
+        return
+
+    target = context.args[0].lower()
+    if target not in ("paper", "live"):
+        await update.message.reply_text("❓ Используй: /mode paper | /mode live")
+        return
+
+    if target == current:
+        await update.message.reply_text(f"ℹ️ Уже в режиме {target.upper()}")
+        return
+
+    if target == "paper":
+        # Paper switch is safe — do immediately
+        _apply_mode_switch("paper")
+        logger.info("[telegram_bot] Mode switched to PAPER via /mode command")
+        await update.message.reply_text(
+            "✅ Режим переключён в <b>PAPER</b> (симуляция).\n"
+            "Биржевые ордера размещаться не будут.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Live mode: two-stage confirmation
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ДА, ВКЛЮЧИТЬ LIVE", callback_data="mode:live:confirm"),
+        InlineKeyboardButton("❌ Отмена", callback_data="x"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ <b>Переключить в LIVE режим?</b>\n\n"
+        "Бот будет размещать реальные ордера на Polymarket.\n"
+        "Баланс: реальные деньги.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+def _apply_mode_switch(mode: str) -> None:
+    """Persist mode switch to bot_state DB and update settings in-process."""
+    from src.db.session import get_session
+    from src.db.models import BotState
+
+    session = get_session()
+    try:
+        state = session.get(BotState, "trading_mode")
+        if state:
+            state.value = mode
+        else:
+            session.add(BotState(key="trading_mode", value=mode))
+        session.commit()
+    except Exception as exc:
+        logger.error(f"[telegram_bot] Failed to persist mode switch: {exc}")
+        session.rollback()
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -951,6 +1038,7 @@ def run_telegram_bot() -> None:
             app.add_handler(CommandHandler("stop",       cmd_stop))
             app.add_handler(CommandHandler("reset_stop", cmd_reset_stop))
             app.add_handler(CommandHandler("start",      cmd_start))
+            app.add_handler(CommandHandler("mode",       cmd_mode))
             app.add_handler(CommandHandler("setlimit",   cmd_setlimit))
             app.add_handler(CommandHandler("setstake",   cmd_setstake))
             app.add_handler(CommandHandler("strategy",   cmd_strategy))

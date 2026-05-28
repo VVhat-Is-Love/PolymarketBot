@@ -693,9 +693,28 @@ def _send_to_clients(msg: str) -> None:
         logger.warning(f"[send_to_clients] Failed: {exc}")
 
 
+def _restore_trading_mode() -> None:
+    """G2-4: Restore trading_mode from bot_state DB if it was changed via /mode command."""
+    from src.db.models import BotState
+    session = get_session()
+    try:
+        state = session.get(BotState, "trading_mode")
+        if state and state.value in ("live", "paper"):
+            from src.config.settings import settings
+            if settings.trading_mode != state.value:
+                settings.trading_mode = state.value
+                logger.info(f"[scheduler] Restored trading_mode={state.value} from bot_state DB")
+    except Exception as e:
+        logger.warning(f"[scheduler] Could not restore trading_mode: {e}")
+    finally:
+        session.close()
+
+
 def setup_scheduler() -> None:
     from src.config.settings import settings
     from src.risk.risk_manager import risk_manager
+
+    _restore_trading_mode()
 
     # Check persistent emergency stop before registering live jobs
     emergency_stopped = risk_manager.is_emergency_stopped()
