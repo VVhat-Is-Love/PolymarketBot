@@ -48,7 +48,8 @@ def _period_bounds(period: str) -> tuple[datetime, datetime, str]:
 def pnl_stats(period: str = "today") -> dict:
     """
     Aggregate PnL for resolved LiveTrades in the given period.
-    A trade is "resolved" when resolved_at IS NOT NULL and pnl_usd IS NOT NULL.
+    PnL is attributed by placed_at date (entry date), NOT resolved_at.
+    This avoids daily-stop distortion from the ~1.5-day resolution lag.
 
     Returns:
         pnl, wins, losses, count, total_staked, roi_pct,
@@ -64,7 +65,7 @@ def pnl_stats(period: str = "today") -> dict:
             LiveTrade.pnl_usd.isnot(None),
         )
         if period != "all":
-            q = q.where(LiveTrade.resolved_at >= start)
+            q = q.where(LiveTrade.placed_at >= start)  # attributed by entry date
 
         trades = list(session.execute(q).scalars().all())
 
@@ -86,13 +87,13 @@ def pnl_stats(period: str = "today") -> dict:
             else:
                 by_strategy[strat]["losses"] += 1
 
-        # By day (only for multi-day periods)
+        # By day (only for multi-day periods) — grouped by placed_at (entry date)
         by_day: list[dict] = []
         if period in ("week", "month", "all"):
             days: dict[str, dict] = {}
             for t in trades:
-                if t.resolved_at:
-                    key = t.resolved_at.strftime("%d.%m")
+                if t.placed_at:  # attribute PnL to the day the trade was opened
+                    key = t.placed_at.strftime("%d.%m")
                     if key not in days:
                         days[key] = {"date": key, "pnl": 0.0, "wins": 0, "losses": 0}
                     days[key]["pnl"] += t.pnl_usd or 0.0

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from loguru import logger
@@ -123,10 +123,11 @@ class RiskManager:
                     (r.group_id or r.id): (r.stake_usd or 0.0) for r in rows
                 }
 
-                # -- Daily loss (filled trades today with negative PnL) --
+                # -- Daily loss (trailing 36h window to cover resolution lag) --
+                cutoff_36h = datetime.utcnow() - timedelta(hours=36)
                 v = session.execute(
                     select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
-                        LiveTrade.filled_at >= today_start,
+                        LiveTrade.resolved_at >= cutoff_36h,
                         LiveTrade.pnl_usd < 0,
                     )
                 ).scalar() or 0.0
