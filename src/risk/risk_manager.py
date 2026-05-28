@@ -1,6 +1,7 @@
 """
 Central risk controller — all trading decisions pass through here.
-State is held in memory (thread-safe) and refreshed from DB before each check/display.
+State is held in memory and refreshed from DB before each check/display.
+Emergency stop is persisted to the `bot_state` table so it survives restarts.
 """
 from __future__ import annotations
 
@@ -65,17 +66,27 @@ class RiskManager:
     def _load_live_stats(self) -> None:
         """
         Refresh counters from DB so they survive process restarts.
-        Safe to call inside self._lock; catches all errors and falls back
-        to in-memory values.
+        Also loads emergency_stop from bot_state table.
+        Safe to call inside self._lock; catches all errors.
         """
         try:
             from sqlalchemy import select, func
             from src.db.session import get_session
-            from src.db.models import LiveTrade
+            from src.db.models import LiveTrade, BotState
 
             today_start = datetime.combine(date.today(), datetime.min.time())
             session = get_session()
             try:
+                # -- Emergency stop (DB-persistent) --
+                stop_row = session.get(BotState, "emergency_stop")
+                if stop_row and stop_row.value == "1":
+                    self._emergency_stop = True
+                    reason_row = session.get(BotState, "emergency_stop_reason")
+                    self._emergency_stop_reason = reason_row.value if reason_row else "DB-persisted stop"
+                elif not self._emergency_stop:
+                    # Only clear in-memory if it wasn't set locally this session
+                    pass  # keep in-memory flag if set
+
                 # -- Daily bet count (all trades placed today) --
                 self._daily_bets_count = int(
                     session.execute(
@@ -131,6 +142,46 @@ class RiskManager:
                 f"RiskManager: DB sync failed — using cached in-memory values: {exc}"
             )
 
+    def _persist_emergency_stop(self, active: bool, reason: str = "") -> None:
+        """Write emergency stop state to bot_state table."""
+        try:
+            from src.db.session import get_session
+            from src.db.models import BotState
+
+            session = get_session()
+            try:
+                session.merge(BotState(
+                    key="emergency_stop",
+                    value="1" if active else "0",
+                    updated_at=datetime.utcnow(),
+                ))
+                session.merge(BotState(
+                    key="emergency_stop_reason",
+                    value=reason,
+                    updated_at=datetime.utcnow(),
+                ))
+                session.commit()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.error(f"RiskManager: failed to persist emergency stop to DB: {exc}")
+
+    def is_emergency_stopped(self) -> bool:
+        """Check DB directly — safe to call at startup before _load_live_stats."""
+        try:
+            from src.db.session import get_session
+            from src.db.models import BotState
+
+            session = get_session()
+            try:
+                row = session.get(BotState, "emergency_stop")
+                return row is not None and row.value == "1"
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"RiskManager: is_emergency_stopped DB check failed: {exc}")
+            return self._emergency_stop  # fall back to in-memory
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -139,11 +190,10 @@ class RiskManager:
         """
         Returns (True, 'ok') or (False, reason).
         Checks are applied in spec order (1-7).
-        Capping bet_size to MAX_SINGLE_BET_USD is done in-place before callers use it.
         """
         with self._lock:
             self._maybe_roll_day()
-            self._load_live_stats()  # sync from DB before checking limits
+            self._load_live_stats()  # syncs emergency_stop from DB too
 
             # 1. Emergency stop
             if self._emergency_stop:
@@ -160,21 +210,36 @@ class RiskManager:
             if self._daily_loss >= self._daily_loss_limit_usd:
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
-            # 4. Total stop-loss → triggers emergency stop
+            # 4. Total stop-loss → triggers persistent emergency stop
             if self._total_loss >= self._total_stop_loss_usd:
-                reason = f"Total loss ${self._total_loss:.2f} >= TOTAL_STOP_LOSS_USD ${self._total_stop_loss_usd:.2f}"
+                reason = (
+                    f"Total loss ${self._total_loss:.2f} >= "
+                    f"TOTAL_STOP_LOSS_USD ${self._total_stop_loss_usd:.2f}"
+                )
                 self._emergency_stop = True
                 self._emergency_stop_reason = reason
+                self._persist_emergency_stop(True, reason)
                 logger.error(f"RiskManager: TOTAL STOP-LOSS triggered — {reason}")
+                try:
+                    from src.notifications.telegram import get_notifier
+                    get_notifier().send(f"🛑 TOTAL STOP-LOSS: {reason}")
+                except Exception:
+                    pass
                 return False, f"Total stop-loss triggered: {reason}"
 
             # 5. Concurrent open bets
             if len(self._open_bets) >= self._max_concurrent_bets:
-                return False, f"Max concurrent bets reached ({len(self._open_bets)}/{self._max_concurrent_bets})"
+                return False, (
+                    f"Max concurrent bets reached "
+                    f"({len(self._open_bets)}/{self._max_concurrent_bets})"
+                )
 
             # 6. Daily bet count
             if self._daily_bets_count >= self._max_daily_bets:
-                return False, f"Daily bet count limit reached ({self._daily_bets_count}/{self._max_daily_bets})"
+                return False, (
+                    f"Daily bet count limit reached "
+                    f"({self._daily_bets_count}/{self._max_daily_bets})"
+                )
 
             # 7. All ok
             return True, "ok"
@@ -227,16 +292,20 @@ class RiskManager:
             )
 
     def set_emergency_stop(self, reason: str) -> None:
+        """Activate emergency stop — persisted to DB, survives restarts."""
         with self._lock:
             self._emergency_stop = True
             self._emergency_stop_reason = reason
             logger.warning(f"RiskManager: EMERGENCY STOP SET — {reason}")
+        self._persist_emergency_stop(True, reason)
 
     def clear_emergency_stop(self) -> None:
+        """Clear emergency stop — persisted to DB."""
         with self._lock:
             self._emergency_stop = False
             self._emergency_stop_reason = ""
             logger.info("RiskManager: emergency stop cleared")
+        self._persist_emergency_stop(False, "")
 
     # ------------------------------------------------------------------
     # Runtime limit setters (called by Telegram bot /setlimit, /setstake)

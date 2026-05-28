@@ -11,6 +11,17 @@ class Base(DeclarativeBase):
     pass
 
 
+class BotState(Base):
+    """Key-value store for persistent bot state (emergency stop, etc.)."""
+    __tablename__ = "bot_state"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 class MarketGroup(Base):
     __tablename__ = "market_groups"
 

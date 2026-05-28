@@ -118,7 +118,11 @@ def _job_paper_trade_engine() -> None:
 
 def _job_live_trade_engine() -> None:
     from src.config.settings import settings
+    from src.risk.risk_manager import risk_manager
     if settings.trading_mode.lower() != "live":
+        return
+    if risk_manager.is_emergency_stopped():
+        logger.warning("JOB: live trade engine SKIPPED — emergency stop active")
         return
     logger.info("JOB: live trade engine")
     try:
@@ -447,12 +451,23 @@ def _job_daily_summary() -> None:
 
 def setup_scheduler() -> None:
     from src.config.settings import settings
+    from src.risk.risk_manager import risk_manager
+
+    # Check persistent emergency stop before registering live jobs
+    emergency_stopped = risk_manager.is_emergency_stopped()
+    if emergency_stopped:
+        logger.critical(
+            "⚠️ Emergency stop is ACTIVE in DB — live/tail jobs will NOT be registered. "
+            "Use /reset_stop in Telegram then restart the bot to resume live trading."
+        )
+
     schedule.every(30).minutes.do(_job_discover_markets)
     schedule.every(10).minutes.do(_job_snapshot_markets)
     schedule.every(60).minutes.do(_job_deactivate_resolved_groups)
     schedule.every(60).minutes.do(_job_fetch_open_meteo)
     schedule.every(15).minutes.do(_job_paper_trade_engine)
-    schedule.every(15).minutes.do(_job_live_trade_engine)
+    if not emergency_stopped:
+        schedule.every(15).minutes.do(_job_live_trade_engine)
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(60).minutes.do(_job_paper_trade_summary)
     schedule.every(30).minutes.do(_job_expire_stale_pending)

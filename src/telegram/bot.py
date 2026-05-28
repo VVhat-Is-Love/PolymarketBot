@@ -12,8 +12,8 @@ Commands:
   /setstake <v>     — update MAX_SINGLE_BET_USD with confirmation
   /strategy [list|on|off] [name] — view/toggle strategies
   /cancel <id>      — cancel an open order with confirmation
-  /stop [reason]    — activate emergency stop
-  /start            — clear emergency stop
+  /stop [reason]    — activate emergency stop (persisted to DB)
+  /reset_stop       — clear emergency stop with two-stage confirmation
   /risk             — risk limits overview
 """
 from __future__ import annotations
@@ -720,18 +720,48 @@ async def cmd_stop(update, context) -> None:
     from src.risk.risk_manager import risk_manager
     risk_manager.set_emergency_stop(reason)
     await update.message.reply_text(
-        f"🛑 Emergency stop активирован.\nПричина: {reason}\n\nБот НЕ будет размещать новые ордера."
+        f"🛑 Emergency stop АКТИВИРОВАН (сохранён в БД).\n"
+        f"Причина: {reason}\n\n"
+        f"Бот НЕ будет размещать новые ордера даже после перезапуска.\n"
+        f"Для снятия: /reset_stop"
+    )
+
+
+@_admin_only
+async def cmd_reset_stop(update, context) -> None:
+    """Two-stage confirmation to clear persistent emergency stop."""
+    from src.risk.risk_manager import risk_manager
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    if not risk_manager.is_emergency_stopped() and not risk_manager.get_status().emergency_stop:
+        await update.message.reply_text("✅ Emergency stop не активен — торговля уже включена.")
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ДА, СНЯТЬ СТОП", callback_data="rs:confirm"),
+        InlineKeyboardButton("❌ Отмена", callback_data="x"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ <b>Подтвердите сброс Emergency Stop</b>\n\n"
+        "Это разрешит боту размещать новые ордера.\n"
+        "Убедитесь, что ситуация под контролем перед продолжением.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
     )
 
 
 @_admin_only
 async def cmd_start(update, context) -> None:
     from src.risk.risk_manager import risk_manager
-    if not risk_manager.get_status().emergency_stop:
-        await update.message.reply_text("✅ Emergency stop не активен — торговля уже запущена.")
+    if not risk_manager.get_status().emergency_stop and not risk_manager.is_emergency_stopped():
+        await update.message.reply_text(
+            "✅ Emergency stop не активен — торговля уже запущена.\n"
+            "Для явного сброса используй /reset_stop"
+        )
         return
-    risk_manager.clear_emergency_stop()
-    await update.message.reply_text("✅ Emergency stop снят. Торговля возобновлена.")
+    await update.message.reply_text(
+        "⚠️ Для сброса Emergency Stop используй /reset_stop (требует подтверждения)."
+    )
 
 
 @_admin_only
@@ -813,6 +843,18 @@ async def _callback_router(update, context) -> None:
             logger.info(f"[telegram_bot] strategy {full_name} {'on' if enabled else 'off'} via callback")
             await query.edit_message_text(
                 f"Стратегия <b>{full_name}</b> {state}", parse_mode="HTML"
+            )
+            return
+
+        # ── reset_stop: rs:confirm ───────────────────────────────────────
+        if data == "rs:confirm":
+            from src.risk.risk_manager import risk_manager
+            risk_manager.clear_emergency_stop()
+            logger.info("[telegram_bot] Emergency stop cleared via /reset_stop callback")
+            await query.edit_message_text(
+                "✅ Emergency stop снят (БД обновлена).\n"
+                "⚠️ Внимание: если bot был запущен с активным стопом, "
+                "live-job не был зарегистрирован — перезапустите бота для восстановления."
             )
             return
 
@@ -903,12 +945,13 @@ def run_telegram_bot() -> None:
             app.add_handler(CommandHandler("risk",     cmd_risk))
 
             # Control commands
-            app.add_handler(CommandHandler("stop",     cmd_stop))
-            app.add_handler(CommandHandler("start",    cmd_start))
-            app.add_handler(CommandHandler("setlimit", cmd_setlimit))
-            app.add_handler(CommandHandler("setstake", cmd_setstake))
-            app.add_handler(CommandHandler("strategy", cmd_strategy))
-            app.add_handler(CommandHandler("cancel",   cmd_cancel_trade))
+            app.add_handler(CommandHandler("stop",       cmd_stop))
+            app.add_handler(CommandHandler("reset_stop", cmd_reset_stop))
+            app.add_handler(CommandHandler("start",      cmd_start))
+            app.add_handler(CommandHandler("setlimit",   cmd_setlimit))
+            app.add_handler(CommandHandler("setstake",   cmd_setstake))
+            app.add_handler(CommandHandler("strategy",   cmd_strategy))
+            app.add_handler(CommandHandler("cancel",     cmd_cancel_trade))
 
             # Inline-button callbacks
             app.add_handler(CallbackQueryHandler(_callback_router))
