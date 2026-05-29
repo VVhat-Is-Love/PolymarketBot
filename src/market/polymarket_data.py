@@ -77,36 +77,82 @@ def get_positions(wallet: str, redeemable: bool | None = None) -> list[dict[str,
         return []
 
 
-def realized_pnl_by_condition(activity: list[dict]) -> dict[str, float]:
+def realized_pnl_by_token(activity: list[dict]) -> dict[str, float]:
     """
-    Aggregate realized PnL per conditionId from cash flows.
+    Aggregate realized PnL per token_id from cash flows.
 
-    PnL = Σ(REDEEM + SELL + …) − Σ(BUY + SPLIT + …)
+    PnL(token) = Σ(SELL proceeds) + Σ(REDEEM payout) − Σ(BUY cost)
 
-    Note: REDEEM entries have empty `asset`; we key by conditionId for both.
+    REDEEM has an empty `asset` field — we link it to its token via the single
+    BUY token bought for that conditionId (confirmed: each resolved conditionId
+    has exactly one winning BUY asset). Falls back to keying by "cond:<id>" in
+    the rare case of multiple BUY tokens per condition (e.g. averaged-in).
     """
+    # Pass 1: build conditionId → [token_ids] map from BUY activity
+    cond_tokens: dict[str, list[str]] = defaultdict(list)
+    for a in activity:
+        if a.get("type") == "TRADE" and a.get("side", "").upper() == "BUY":
+            token = a.get("asset", "")
+            cid = a.get("conditionId", "")
+            if token and cid:
+                cond_tokens[cid].append(token)
+
+    # Pass 2: aggregate PnL per token_id
     pnl: dict[str, float] = defaultdict(float)
     for a in activity:
         t = a.get("type", "").upper()
-        side = a.get("side", "").upper()
-        # Normalise: TRADE:BUY → BUY, TRADE:SELL → SELL
-        if t == "TRADE":
-            t = side  # "BUY" or "SELL"
         try:
             amt = float(a.get("usdcSize") or 0)
         except (TypeError, ValueError):
             amt = 0.0
 
-        cond_id = a.get("conditionId", "")
-        if not cond_id:
-            continue
+        token = a.get("asset", "")
+        cid = a.get("conditionId", "")
 
-        if t in CASH_IN_TYPES:
-            pnl[cond_id] += amt
-        elif t in CASH_OUT_TYPES:
-            pnl[cond_id] -= amt
+        if t == "TRADE":
+            side = a.get("side", "").upper()
+            if side == "BUY" and token:
+                pnl[token] -= amt
+            elif side == "SELL" and token:
+                pnl[token] += amt
+        elif t == "REDEEM":
+            tokens = cond_tokens.get(cid, [])
+            if len(tokens) == 1:
+                pnl[tokens[0]] += amt
+            elif tokens:
+                # Multiple BUY tokens for same condition (averaged-in): split evenly
+                per = amt / len(tokens)
+                for tok in tokens:
+                    pnl[tok] += per
+            else:
+                # No matching BUY found — fall back to conditionId key
+                pnl[f"cond:{cid}"] += amt
 
     return dict(pnl)
+
+
+def realized_pnl_by_condition(activity: list[dict]) -> dict[str, float]:
+    """Legacy alias — kept for any callers outside scheduler. Prefer realized_pnl_by_token."""
+    # Build token map then collapse back to conditionId
+    token_pnl = realized_pnl_by_token(activity)
+    cond_tokens: dict[str, list[str]] = defaultdict(list)
+    for a in activity:
+        if a.get("type") == "TRADE" and a.get("side", "").upper() == "BUY":
+            token = a.get("asset", "")
+            cid = a.get("conditionId", "")
+            if token and cid:
+                cond_tokens[cid].append(token)
+
+    result: dict[str, float] = defaultdict(float)
+    for cid, tokens in cond_tokens.items():
+        for tok in tokens:
+            if tok in token_pnl:
+                result[cid] += token_pnl[tok]
+    # also carry cond: fallback keys
+    for key, val in token_pnl.items():
+        if key.startswith("cond:"):
+            result[key[5:]] += val
+    return dict(result)
 
 
 def open_market_value(positions: list[dict]) -> dict[str, float]:
