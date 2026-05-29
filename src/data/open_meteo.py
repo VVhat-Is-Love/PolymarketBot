@@ -59,8 +59,14 @@ def _parse_daily(response, model: str, city: str, days: int) -> list[WeatherSnap
     return snapshots
 
 
-def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 5) -> list[WeatherSnapshot]:
-    """Fetch daily high/low from 3 global models for the given city."""
+def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 3) -> list[WeatherSnapshot]:
+    """Fetch daily high/low from 3 global models for the given city.
+
+    timezone="UTC" ensures forecast_date stored in DB equals the UTC calendar date,
+    matching Polymarket's resolution_date (which is always a UTC day). With "auto"
+    the start-of-day timestamp is midnight local time, shifting stored dates by ±1
+    for cities in UTC±N timezones.
+    """
     om = _build_client()
     snapshots: list[WeatherSnapshot] = []
 
@@ -73,7 +79,7 @@ def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 5)
                 "models": model,
                 "temperature_unit": "celsius",
                 "forecast_days": days,
-                "timezone": "auto",
+                "timezone": "UTC",   # was "auto" — see docstring
             }
             responses = om.weather_api(FORECAST_URL, params=params)
             
