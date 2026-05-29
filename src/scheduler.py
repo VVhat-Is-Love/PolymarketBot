@@ -398,14 +398,16 @@ def _job_expire_stale_pending() -> None:
 
 def _job_reconcile_pnl() -> None:
     """
-    G2-1: Reconcile live trade PnL against Polymarket Data API.
+    G3-2: Reconcile live trade PnL against Polymarket Data API.
 
-    Source of truth: /activity (cash flows) + /positions (open MTM).
-    Matches by condition_id. Marks reconciled_with_polymarket=True once confirmed.
-    Runs every 15 min. Only touches trades with condition_id set.
+    Resolution gating: Gamma is_resolved_event(group_id) — not cash-flow heuristics.
+    PnL source: realized_pnl_by_token keyed by token_id.
+    Dedup: one primary row per token_id gets the real PnL; duplicates (retries) get 0.
+    PnL=$0 on a resolved losing position IS valid and IS written.
     """
+    from collections import defaultdict as _dd
     from src.config.settings import settings
-    from src.market.polymarket_data import get_activity, realized_pnl_by_condition
+    from src.market.polymarket_data import get_activity, realized_pnl_by_token
     from src.notifications.telegram import get_notifier
 
     if not settings.proxy_wallet_address:
@@ -415,11 +417,11 @@ def _job_reconcile_pnl() -> None:
     notifier = get_notifier()
     session = get_session()
     try:
-        # Fetch all trades that have condition_id but are not yet reconciled
         unreconciled: list[LiveTrade] = list(
             session.execute(
                 select(LiveTrade).where(
-                    LiveTrade.condition_id.isnot(None),
+                    LiveTrade.token_id.isnot(None),
+                    LiveTrade.group_id.isnot(None),
                     LiveTrade.reconciled_with_polymarket == False,  # noqa: E712
                     LiveTrade.status.in_(["filled", "open", "expired", "cancelled"]),
                 )
@@ -427,53 +429,69 @@ def _job_reconcile_pnl() -> None:
         )
 
         if not unreconciled:
-            logger.debug("[reconcile_pnl] No unreconciled trades with condition_id")
+            logger.debug("[reconcile_pnl] No unreconciled trades with token_id")
             return
 
         logger.info(f"[reconcile_pnl] Checking {len(unreconciled)} trades against Data API")
 
         activity = get_activity(settings.proxy_wallet_address)
-        pnl_map = realized_pnl_by_condition(activity)
+        pnl_map = realized_pnl_by_token(activity)
 
+        # Cache Gamma resolution per group_id to avoid duplicate API calls
+        resolved_cache: dict[str, bool] = {}
+
+        def _is_resolved(group_id: str) -> bool:
+            if group_id not in resolved_cache:
+                resolved_cache[group_id] = _gamma.is_resolved_event(group_id)
+            return resolved_cache[group_id]
+
+        # Group by token_id for dedup; then by group_id for resolution check
+        by_token: dict[str, list[LiveTrade]] = _dd(list)
         for t in unreconciled:
-            cid = t.condition_id
-            if cid not in pnl_map:
-                continue  # no activity for this condition yet (market still open)
+            if t.token_id:
+                by_token[t.token_id].append(t)
 
-            realized = pnl_map[cid]
+        for token_id, trades in by_token.items():
+            group_id = trades[0].group_id
+            if not group_id or not _is_resolved(group_id):
+                continue  # market still live — skip
 
-            # Determine if the position has been settled:
-            # A settled position has at least one REDEEM or SELL in the activity map.
-            has_cash_in = any(
-                (a.get("conditionId") == cid and
-                 (a.get("type") == "REDEEM" or
-                  (a.get("type") == "TRADE" and a.get("side", "").upper() == "SELL")))
-                for a in activity
+            # PnL from Polymarket cash flows (0.0 for a loss = valid)
+            realized = pnl_map.get(token_id, 0.0)
+
+            # Primary = filled > open > most-recently-placed (handles retries)
+            primary = max(
+                trades,
+                key=lambda t: (
+                    t.status == "filled",
+                    t.status == "open",
+                    t.placed_at or datetime.min,
+                ),
             )
-            if not has_cash_in and realized < 0:
-                # Only BUY activity — position still open, skip
-                continue
+            primary.pnl_usd = round(realized, 4)
+            primary.reconciled_with_polymarket = True
+            primary.resolved_at = primary.resolved_at or datetime.utcnow()
+            primary.status = "resolved"
 
-            old_pnl = t.pnl_usd
-            t.pnl_usd = round(realized, 4)
-            t.reconciled_with_polymarket = True
-            t.resolved_at = t.resolved_at or datetime.utcnow()
-
-            # Update status to resolved if it was still "open"
-            if t.status in ("open", "pending"):
-                t.status = "filled"
+            # Dedup: retries with same token get pnl=0 (the real PnL is on primary)
+            for t in trades:
+                if t is not primary and not t.reconciled_with_polymarket:
+                    t.pnl_usd = 0.0
+                    t.reconciled_with_polymarket = True
+                    t.status = "resolved"
 
             session.commit()
 
             pnl_sign = "+" if realized >= 0 else ""
-            city = t.city or t.group_id or "?"
+            city = primary.city or group_id or "?"
             logger.info(
-                f"[reconcile_pnl] ✅ Reconciled: {city} {t.bin_label} "
-                f"PnL={pnl_sign}${realized:.2f} (was {old_pnl})"
+                f"[reconcile_pnl] ✅ {city} {primary.bin_label} "
+                f"PnL={pnl_sign}${realized:.2f} token={token_id[:12]}…"
+                + (f" ({len(trades)-1} deduped)" if len(trades) > 1 else "")
             )
             outcome_em = "✅" if realized > 0 else "❌"
             notifier.send(
-                f"{outcome_em} [{t.strategy_name}] {city} {t.bin_label} — "
+                f"{outcome_em} [{primary.strategy_name}] {city} {primary.bin_label} — "
                 f"закрыта {pnl_sign}${abs(realized):.2f} (сверено Polymarket)"
             )
 
@@ -598,6 +616,87 @@ def _job_paper_trade_summary() -> None:
         )
     except Exception as e:
         logger.error(f"Summary job failed: {e}")
+    finally:
+        session.close()
+
+
+def _job_settle_paper() -> None:
+    """
+    G3-3: Settle open paper trades by Gamma outcome — NOT weather, NOT Data API.
+
+    For each open PaperTrade: check if the event is resolved via Gamma. If yes,
+    find the winning market_id (price ≥ 0.99), compute PnL from basket_json
+    (shares × $1 - total_cost), and mark resolved.
+
+    Paper trades are simulations — they have no /activity entry on Polymarket.
+    Gamma prices are the canonical outcome for resolution.
+    """
+    import json as _json
+    session = get_session()
+    notifier = get_notifier()
+    try:
+        open_trades: list[PaperTrade] = list(
+            session.execute(
+                select(PaperTrade).where(PaperTrade.status == "open")
+            ).scalars().all()
+        )
+
+        if not open_trades:
+            logger.debug("[settle_paper] No open paper trades")
+            return
+
+        logger.info(f"[settle_paper] Checking {len(open_trades)} open paper trades via Gamma")
+        resolved_count = 0
+
+        for pt in open_trades:
+            if not pt.group_id:
+                continue
+            if not _gamma.is_resolved_event(pt.group_id):
+                continue
+
+            winner_mid = _gamma.winning_market_id(pt.group_id)
+
+            # Compute payout from basket_json
+            try:
+                basket = _json.loads(pt.basket_json)
+            except Exception:
+                basket = []
+
+            total_cost = pt.virtual_stake_usd or sum(b.get("stake_usd", 0) for b in basket)
+            winning_bin = next((b for b in basket if str(b.get("market_id")) == str(winner_mid)), None)
+
+            if winning_bin:
+                shares = winning_bin.get("shares") or 0.0
+                payout = float(shares) * 1.0
+                pnl = round(payout - total_cost, 4)
+                status = "resolved_win" if pnl > 0 else "resolved_partial" if payout > 0 else "resolved_loss"
+            else:
+                pnl = round(-total_cost, 4)
+                status = "resolved_basket_miss" if winner_mid else "resolved_loss"
+
+            pt.pnl_usd = pnl
+            pt.status = status
+            pt.resolved_at = datetime.utcnow()
+            pt.winning_market_id = winner_mid
+            pt.resolved_via = "gamma_api"
+            resolved_count += 1
+
+            city = pt.city or pt.group_id or "?"
+            outcome_em = "✅" if pnl > 0 else "❌"
+            logger.info(
+                f"[settle_paper] {city} → {status} PnL=${pnl:+.2f} winner={winner_mid}"
+            )
+            notifier.send(
+                f"{outcome_em} [paper] {city} — {status} PnL=${pnl:+.2f}"
+            )
+
+        if resolved_count:
+            session.commit()
+            logger.info(f"[settle_paper] Settled {resolved_count} paper trades via Gamma")
+
+    except Exception as exc:
+        logger.error(f"[settle_paper] Job failed: {exc}")
+        session.rollback()
     finally:
         session.close()
 
@@ -880,6 +979,7 @@ def setup_scheduler() -> None:
     if not emergency_stopped:
         schedule.every(15).minutes.do(_job_live_trade_engine)
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
+    schedule.every(15).minutes.do(_job_settle_paper)   # G3-3: Gamma-based paper settlement
     schedule.every(60).minutes.do(_job_paper_trade_summary)
     schedule.every(2).minutes.do(_job_reconcile_orders)
     schedule.every(15).minutes.do(_job_reconcile_pnl)
@@ -903,7 +1003,8 @@ def run_initial_jobs() -> None:
     _job_fetch_open_meteo()
     _job_snapshot_markets()
     _job_resolve_paper_trades()
-    _job_reconcile_pnl()       # G2-1: reconcile first, so live summary is correct
+    _job_settle_paper()         # G3-3: Gamma paper settlement on startup
+    _job_reconcile_pnl()       # G3-2: reconcile live PnL first
     _job_resolve_live_trades()
     _job_paper_trade_engine()
     _job_live_trade_engine()

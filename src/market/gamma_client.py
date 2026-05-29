@@ -165,6 +165,24 @@ class GammaClient:
                 pass
         return result
 
+    def is_resolved_event(self, event_id: str) -> bool:
+        """
+        Return True if the Gamma event is resolved (any market has price_yes ≥ 0.99).
+        Used by reconcile and paper-settle jobs to gate PnL attribution.
+        """
+        prices = self.get_prices_for_group(event_id)
+        if not prices:
+            return False
+        return max(prices.values(), default=0.0) >= 0.99
+
+    def winning_market_id(self, event_id: str) -> str | None:
+        """Return the market_id whose YES price ≥ 0.99, or None if still live."""
+        prices = self.get_prices_for_group(event_id)
+        for mid, p in prices.items():
+            if p >= 0.99:
+                return mid
+        return None
+
     def get_all_weather_events(self) -> list[dict]:
         """
         Fetch weather events via targeted keyword search to avoid the 403 that
