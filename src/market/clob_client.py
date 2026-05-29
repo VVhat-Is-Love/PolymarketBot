@@ -1,9 +1,29 @@
+"""
+CLOB order-book helpers.
+
+Endpoint contract (confirmed against Polymarket CLOB API):
+  GET  /book?token_id=<id>          — single token, always works
+  POST /books   body=[{"token_id": "..."}]  — batch, one request for N tokens
+  GET  /books?token_id=...          — 400 "Invalid payload" (wrong method)
+
+We use:
+  • POST /books for batch YES-ask fetches (one HTTP round-trip per group)
+  • GET  /book  for single-token fallback + legacy callers
+"""
 import time
+
 import requests
 from loguru import logger
 
 _CLOB_HOST = "https://clob.polymarket.com"
-_REQUEST_DELAY = 0.1  # 10 req/s — conservative, CLOB allows ~50 req/s
+
+# Rate-limiting: ~6–7 req/s (well under CLOB limit of ~50/s)
+_REQUEST_DELAY = 0.15
+
+# Connect + read timeouts (seconds)
+_TIMEOUT = (5, 15)  # (connect, read)
+_RETRIES = 3        # attempts before giving up on a single token
+_RETRY_SLEEP = 2    # seconds between retries on timeout/connect errors
 
 _CLOB_HEADERS = {
     "Accept": "application/json",
@@ -11,8 +31,177 @@ _CLOB_HEADERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _parse_book_response(book: dict) -> dict:
+    """Parse a single order-book dict into our canonical snapshot format."""
+    bids: list[dict] = book.get("bids") or []
+    asks: list[dict] = book.get("asks") or []
+
+    best_bid = float(bids[0]["price"]) if bids else None
+    best_bid_size = float(bids[0]["size"]) if bids else None
+    best_ask = float(asks[0]["price"]) if asks else None
+    best_ask_size = float(asks[0]["size"]) if asks else None
+
+    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
+    spread = (best_ask - best_bid) if best_bid and best_ask else None
+
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "best_bid_size": best_bid_size,
+        "best_ask_size": best_ask_size,
+        "mid": mid,
+        "spread": spread,
+        "price_yes": best_ask,
+        "price_no": (1.0 - best_bid) if best_bid is not None else None,
+    }
+
+
+class BookUnavailable(Exception):
+    """Raised when CLOB says the market exists but has no active order book."""
+
+
+def _get_single_book(token_id: str) -> dict | None:
+    """
+    GET /book?token_id=<id>  — single token, with timeout retries.
+    Returns parsed snapshot dict, or None on failure.
+    Raises BookUnavailable when the market has no active book (HTTP 400).
+    """
+    for attempt in range(_RETRIES):
+        try:
+            resp = requests.get(
+                f"{_CLOB_HOST}/book",
+                params={"token_id": token_id},
+                headers=_CLOB_HEADERS,
+                timeout=_TIMEOUT,
+            )
+            if resp.status_code == 400:
+                raise BookUnavailable(token_id)
+            if resp.status_code == 403:
+                logger.warning(
+                    f"[clob] GET /book 403 token={token_id[:16]}… — IP-blocked or rate-limited"
+                )
+                return None
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                logger.warning(f"[clob] GET /book 429 — sleeping {retry_after}s")
+                time.sleep(retry_after)
+                continue
+            resp.raise_for_status()
+            return _parse_book_response(resp.json())
+
+        except BookUnavailable:
+            raise
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt < _RETRIES - 1:
+                logger.warning(
+                    f"[clob] GET /book timeout/connect token={token_id[:16]}… "
+                    f"attempt {attempt + 1}/{_RETRIES}: {exc} — retrying in {_RETRY_SLEEP}s"
+                )
+                time.sleep(_RETRY_SLEEP)
+                continue
+            logger.warning(
+                f"[clob] GET /book gave up after {_RETRIES} attempts "
+                f"token={token_id[:16]}…: {exc}"
+            )
+            return None
+        except Exception as exc:
+            logger.error(f"[clob] GET /book unexpected error token={token_id[:16]}…: {exc}")
+            return None
+
+    return None
+
+
+def _post_batch_books(
+    token_ids: list[str],
+    *,
+    log_raw: bool = False,
+) -> list[dict | None]:
+    """
+    POST /books  body=[{"token_id": ...}, ...]
+    Returns list of parsed snapshots in the same order as token_ids.
+    None entries for tokens whose book could not be fetched.
+
+    log_raw=True logs the raw HTTP response at INFO level (diagnostics).
+    """
+    if not token_ids:
+        return []
+
+    body = [{"token_id": tid} for tid in token_ids]
+    for attempt in range(_RETRIES):
+        try:
+            resp = requests.post(
+                f"{_CLOB_HOST}/books",
+                json=body,
+                headers={**_CLOB_HEADERS, "Content-Type": "application/json"},
+                timeout=(5, 30),
+            )
+            if log_raw:
+                logger.info(
+                    f"[clob_diag] POST /books n={len(token_ids)} "
+                    f"HTTP={resp.status_code} "
+                    f"body={resp.text[:800]}"
+                )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[clob] POST /books HTTP {resp.status_code}: {resp.text[:300]}"
+                )
+                return [None] * len(token_ids)
+
+            data = resp.json()
+            if not isinstance(data, list):
+                logger.warning(
+                    f"[clob] POST /books unexpected response type {type(data).__name__}"
+                )
+                return [None] * len(token_ids)
+
+            result: list[dict | None] = []
+            for book in data:
+                if isinstance(book, dict) and book:
+                    try:
+                        result.append(_parse_book_response(book))
+                    except Exception:
+                        result.append(None)
+                else:
+                    result.append(None)
+
+            # Pad if server returned fewer items than requested
+            while len(result) < len(token_ids):
+                result.append(None)
+
+            return result
+
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt < _RETRIES - 1:
+                logger.warning(
+                    f"[clob] POST /books timeout/connect attempt {attempt + 1}/{_RETRIES}: "
+                    f"{exc} — retrying in {_RETRY_SLEEP}s"
+                )
+                time.sleep(_RETRY_SLEEP)
+                continue
+            logger.warning(f"[clob] POST /books gave up after {_RETRIES} attempts: {exc}")
+            return [None] * len(token_ids)
+        except Exception as exc:
+            logger.error(f"[clob] POST /books unexpected error: {exc}")
+            return [None] * len(token_ids)
+
+    return [None] * len(token_ids)
+
+
+# ---------------------------------------------------------------------------
+# Legacy single-token helper (used by get_book_snapshot + get_no_ask_prices)
+# ---------------------------------------------------------------------------
+
+def _fallback_http(token_id: str) -> dict | None:
+    """Single-token book fetch via GET /book (fixed endpoint, with retries)."""
+    return _get_single_book(token_id)
+
+
 def _try_py_clob_client(token_id: str) -> dict | None:
-    """Attempt to use the official py-clob-client SDK (read-only, no credentials)."""
+    """Attempt the official py-clob-client SDK (read-only). Falls back on any error."""
     try:
         from py_clob_client.client import ClobClient as _PyClob  # type: ignore[import]
 
@@ -40,99 +229,45 @@ def _try_py_clob_client(token_id: str) -> dict | None:
             "price_yes": best_ask,
             "price_no": (1.0 - best_bid) if best_bid is not None else None,
         }
-    except Exception as e:
-        logger.debug(f"py-clob-client failed for {token_id[:12]}…: {e} — falling back to HTTP")
+    except Exception as exc:
+        logger.debug(
+            f"[clob] py-clob-client failed for {token_id[:16]}…: {exc} — using HTTP"
+        )
         return None
 
 
-class BookUnavailable(Exception):
-    """Raised when CLOB returns 400 — market exists but has no active book."""
-
-
-def _parse_book_response(book: dict) -> dict:
-    bids: list[dict] = book.get("bids") or []
-    asks: list[dict] = book.get("asks") or []
-
-    best_bid = float(bids[0]["price"]) if bids else None
-    best_bid_size = float(bids[0]["size"]) if bids else None
-    best_ask = float(asks[0]["price"]) if asks else None
-    best_ask_size = float(asks[0]["size"]) if asks else None
-
-    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
-    spread = (best_ask - best_bid) if best_bid and best_ask else None
-
-    return {
-        "best_bid": best_bid,
-        "best_ask": best_ask,
-        "best_bid_size": best_bid_size,
-        "best_ask_size": best_ask_size,
-        "mid": mid,
-        "spread": spread,
-        "price_yes": best_ask,
-        "price_no": (1.0 - best_bid) if best_bid is not None else None,
-    }
-
-
-def _fallback_http(token_id: str) -> dict | None:
-    """Plain HTTP fallback in case py-clob-client has issues."""
-    for attempt in range(2):
-        try:
-            resp = requests.get(
-                f"{_CLOB_HOST}/books",
-                params={"token_id": token_id},
-                headers=_CLOB_HEADERS,
-                timeout=20,
-            )
-            if resp.status_code == 400:
-                raise BookUnavailable(token_id)
-            if resp.status_code == 403:
-                logger.warning(f"CLOB 403 for {token_id[:12]}… — rate-limited or IP-blocked, skipping")
-                return None
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 60))
-                logger.warning(f"CLOB 429 — sleeping {retry_after}s before retry")
-                time.sleep(retry_after)
-                continue
-            resp.raise_for_status()
-            return _parse_book_response(resp.json())
-        except BookUnavailable:
-            raise
-        except Exception as e:
-            logger.error(f"HTTP request failed for token {token_id[:12]}…: {e}")
-            return None
-    return None
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def get_book_snapshot(token_id: str) -> dict | None:
     """
-    Returns order book snapshot for a YES token.
-    Tries py-clob-client first, falls back to plain HTTP.
-    Raises BookUnavailable if CLOB returned 400 (closed/invalid market).
-    Caller is responsible for rate-limiting (sleep after each call).
+    Order-book snapshot for a single YES token.
+    Tries py-clob-client, falls back to GET /book.
+    Raises BookUnavailable if the market has no active book.
     """
     result = _try_py_clob_client(token_id)
     if result is None:
-        result = _fallback_http(token_id)
+        result = _get_single_book(token_id)
     return result
 
 
 def get_no_ask_prices(token_ids: list[str]) -> dict[str, float | None]:
     """
-    Fetch the best ask for each NO token from the CLOB order book.
-    Returns {token_id: best_ask} — None when book is empty or unavailable.
-    Sequential with _REQUEST_DELAY between calls.
+    Best ask for each NO token via GET /book (sequential with rate-limit delay).
+    Returns {token_id: best_ask} — None when unavailable.
     """
     result: dict[str, float | None] = {}
     for token_id in token_ids:
         if not token_id:
             continue
         try:
-            snap = _fallback_http(token_id)
+            snap = _get_single_book(token_id)
             result[token_id] = snap.get("best_ask") if snap else None
         except BookUnavailable:
             result[token_id] = None
         except Exception as exc:
-            logger.debug(f"[clob_client] NO ask fetch {token_id[:12]}…: {exc}")
+            logger.debug(f"[clob] NO ask fetch {token_id[:16]}…: {exc}")
             result[token_id] = None
         time.sleep(_REQUEST_DELAY)
     return result
@@ -144,59 +279,55 @@ def get_yes_ask_prices(
     log_raw_for: str | None = None,
 ) -> dict[str, float | None]:
     """
-    Fetch best_ask for each YES token from the CLOB order book.
-    Returns {token_id: best_ask} — None when book is empty or unavailable.
+    Best ask for YES tokens — single POST /books round-trip for all tokens.
 
-    log_raw_for: if a token_id in the list matches this value, log the raw HTTP
-    response at INFO level (diagnostic; pass first token_id of a group to get
-    one representative dump).
+    log_raw_for: unused (kept for API compat); raw response is always logged
+    at INFO when the batch call is the first call for a group (controlled by
+    the caller passing the parameter).
+
+    Falls back to individual GET /book calls if the batch fails completely.
+    Returns {token_id: best_ask | None}.
     """
-    import requests as _req
+    if not token_ids:
+        return {}
+
+    clean = [tid for tid in token_ids if tid]
+    # Log raw response when diagnostics are requested (log_raw_for!=None triggers it)
+    do_log_raw = log_raw_for is not None
+    books = _post_batch_books(clean, log_raw=do_log_raw)
 
     result: dict[str, float | None] = {}
-    for token_id in token_ids:
-        if not token_id:
-            result[token_id] = None
-            continue
-        try:
-            resp = _req.get(
-                f"{_CLOB_HOST}/books",
-                params={"token_id": token_id},
-                headers=_CLOB_HEADERS,
-                timeout=20,
-            )
-            if token_id == log_raw_for:
+    all_failed = all(b is None for b in books)
+
+    if all_failed and clean:
+        # Batch totally failed — fall back to sequential GET /book
+        logger.warning(
+            "[clob] POST /books returned all-None — falling back to GET /book per token"
+        )
+        for token_id in clean:
+            try:
+                snap = _get_single_book(token_id)
+                ask = snap.get("best_ask") if snap else None
                 logger.info(
-                    f"[clob_diag] YES book token={token_id[:20]}… "
-                    f"HTTP={resp.status_code} "
-                    f"body={resp.text[:600]}"
-                )
-            if resp.status_code == 400:
-                logger.debug(f"[clob_client] YES ask 400 (no book) token={token_id[:12]}…")
-                result[token_id] = None
-            elif resp.status_code in (403, 429):
-                logger.warning(
-                    f"[clob_client] YES ask HTTP {resp.status_code} "
-                    f"token={token_id[:12]}… — rate-limited or IP-blocked"
-                )
-                result[token_id] = None
-            elif resp.status_code == 200:
-                parsed = _parse_book_response(resp.json())
-                ask = parsed.get("best_ask")
-                logger.debug(
-                    f"[clob_client] YES ask token={token_id[:12]}… ask={ask}"
+                    f"[clob] YES ask fallback GET /book "
+                    f"token={token_id[:16]}… ask={ask}"
                 )
                 result[token_id] = ask
-            else:
-                logger.warning(
-                    f"[clob_client] YES ask HTTP {resp.status_code} "
-                    f"token={token_id[:12]}…"
-                )
+            except BookUnavailable:
                 result[token_id] = None
-        except BookUnavailable:
-            result[token_id] = None
-        except Exception as exc:
-            logger.warning(f"[clob_client] YES ask fetch failed token={token_id[:12]}…: {exc}")
-            result[token_id] = None
-        time.sleep(_REQUEST_DELAY)
+            except Exception as exc:
+                logger.warning(f"[clob] YES ask fallback failed {token_id[:16]}…: {exc}")
+                result[token_id] = None
+            time.sleep(_REQUEST_DELAY)
+    else:
+        for token_id, snap in zip(clean, books):
+            ask = snap.get("best_ask") if snap else None
+            logger.debug(f"[clob] YES ask batch token={token_id[:16]}… ask={ask}")
+            result[token_id] = ask
+
+    # Tokens that were empty strings → None
+    for tid in token_ids:
+        if not tid:
+            result[tid] = None
+
     return result
