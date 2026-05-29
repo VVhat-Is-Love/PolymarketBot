@@ -668,17 +668,38 @@ def _job_settle_paper() -> None:
             except Exception:
                 basket = []
 
+            basket_market_ids = [str(b.get("market_id", "")) for b in basket]
             total_cost = pt.virtual_stake_usd or sum(b.get("stake_usd", 0) for b in basket)
-            winning_bin = next((b for b in basket if str(b.get("market_id")) == str(winner_mid)), None)
+
+            # Diagnostic: log exact inputs to the match
+            logger.info(
+                f"[settle_paper] id={pt.id} group={pt.group_id} "
+                f"winner_mid={winner_mid!r} "
+                f"basket_market_ids={basket_market_ids} "
+                f"total_cost=${total_cost:.4f}"
+            )
+
+            winning_bin = next(
+                (b for b in basket if str(b.get("market_id")) == str(winner_mid)),
+                None,
+            )
 
             if winning_bin:
                 shares = winning_bin.get("shares") or 0.0
                 payout = float(shares) * 1.0
                 pnl = round(payout - total_cost, 4)
                 status = "resolved_win" if pnl > 0 else "resolved_partial" if payout > 0 else "resolved_loss"
+                logger.info(
+                    f"[settle_paper] MATCH: bin={winning_bin.get('bin_label')} "
+                    f"shares={shares:.4f} payout=${payout:.4f} pnl=${pnl:+.4f}"
+                )
             else:
                 pnl = round(-total_cost, 4)
                 status = "resolved_basket_miss" if winner_mid else "resolved_loss"
+                logger.warning(
+                    f"[settle_paper] NO MATCH: winner_mid={winner_mid!r} not in basket "
+                    f"{basket_market_ids} → status={status} pnl=${pnl:+.2f}"
+                )
 
             pt.pnl_usd = pnl
             pt.status = status
@@ -1045,8 +1066,46 @@ def setup_scheduler() -> None:
     )
 
 
+def _reset_phantom_paper_losses() -> None:
+    """
+    One-time cleanup: cancel paper trades whose pnl_usd equals exactly -virtual_stake_usd.
+    These are the signature of a basket_miss where the winning_market_id was not found in
+    the basket_json — a known settle bug. Sets them to cancelled/pnl=0 so they don't
+    inflate the paper_total_loss counter.
+    """
+    session = get_session()
+    try:
+        rows: list[PaperTrade] = list(
+            session.execute(
+                select(PaperTrade).where(
+                    PaperTrade.pnl_usd.isnot(None),
+                    PaperTrade.status.in_(["resolved_basket_miss", "resolved_loss"]),
+                )
+            ).scalars().all()
+        )
+        cleaned = 0
+        for pt in rows:
+            # Flat loss = stake rounded to 4 decimals — signature of basket_miss path
+            if pt.pnl_usd is not None and abs(pt.pnl_usd + (pt.virtual_stake_usd or 0)) < 0.01:
+                pt.status = "cancelled"
+                pt.pnl_usd = 0.0
+                pt.resolved_via = "reset_phantom"
+                cleaned += 1
+        if cleaned:
+            session.commit()
+            logger.info(f"[reset_phantom] Cancelled {cleaned} phantom paper losses (pnl reset to $0)")
+        else:
+            logger.info("[reset_phantom] No phantom paper losses found")
+    except Exception as exc:
+        logger.warning(f"[reset_phantom] Failed: {exc}")
+        session.rollback()
+    finally:
+        session.close()
+
+
 def run_initial_jobs() -> None:
     logger.info("Running initial data collection on startup...")
+    _reset_phantom_paper_losses()    # cancel flat -stake losses from broken settle path
     _job_expire_stale_pending()
     _job_discover_markets()
     _job_fetch_open_meteo()

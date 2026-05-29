@@ -513,7 +513,45 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                 continue
 
             unit = group.unit or "F"
-            all_bin_prices = {mid: p for mid, p in prices.items() if p is not None}
+
+            # ── Fetch real CLOB YES ask prices (not Gamma mid/last) ────────
+            # basket_decision needs real order-book ask to compute honest EV.
+            # Gamma outcomePrices[0] is mid/last price — using it causes EV
+            # to be computed on a surrogate and the EV gate to fire incorrectly.
+            from src.market.clob_client import get_yes_ask_prices as _get_yes_asks
+            token_yes_map: dict[str, str] = {
+                m.token_id_yes: m.market_id
+                for m in markets
+                if m.token_id_yes
+            }
+            # Log raw CLOB response for the first YES token of this group (diagnostics)
+            log_raw_token = next(iter(token_yes_map), None)
+            yes_asks_by_token = _get_yes_asks(
+                list(token_yes_map.keys()),
+                log_raw_for=log_raw_token,
+            )
+            # Build market_id → ask_price; fall back to Gamma price_yes if CLOB returns None
+            clob_ask_prices: dict[str, float] = {}
+            for tok, mid in token_yes_map.items():
+                clob_ask = yes_asks_by_token.get(tok)
+                gamma_mid = prices.get(mid)
+                chosen = clob_ask if clob_ask is not None else gamma_mid
+                source = "CLOB" if clob_ask is not None else "Gamma_fallback"
+                logger.info(
+                    f"[live_trader] {group.city} market={mid} "
+                    f"clob_ask={clob_ask} gamma_mid={gamma_mid} using={source}"
+                )
+                if chosen is not None:
+                    clob_ask_prices[mid] = chosen
+
+            if not clob_ask_prices:
+                logger.info(
+                    f"[live_trader] SKIP {group.city}: "
+                    "no ask prices from CLOB or Gamma — cannot size basket"
+                )
+                continue
+
+            all_bin_prices = clob_ask_prices
 
             # Diagnostic per-bin edge logging (does NOT gate or select bins)
             if result.consensus_temp is not None:

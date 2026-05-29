@@ -136,3 +136,67 @@ def get_no_ask_prices(token_ids: list[str]) -> dict[str, float | None]:
             result[token_id] = None
         time.sleep(_REQUEST_DELAY)
     return result
+
+
+def get_yes_ask_prices(
+    token_ids: list[str],
+    *,
+    log_raw_for: str | None = None,
+) -> dict[str, float | None]:
+    """
+    Fetch best_ask for each YES token from the CLOB order book.
+    Returns {token_id: best_ask} — None when book is empty or unavailable.
+
+    log_raw_for: if a token_id in the list matches this value, log the raw HTTP
+    response at INFO level (diagnostic; pass first token_id of a group to get
+    one representative dump).
+    """
+    import requests as _req
+
+    result: dict[str, float | None] = {}
+    for token_id in token_ids:
+        if not token_id:
+            result[token_id] = None
+            continue
+        try:
+            resp = _req.get(
+                f"{_CLOB_HOST}/books",
+                params={"token_id": token_id},
+                headers=_CLOB_HEADERS,
+                timeout=20,
+            )
+            if token_id == log_raw_for:
+                logger.info(
+                    f"[clob_diag] YES book token={token_id[:20]}… "
+                    f"HTTP={resp.status_code} "
+                    f"body={resp.text[:600]}"
+                )
+            if resp.status_code == 400:
+                logger.debug(f"[clob_client] YES ask 400 (no book) token={token_id[:12]}…")
+                result[token_id] = None
+            elif resp.status_code in (403, 429):
+                logger.warning(
+                    f"[clob_client] YES ask HTTP {resp.status_code} "
+                    f"token={token_id[:12]}… — rate-limited or IP-blocked"
+                )
+                result[token_id] = None
+            elif resp.status_code == 200:
+                parsed = _parse_book_response(resp.json())
+                ask = parsed.get("best_ask")
+                logger.debug(
+                    f"[clob_client] YES ask token={token_id[:12]}… ask={ask}"
+                )
+                result[token_id] = ask
+            else:
+                logger.warning(
+                    f"[clob_client] YES ask HTTP {resp.status_code} "
+                    f"token={token_id[:12]}…"
+                )
+                result[token_id] = None
+        except BookUnavailable:
+            result[token_id] = None
+        except Exception as exc:
+            logger.warning(f"[clob_client] YES ask fetch failed token={token_id[:12]}…: {exc}")
+            result[token_id] = None
+        time.sleep(_REQUEST_DELAY)
+    return result
