@@ -22,6 +22,7 @@ class RiskStatus:
     total_loss: float           # cumulative all-time losses
     emergency_stop: bool
     emergency_stop_reason: str
+    emergency_stop_type: str    # 'manual' | 'daily_loss' | 'total_loss' | ''
     max_single_bet_usd: float
     max_daily_bets: int
     max_concurrent_bets: int
@@ -44,6 +45,7 @@ class RiskManager:
         self._total_loss: float = 0.0
         self._emergency_stop: bool = False
         self._emergency_stop_reason: str = ""
+        self._emergency_stop_type: str = ""   # 'manual' | 'daily_loss' | 'total_loss'
         # group_id → bet_size_usd for currently open bets
         self._open_bets: dict[str, float] = {}
         # In-session reservations: notional pre-approved but not yet in DB
@@ -98,6 +100,8 @@ class RiskManager:
                     self._emergency_stop = True
                     reason_row = session.get(BotState, "emergency_stop_reason")
                     self._emergency_stop_reason = reason_row.value if reason_row else "DB-persisted stop"
+                    type_row = session.get(BotState, "emergency_stop_type")
+                    self._emergency_stop_type = type_row.value if type_row else "manual"
                 elif not self._emergency_stop:
                     # Only clear in-memory if it wasn't set locally this session
                     pass  # keep in-memory flag if set
@@ -159,7 +163,9 @@ class RiskManager:
                 f"RiskManager: DB sync failed — using cached in-memory values: {exc}"
             )
 
-    def _persist_emergency_stop(self, active: bool, reason: str = "") -> None:
+    def _persist_emergency_stop(
+        self, active: bool, reason: str = "", stop_type: str = "manual"
+    ) -> None:
         """Write emergency stop state to bot_state table."""
         try:
             from src.db.session import get_session
@@ -167,16 +173,10 @@ class RiskManager:
 
             session = get_session()
             try:
-                session.merge(BotState(
-                    key="emergency_stop",
-                    value="1" if active else "0",
-                    updated_at=datetime.utcnow(),
-                ))
-                session.merge(BotState(
-                    key="emergency_stop_reason",
-                    value=reason,
-                    updated_at=datetime.utcnow(),
-                ))
+                now = datetime.utcnow()
+                session.merge(BotState(key="emergency_stop", value="1" if active else "0", updated_at=now))
+                session.merge(BotState(key="emergency_stop_reason", value=reason, updated_at=now))
+                session.merge(BotState(key="emergency_stop_type", value=stop_type if active else "", updated_at=now))
                 session.commit()
             finally:
                 session.close()
@@ -210,16 +210,34 @@ class RiskManager:
     def _trigger_total_stop(self, reason: str) -> None:
         """Edge-triggered: fires once on 0→1 transition; skips alert if already stopped."""
         if self._emergency_stop:
-            return  # already stopped — no re-alert
+            return
         self._emergency_stop = True
         self._emergency_stop_reason = reason
-        self._persist_emergency_stop(True, reason)
+        self._emergency_stop_type = "total_loss"
+        self._persist_emergency_stop(True, reason, "total_loss")
         logger.error(f"RiskManager: TOTAL STOP-LOSS triggered — {reason}")
         try:
             from src.config.settings import settings
             if settings.trading_mode.lower() == "live":
                 from src.notifications.telegram import get_notifier
                 get_notifier().send(f"🛑 TOTAL STOP-LOSS: {reason}")
+        except Exception:
+            pass
+
+    def _trigger_daily_loss_stop(self, reason: str) -> None:
+        """Edge-triggered: activate daily-loss emergency stop (auto-cleared next trading day)."""
+        if self._emergency_stop:
+            return
+        self._emergency_stop = True
+        self._emergency_stop_reason = reason
+        self._emergency_stop_type = "daily_loss"
+        self._persist_emergency_stop(True, reason, "daily_loss")
+        logger.warning(f"RiskManager: DAILY LOSS STOP triggered — {reason}")
+        try:
+            from src.config.settings import settings
+            if settings.trading_mode.lower() == "live":
+                from src.notifications.telegram import get_notifier
+                get_notifier().send(f"⚠️ DAILY LOSS LIMIT: {reason}")
         except Exception:
             pass
 
@@ -257,6 +275,9 @@ class RiskManager:
                 return False, f"Emergency stop: {self._emergency_stop_reason}"
 
             if self._daily_loss >= self._daily_loss_limit_usd:
+                self._trigger_daily_loss_stop(
+                    f"Daily loss ${self._daily_loss:.2f} >= limit ${self._daily_loss_limit_usd:.2f}"
+                )
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
             if self._total_loss >= self._total_stop_loss_usd:
@@ -309,6 +330,9 @@ class RiskManager:
                 return False, f"Emergency stop: {self._emergency_stop_reason}"
 
             if self._daily_loss >= self._daily_loss_limit_usd:
+                self._trigger_daily_loss_stop(
+                    f"Daily loss ${self._daily_loss:.2f} >= limit ${self._daily_loss_limit_usd:.2f}"
+                )
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
             if self._total_loss >= self._total_stop_loss_usd:
@@ -365,6 +389,9 @@ class RiskManager:
 
             # 3. Daily loss limit
             if self._daily_loss >= self._daily_loss_limit_usd:
+                self._trigger_daily_loss_stop(
+                    f"Daily loss ${self._daily_loss:.2f} >= limit ${self._daily_loss_limit_usd:.2f}"
+                )
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
             # 4. Total stop-loss → triggers persistent emergency stop (edge-triggered alert)
@@ -439,6 +466,7 @@ class RiskManager:
                 total_loss=self._total_loss,
                 emergency_stop=self._emergency_stop,
                 emergency_stop_reason=self._emergency_stop_reason,
+                emergency_stop_type=self._emergency_stop_type,
                 max_single_bet_usd=self._max_single_bet_usd,
                 max_daily_bets=self._max_daily_bets,
                 max_concurrent_bets=self._max_concurrent_bets,
@@ -452,21 +480,57 @@ class RiskManager:
                 tail_max_usd=self._tail_max_usd,
             )
 
-    def set_emergency_stop(self, reason: str) -> None:
+    def set_emergency_stop(self, reason: str, stop_type: str = "manual") -> None:
         """Activate emergency stop — persisted to DB, survives restarts."""
         with self._lock:
             self._emergency_stop = True
             self._emergency_stop_reason = reason
-            logger.warning(f"RiskManager: EMERGENCY STOP SET — {reason}")
-        self._persist_emergency_stop(True, reason)
+            self._emergency_stop_type = stop_type
+            logger.warning(f"RiskManager: EMERGENCY STOP SET [{stop_type}] — {reason}")
+        self._persist_emergency_stop(True, reason, stop_type)
 
     def clear_emergency_stop(self) -> None:
         """Clear emergency stop — persisted to DB."""
         with self._lock:
             self._emergency_stop = False
             self._emergency_stop_reason = ""
+            self._emergency_stop_type = ""
             logger.info("RiskManager: emergency stop cleared")
-        self._persist_emergency_stop(False, "")
+        self._persist_emergency_stop(False, "", "")
+
+    def get_stop_type(self) -> str:
+        """Return the type of the active emergency stop from DB ('manual'|'daily_loss'|'total_loss'|'')."""
+        try:
+            from src.db.session import get_session
+            from src.db.models import BotState
+
+            session = get_session()
+            try:
+                row = session.get(BotState, "emergency_stop_type")
+                return row.value if row else ""
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"RiskManager: get_stop_type DB check failed: {exc}")
+            return self._emergency_stop_type
+
+    def get_stop_triggered_at(self) -> "datetime | None":
+        """Return the timestamp when the active emergency stop was set (from updated_at of the DB row)."""
+        try:
+            from src.db.session import get_session
+            from src.db.models import BotState
+
+            session = get_session()
+            try:
+                row = session.get(BotState, "emergency_stop")
+                if row and row.value == "1":
+                    return row.updated_at
+                return None
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"RiskManager: get_stop_triggered_at DB check failed: {exc}")
+            return None
 
     # ------------------------------------------------------------------
     # Runtime limit setters (called by Telegram bot /setlimit, /setstake)

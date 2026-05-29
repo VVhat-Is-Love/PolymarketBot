@@ -42,6 +42,7 @@ def _make_rm(**kwargs):
         rm._total_loss = 0.0
         rm._emergency_stop = False
         rm._emergency_stop_reason = ""
+        rm._emergency_stop_type = ""
         rm._open_bets = {}
         rm._reserved_usd = 0.0
         rm._basket_legs_open = 0

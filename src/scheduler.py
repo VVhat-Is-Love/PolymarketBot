@@ -958,11 +958,141 @@ def _restore_trading_mode() -> None:
         session.close()
 
 
+_paper_promote_done: bool = False
+
+
+def _check_emergency_stop_on_startup() -> None:
+    """
+    Auto-clear emergency stops that do NOT require manual intervention:
+      - 'manual'     → user restarted intentionally → clear
+      - 'daily_loss' → new trading day → clear; same day → keep
+      - 'total_loss' → always require /reset_stop (never auto-clear)
+    """
+    from src.risk.risk_manager import risk_manager
+
+    if not risk_manager.is_emergency_stopped():
+        return
+
+    stop_type = risk_manager.get_stop_type()
+    notifier = get_notifier()
+
+    if stop_type == "manual":
+        risk_manager.clear_emergency_stop()
+        logger.info("[startup] Emergency stop cleared (reason=manual, bot restarted intentionally)")
+        notifier.send(
+            "✅ Emergency stop сброшен после перезапуска (причина: manual). "
+            "Бот возобновляет live торговлю."
+        )
+
+    elif stop_type == "daily_loss":
+        triggered_at = risk_manager.get_stop_triggered_at()
+        if triggered_at is None or triggered_at.date() < date.today():
+            risk_manager.clear_emergency_stop()
+            logger.info("[startup] Emergency stop cleared (reason=daily_loss, new trading day)")
+            notifier.send("✅ Emergency stop сброшен — новый торговый день, дневной лимит обнулён.")
+        else:
+            logger.warning("[startup] Emergency stop ACTIVE (daily_loss today) — live jobs disabled")
+
+    else:  # total_loss or unknown
+        logger.critical(
+            "[startup] Emergency stop ACTIVE (reason=%s) — live jobs disabled. "
+            "Use /reset_stop in Telegram to resume.",
+            stop_type or "total_loss",
+        )
+
+
+def _promote_paper_trades_to_live() -> None:
+    """
+    After a manual/daily_loss stop is cleared on startup: find recent open paper trades
+    (≤4 h old) whose bin prices haven't moved >5%. Logs eligible ones and notifies owner.
+    Actual placement is handled by _job_live_trade_engine() which follows immediately.
+    Runs only once per process startup (guarded by _paper_promote_done).
+    """
+    global _paper_promote_done
+    if _paper_promote_done:
+        return
+    _paper_promote_done = True
+
+    from src.risk.risk_manager import risk_manager
+    if risk_manager.is_emergency_stopped():
+        return  # stop still active — nothing to promote
+
+    cutoff = datetime.utcnow() - timedelta(hours=4)
+    session = get_session()
+    notifier = get_notifier()
+    try:
+        paper_trades = list(
+            session.execute(
+                select(PaperTrade).where(
+                    PaperTrade.decision_time >= cutoff,
+                    PaperTrade.status == "open",
+                )
+            ).scalars().all()
+        )
+        if not paper_trades:
+            return
+
+        eligible = []
+        for pt in paper_trades:
+            if not pt.basket_json:
+                continue
+            try:
+                basket = json.loads(pt.basket_json)
+            except Exception:
+                continue
+
+            # Check price drift per bin against latest snapshot
+            max_drift = 0.0
+            for entry in basket:
+                market_id = entry.get("market_id")
+                stored_price = float(entry.get("entry_price") or 0)
+                if not market_id or not stored_price:
+                    continue
+                snap = session.execute(
+                    select(MarketSnapshot)
+                    .where(MarketSnapshot.market_id == market_id)
+                    .order_by(MarketSnapshot.snapshot_time.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if snap and snap.best_ask:
+                    max_drift = max(max_drift, abs(snap.best_ask - stored_price))
+
+            if max_drift > 0.05:
+                logger.info(
+                    f"[promote] skip {pt.city or pt.group_id} — "
+                    f"price drift {max_drift:.3f} > 0.05"
+                )
+                continue
+
+            edge_pct = (pt.estimated_edge or 0.0) * 100
+            logger.info(
+                f"[promote] eligible: {pt.city or pt.group_id} "
+                f"stake=${pt.virtual_stake_usd:.2f} edge={edge_pct:.1f}% drift={max_drift:.3f}"
+            )
+            eligible.append(pt)
+
+        if eligible:
+            lines = "\n".join(
+                f"  • {pt.city or pt.group_id} edge={(pt.estimated_edge or 0)*100:.1f}%"
+                for pt in eligible
+            )
+            notifier.send(
+                f"🔄 Promote: {len(eligible)} бумажных сделки→live (drift≤5%)\n"
+                f"{lines}\n"
+                "Live-движок разместит их в следующем цикле."
+            )
+    except Exception as exc:
+        logger.warning(f"[promote] failed: {exc}")
+    finally:
+        session.close()
+
+
 def setup_scheduler() -> None:
     from src.config.settings import settings
     from src.risk.risk_manager import risk_manager
 
     _restore_trading_mode()
+    _check_emergency_stop_on_startup()  # auto-clear manual/daily_loss stops before registering jobs
 
     # Check persistent emergency stop before registering live jobs
     emergency_stopped = risk_manager.is_emergency_stopped()
@@ -1007,6 +1137,7 @@ def run_initial_jobs() -> None:
     _job_settle_paper()         # G3-3: Gamma paper settlement on startup
     _job_reconcile_pnl()       # G3-2: reconcile live PnL first
     _job_resolve_live_trades()
+    _promote_paper_trades_to_live()   # G4-3: identify recent paper trades eligible for live
     _job_paper_trade_engine()
     _job_live_trade_engine()
     _job_paper_trade_summary()
