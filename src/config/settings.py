@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     tail_max_usd: float = Field(default=18.0)
 
     trading_mode: str = Field(default="paper")  # 'paper' | 'live'
+
+    # Paper trading bankroll / risk limits (separate virtual budget, never touches live)
+    paper_bankroll_usd: float = Field(default=100.0)
+    paper_total_stop_loss_usd: float = Field(default=20.0)
+    paper_daily_loss_limit_usd: float = Field(default=10.0)
     # Fallback balance if CLOB API balance query fails (Level 1 auth limitation).
     # Set to your actual Polymarket USDC balance so Kelly stake is calculated correctly.
     live_wallet_balance_usd: float = Field(default=0.0)

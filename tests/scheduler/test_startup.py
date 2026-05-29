@@ -109,6 +109,11 @@ class TestStopTypeTracking:
         rm._emergency_stop = False
         rm._emergency_stop_reason = ""
         rm._emergency_stop_type = ""
+        rm._paper_daily_loss = 0.0
+        rm._paper_total_loss = 0.0
+        rm._paper_bankroll_usd = 100.0
+        rm._paper_total_stop_loss_usd = 20.0
+        rm._paper_daily_loss_limit_usd = 10.0
         rm._open_bets = {}
         rm._reserved_usd = 0.0
         rm._basket_legs_open = 0

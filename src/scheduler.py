@@ -132,11 +132,14 @@ def _job_fetch_open_meteo() -> None:
 
 
 def _job_paper_trade_engine() -> None:
+    from src.risk.risk_manager import risk_manager
+    ok, reason = risk_manager.can_run_paper()
+    if not ok:
+        logger.info(f"JOB: paper trade engine SKIP — paper risk limit: {reason}")
+        return
     logger.info("JOB: paper trade engine")
     try:
         run_paper_trade_engine()
-    # except Exception as e:
-    #     logger.error(f"Paper trade engine job failed: {e}")
     except Exception as exc:
         logger.exception("Paper trade engine job failed")
 
@@ -1010,12 +1013,11 @@ def setup_scheduler() -> None:
     _restore_trading_mode()
     _check_emergency_stop_on_startup()  # auto-clear manual/daily_loss stops before registering jobs
 
-    # Check persistent emergency stop before registering live jobs
-    emergency_stopped = risk_manager.is_emergency_stopped()
-    if emergency_stopped:
-        logger.critical(
-            "⚠️ Emergency stop is ACTIVE in DB — live/tail jobs will NOT be registered. "
-            "Use /reset_stop in Telegram then restart the bot to resume live trading."
+    # Log emergency stop state but ALWAYS register live jobs — runtime check is in the job
+    if risk_manager.is_emergency_stopped():
+        logger.warning(
+            "⚠️ Emergency stop is ACTIVE — live job registered but will self-skip until "
+            "/reset_stop clears the flag (no restart needed)."
         )
 
     schedule.every(30).minutes.do(_job_discover_markets)
@@ -1023,8 +1025,7 @@ def setup_scheduler() -> None:
     schedule.every(60).minutes.do(_job_deactivate_resolved_groups)
     schedule.every(60).minutes.do(_job_fetch_open_meteo)
     schedule.every(15).minutes.do(_job_paper_trade_engine)
-    if not emergency_stopped:
-        schedule.every(15).minutes.do(_job_live_trade_engine)
+    schedule.every(15).minutes.do(_job_live_trade_engine)   # runtime emergency_stop check inside
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(15).minutes.do(_job_settle_paper)   # G3-3: Gamma-based paper settlement
     schedule.every(60).minutes.do(_job_paper_trade_summary)
@@ -1038,8 +1039,9 @@ def setup_scheduler() -> None:
     logger.info(
         f"Scheduler ready [{mode}]: discover=30 min | snapshots=10 min | "
         "open-meteo=60 min | deactivate=60 min | "
-        "paper-trade=15 min | live-trade=15 min | resolve-paper=60 min | "
-        "resolve-live=30 min | expire-pending=30 min | summary=60 min | daily=00:05 UTC"
+        "paper-trade=15 min | live-trade=15 min (always registered, runtime-gated) | "
+        "resolve-paper=60 min | resolve-live=30 min | expire-pending=30 min | "
+        "summary=60 min | daily=00:05 UTC"
     )
 
 

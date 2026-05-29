@@ -23,6 +23,12 @@ class RiskStatus:
     emergency_stop: bool
     emergency_stop_reason: str
     emergency_stop_type: str    # 'manual' | 'daily_loss' | 'total_loss' | ''
+    # --- Paper contour (independent from live) ---
+    paper_daily_loss: float
+    paper_total_loss: float
+    paper_bankroll_usd: float
+    paper_total_stop_loss_usd: float
+    paper_daily_loss_limit_usd: float
     max_single_bet_usd: float
     max_daily_bets: int
     max_concurrent_bets: int
@@ -42,10 +48,14 @@ class RiskManager:
         self._lock = threading.Lock()
         self._load_settings()
         self._reset_daily_state()
+        # --- Live contour ---
         self._total_loss: float = 0.0
         self._emergency_stop: bool = False
         self._emergency_stop_reason: str = ""
         self._emergency_stop_type: str = ""   # 'manual' | 'daily_loss' | 'total_loss'
+        # --- Paper contour (independent virtual budget) ---
+        self._paper_daily_loss: float = 0.0
+        self._paper_total_loss: float = 0.0
         # group_id → bet_size_usd for currently open bets
         self._open_bets: dict[str, float] = {}
         # In-session reservations: notional pre-approved but not yet in DB
@@ -68,6 +78,10 @@ class RiskManager:
         self._total_deployed_cap_usd = settings.total_deployed_cap_usd
         self._basket_max_usd = settings.basket_max_usd
         self._tail_max_usd = settings.tail_max_usd
+        # Paper contour limits (virtual, never block live)
+        self._paper_bankroll_usd = settings.paper_bankroll_usd
+        self._paper_total_stop_loss_usd = settings.paper_total_stop_loss_usd
+        self._paper_daily_loss_limit_usd = settings.paper_daily_loss_limit_usd
 
     def _reset_daily_state(self) -> None:
         self._today = date.today()
@@ -89,12 +103,13 @@ class RiskManager:
         try:
             from sqlalchemy import select, func, or_
             from src.db.session import get_session
-            from src.db.models import LiveTrade, BotState, MarketGroup
+            from src.db.models import LiveTrade, BotState, MarketGroup, PaperTrade
 
             today_start = datetime.combine(date.today(), datetime.min.time())
+            cutoff_36h = datetime.utcnow() - timedelta(hours=36)
             session = get_session()
             try:
-                # -- Emergency stop (DB-persistent) --
+                # -- Emergency stop (DB-persistent, live contour only) --
                 stop_row = session.get(BotState, "emergency_stop")
                 if stop_row and stop_row.value == "1":
                     self._emergency_stop = True
@@ -103,10 +118,9 @@ class RiskManager:
                     type_row = session.get(BotState, "emergency_stop_type")
                     self._emergency_stop_type = type_row.value if type_row else "manual"
                 elif not self._emergency_stop:
-                    # Only clear in-memory if it wasn't set locally this session
-                    pass  # keep in-memory flag if set
+                    pass  # keep in-memory flag if set locally this session
 
-                # -- Daily bet count (all trades placed today) --
+                # -- Daily bet count (all live trades placed today) --
                 self._daily_bets_count = int(
                     session.execute(
                         select(func.count()).select_from(LiveTrade).where(
@@ -115,16 +129,12 @@ class RiskManager:
                     ).scalar() or 0
                 )
 
-                # -- Concurrent open / pending positions --
-                # Exclude positions on deactivated (Gamma-resolved) groups: a trade on
-                # a group with is_active=False has curPrice ∈ {0,1} and is awaiting
-                # reconciliation, not a live open position.
+                # -- Concurrent open / pending positions (exclude Gamma-resolved groups) --
                 rows = session.execute(
                     select(LiveTrade.group_id, LiveTrade.id, LiveTrade.stake_usd)
                     .join(MarketGroup, LiveTrade.group_id == MarketGroup.group_id, isouter=True)
                     .where(
                         LiveTrade.status.in_(["pending", "open"]),
-                        # is_active NULL (no group row) or True → passes; False → excluded
                         MarketGroup.is_active.is_not(False),
                     )
                 ).all()
@@ -132,8 +142,10 @@ class RiskManager:
                     (r.group_id or r.id): (r.stake_usd or 0.0) for r in rows
                 }
 
-                # -- Daily loss (trailing 36h window, reconciled live trades only) --
-                cutoff_36h = datetime.utcnow() - timedelta(hours=36)
+                # ── LIVE CONTOUR ─────────────────────────────────────────────
+                # Only reconciled LiveTrade rows — paper trades physically can't appear here.
+
+                # Daily loss (36h, reconciled live trades only)
                 v = session.execute(
                     select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
                         LiveTrade.resolved_at >= cutoff_36h,
@@ -143,7 +155,7 @@ class RiskManager:
                 ).scalar() or 0.0
                 self._daily_loss = abs(float(v))
 
-                # -- Total loss (all-time, reconciled live trades only) --
+                # Total loss (all-time, reconciled live trades only)
                 v = session.execute(
                     select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
                         LiveTrade.pnl_usd < 0,
@@ -152,7 +164,27 @@ class RiskManager:
                 ).scalar() or 0.0
                 self._total_loss = abs(float(v))
 
-                # -- Daily PnL (resolved today) --
+                # Detail for log: up to 5 contributing trades
+                live_detail = session.execute(
+                    select(LiveTrade.id, LiveTrade.city, LiveTrade.pnl_usd)
+                    .where(
+                        LiveTrade.pnl_usd < 0,
+                        LiveTrade.reconciled_with_polymarket == True,  # noqa: E712
+                    )
+                    .order_by(LiveTrade.resolved_at.desc())
+                    .limit(5)
+                ).all()
+                live_ids_str = (
+                    ", ".join(f"#{r.id}({r.city or '?'} ${r.pnl_usd:.2f})" for r in live_detail)
+                    or "none"
+                )
+                logger.info(
+                    f"live_loss_calc: daily=${self._daily_loss:.4f} "
+                    f"total=${self._total_loss:.4f} "
+                    f"from {len(live_detail)} reconciled live [{live_ids_str}]"
+                )
+
+                # Daily PnL (resolved today, live)
                 v = session.execute(
                     select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
                         LiveTrade.resolved_at >= today_start,
@@ -160,6 +192,43 @@ class RiskManager:
                     )
                 ).scalar() or 0.0
                 self._daily_pnl = float(v)
+
+                # ── PAPER CONTOUR ────────────────────────────────────────────
+                # Exclusively PaperTrade rows — never touches live limits.
+
+                # Paper daily loss (36h)
+                v = session.execute(
+                    select(func.coalesce(func.sum(PaperTrade.pnl_usd), 0.0)).where(
+                        PaperTrade.resolved_at >= cutoff_36h,
+                        PaperTrade.pnl_usd < 0,
+                    )
+                ).scalar() or 0.0
+                self._paper_daily_loss = abs(float(v))
+
+                # Paper total loss (all-time)
+                v = session.execute(
+                    select(func.coalesce(func.sum(PaperTrade.pnl_usd), 0.0)).where(
+                        PaperTrade.pnl_usd < 0,
+                    )
+                ).scalar() or 0.0
+                self._paper_total_loss = abs(float(v))
+
+                # Detail for log: up to 5 contributing paper trades
+                paper_detail = session.execute(
+                    select(PaperTrade.id, PaperTrade.city, PaperTrade.pnl_usd)
+                    .where(PaperTrade.pnl_usd < 0)
+                    .order_by(PaperTrade.resolved_at.desc())
+                    .limit(5)
+                ).all()
+                paper_ids_str = (
+                    ", ".join(f"#{r.id}({r.city or '?'} ${r.pnl_usd:.2f})" for r in paper_detail)
+                    or "none"
+                )
+                logger.info(
+                    f"paper_loss_calc: daily=${self._paper_daily_loss:.4f} "
+                    f"total=${self._paper_total_loss:.4f} "
+                    f"from {len(paper_detail)} paper [{paper_ids_str}]"
+                )
 
             finally:
                 session.close()
@@ -305,6 +374,29 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def can_run_paper(self) -> tuple[bool, str]:
+        """
+        Check if paper trading is allowed against the virtual bankroll.
+        Completely independent from live risk: paper losses NEVER block live.
+        """
+        with self._lock:
+            self._maybe_roll_day()
+            self._load_live_stats()
+
+            if self._paper_daily_loss >= self._paper_daily_loss_limit_usd:
+                return False, (
+                    f"Paper daily loss ${self._paper_daily_loss:.2f} >= "
+                    f"limit ${self._paper_daily_loss_limit_usd:.2f}"
+                )
+
+            if self._paper_total_loss >= self._paper_total_stop_loss_usd:
+                return False, (
+                    f"Paper total loss ${self._paper_total_loss:.2f} >= "
+                    f"virtual stop ${self._paper_total_stop_loss_usd:.2f}"
+                )
+
+            return True, "ok"
 
     def can_place_basket(self, notional: float, n_legs: int) -> tuple[bool, str]:
         """
@@ -512,6 +604,11 @@ class RiskManager:
                 emergency_stop=self._emergency_stop,
                 emergency_stop_reason=self._emergency_stop_reason,
                 emergency_stop_type=self._emergency_stop_type,
+                paper_daily_loss=self._paper_daily_loss,
+                paper_total_loss=self._paper_total_loss,
+                paper_bankroll_usd=self._paper_bankroll_usd,
+                paper_total_stop_loss_usd=self._paper_total_stop_loss_usd,
+                paper_daily_loss_limit_usd=self._paper_daily_loss_limit_usd,
                 max_single_bet_usd=self._max_single_bet_usd,
                 max_daily_bets=self._max_daily_bets,
                 max_concurrent_bets=self._max_concurrent_bets,

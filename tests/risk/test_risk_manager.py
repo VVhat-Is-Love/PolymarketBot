@@ -14,12 +14,14 @@ def _make_rm(**kwargs):
         order_timeout_minutes=30,
         kelly_fraction=0.25,
         trading_mode="live",
-        # Capital cap settings (P1-6)
         max_basket_legs_open=12,
         max_tail_positions=3,
         total_deployed_cap_usd=40.0,
         basket_max_usd=26.0,
         tail_max_usd=18.0,
+        paper_bankroll_usd=100.0,
+        paper_total_stop_loss_usd=20.0,
+        paper_daily_loss_limit_usd=10.0,
     )
     defaults.update(kwargs)
 
@@ -43,6 +45,11 @@ def _make_rm(**kwargs):
         rm._emergency_stop = False
         rm._emergency_stop_reason = ""
         rm._emergency_stop_type = ""
+        rm._paper_daily_loss = 0.0
+        rm._paper_total_loss = 0.0
+        rm._paper_bankroll_usd = defaults["paper_bankroll_usd"]
+        rm._paper_total_stop_loss_usd = defaults["paper_total_stop_loss_usd"]
+        rm._paper_daily_loss_limit_usd = defaults["paper_daily_loss_limit_usd"]
         rm._open_bets = {}
         rm._reserved_usd = 0.0
         rm._basket_legs_open = 0
@@ -178,3 +185,47 @@ def test_emergency_stop_checked_before_daily_loss():
     ok, reason = rm.can_place_order(1.0)
     assert ok is False
     assert "Emergency stop" in reason  # not "Daily loss"
+
+
+# ---------------------------------------------------------------------------
+# Paper contour — can_run_paper()
+# ---------------------------------------------------------------------------
+
+def test_can_run_paper_allowed_when_no_losses():
+    rm = _make_rm(paper_total_stop_loss_usd=20.0, paper_daily_loss_limit_usd=10.0)
+    ok, reason = rm.can_run_paper()
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_can_run_paper_blocked_by_daily_loss():
+    rm = _make_rm(paper_daily_loss_limit_usd=10.0)
+    rm._paper_daily_loss = 10.0
+    ok, reason = rm.can_run_paper()
+    assert ok is False
+    assert "Paper daily loss" in reason
+
+
+def test_can_run_paper_blocked_by_total_loss():
+    rm = _make_rm(paper_total_stop_loss_usd=20.0)
+    rm._paper_total_loss = 25.0
+    ok, reason = rm.can_run_paper()
+    assert ok is False
+    assert "Paper total loss" in reason
+
+
+def test_paper_loss_does_not_block_live():
+    """Paper losses must never block live trading — live only checks _daily_loss/_total_loss."""
+    rm = _make_rm(
+        total_stop_loss_usd=20.0, daily_loss_limit_usd=10.0,
+        paper_total_stop_loss_usd=5.0, paper_daily_loss_limit_usd=3.0,
+    )
+    # Simulate massive paper losses — live counters stay zero
+    rm._paper_daily_loss = 50.0
+    rm._paper_total_loss = 100.0
+
+    ok, reason = rm.can_place_order(1.0)
+    assert ok is True, f"Live blocked by paper losses: {reason}"
+
+    ok2, reason2 = rm.can_place_basket(2.0, 2)
+    assert ok2 is True, f"Live basket blocked by paper losses: {reason2}"
