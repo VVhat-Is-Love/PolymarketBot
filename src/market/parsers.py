@@ -2,6 +2,39 @@ import re
 from datetime import date, datetime
 
 # ---------------------------------------------------------------------------
+# Canonical city name (G3-5)
+# ---------------------------------------------------------------------------
+# Maps lowercase raw names / aliases → canonical name used in CITIES_WHITELIST.
+# Applied at three points: weather write, market-title parse, forecast read.
+CITY_CANONICAL: dict[str, str] = {
+    "nyc": "New York",
+    "new york city": "New York",
+    "new york": "New York",
+    "ny": "New York",
+    "sao paulo": "Sao Paulo",
+    "são paulo": "Sao Paulo",
+    "kuala lumpur": "Kuala Lumpur",
+    "buenos aires": "Buenos Aires",
+    "hong kong": "Hong Kong",
+    "cape town": "Cape Town",
+    "los angeles": "Los Angeles",
+    "san francisco": "San Francisco",
+    "mexico city": "Mexico City",
+    "panama city": "Panama City",
+}
+
+
+def canonical_city(raw: str) -> str:
+    """Return the canonical city name for whitelist matching.
+
+    Strips whitespace, lower-cases, looks up in CITY_CANONICAL; falls back to
+    title-casing the raw value if not found (keeps existing whitelist entries
+    like 'Amsterdam' unchanged).
+    """
+    cleaned = raw.strip()
+    return CITY_CANONICAL.get(cleaned.lower(), cleaned)
+
+# ---------------------------------------------------------------------------
 # Month name → number mapping
 # ---------------------------------------------------------------------------
 _MONTHS: dict[str, int] = {
@@ -52,14 +85,18 @@ _BIN_POINT = re.compile(r"^(\d+(?:\.\d+)?)\s*°?[CFcf]?\s*$")
 # ---------------------------------------------------------------------------
 
 def parse_city_from_title(title: str, whitelist: dict) -> str | None:
-    """'Highest temperature in Seoul on May 5?' → 'Seoul'"""
+    """'Highest temperature in Seoul on May 5?' → 'Seoul' (canonical)."""
     t = title.lower()
     for city, cfg in whitelist.items():
         if city.lower() in t:
-            return city
+            return city  # already canonical (key from whitelist)
         for alias in cfg.get("aliases", []):
             if alias.lower() in t:
-                return city
+                return city  # return the canonical key, not the alias
+    # Last-resort: check CITY_CANONICAL for titles like "highest temp in NYC"
+    for raw, canonical in CITY_CANONICAL.items():
+        if raw in t and canonical in whitelist:
+            return canonical
     return None
 
 

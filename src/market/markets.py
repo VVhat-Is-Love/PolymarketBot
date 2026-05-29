@@ -13,6 +13,7 @@ from src.market.parsers import (
     parse_metric_from_title,
     parse_bin_range,
     parse_station,
+    canonical_city,
 )
 
 MIN_VOLUME = 2_000.0
@@ -84,6 +85,7 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
         city = parse_city_from_title(title, CITIES_WHITELIST)
         if not city:
             continue
+        city = canonical_city(city)  # G3-5: ensure canonical form (e.g. Nyc → New York)
 
         # 4. Metric and resolution date
         metric = parse_metric_from_title(title)
