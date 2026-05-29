@@ -87,9 +87,9 @@ class RiskManager:
         Safe to call inside self._lock; catches all errors.
         """
         try:
-            from sqlalchemy import select, func
+            from sqlalchemy import select, func, or_
             from src.db.session import get_session
-            from src.db.models import LiveTrade, BotState
+            from src.db.models import LiveTrade, BotState, MarketGroup
 
             today_start = datetime.combine(date.today(), datetime.min.time())
             session = get_session()
@@ -116,23 +116,29 @@ class RiskManager:
                 )
 
                 # -- Concurrent open / pending positions --
+                # Exclude positions on deactivated (Gamma-resolved) groups: a trade on
+                # a group with is_active=False has curPrice ∈ {0,1} and is awaiting
+                # reconciliation, not a live open position.
                 rows = session.execute(
-                    select(
-                        LiveTrade.group_id,
-                        LiveTrade.id,
-                        LiveTrade.stake_usd,
-                    ).where(LiveTrade.status.in_(["pending", "open"]))
+                    select(LiveTrade.group_id, LiveTrade.id, LiveTrade.stake_usd)
+                    .join(MarketGroup, LiveTrade.group_id == MarketGroup.group_id, isouter=True)
+                    .where(
+                        LiveTrade.status.in_(["pending", "open"]),
+                        # is_active NULL (no group row) or True → passes; False → excluded
+                        MarketGroup.is_active.is_not(False),
+                    )
                 ).all()
                 self._open_bets = {
                     (r.group_id or r.id): (r.stake_usd or 0.0) for r in rows
                 }
 
-                # -- Daily loss (trailing 36h window to cover resolution lag) --
+                # -- Daily loss (trailing 36h window, reconciled live trades only) --
                 cutoff_36h = datetime.utcnow() - timedelta(hours=36)
                 v = session.execute(
                     select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
                         LiveTrade.resolved_at >= cutoff_36h,
                         LiveTrade.pnl_usd < 0,
+                        LiveTrade.reconciled_with_polymarket == True,  # noqa: E712
                     )
                 ).scalar() or 0.0
                 self._daily_loss = abs(float(v))
@@ -207,15 +213,54 @@ class RiskManager:
             logger.warning(f"RiskManager: _get_deployed_by_strategy failed: {exc}")
             return {}
 
+    def _log_loss_breakdown(self, stop_type: str, total_amount: float) -> None:
+        """Query and log the individual trades that contributed to the triggering loss."""
+        try:
+            from sqlalchemy import select
+            from src.db.session import get_session
+            from src.db.models import LiveTrade
+
+            session = get_session()
+            try:
+                if stop_type == "daily_loss":
+                    cutoff = datetime.utcnow() - timedelta(hours=36)
+                    rows = session.execute(
+                        select(LiveTrade.id, LiveTrade.city, LiveTrade.pnl_usd, LiveTrade.resolved_at)
+                        .where(
+                            LiveTrade.resolved_at >= cutoff,
+                            LiveTrade.pnl_usd < 0,
+                            LiveTrade.reconciled_with_polymarket == True,  # noqa: E712
+                        )
+                    ).all()
+                else:
+                    rows = session.execute(
+                        select(LiveTrade.id, LiveTrade.city, LiveTrade.pnl_usd)
+                        .where(
+                            LiveTrade.pnl_usd < 0,
+                            LiveTrade.reconciled_with_polymarket == True,  # noqa: E712
+                        )
+                    ).all()
+                detail = " | ".join(
+                    f"#{r.id} {r.city or '?'} ${r.pnl_usd:.4f}" for r in rows
+                ) or "(none)"
+                logger.warning(
+                    f"RiskManager [{stop_type}] total=${total_amount:.4f} "
+                    f"from {len(rows)} trade(s): {detail}"
+                )
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"RiskManager: _log_loss_breakdown failed: {exc}")
+
     def _trigger_total_stop(self, reason: str) -> None:
         """Edge-triggered: fires once on 0→1 transition; skips alert if already stopped."""
         if self._emergency_stop:
             return
+        self._log_loss_breakdown("total_loss", self._total_loss)
         self._emergency_stop = True
         self._emergency_stop_reason = reason
         self._emergency_stop_type = "total_loss"
         self._persist_emergency_stop(True, reason, "total_loss")
-        logger.error(f"RiskManager: TOTAL STOP-LOSS triggered — {reason}")
         try:
             from src.config.settings import settings
             if settings.trading_mode.lower() == "live":
@@ -228,11 +273,11 @@ class RiskManager:
         """Edge-triggered: activate daily-loss emergency stop (auto-cleared next trading day)."""
         if self._emergency_stop:
             return
+        self._log_loss_breakdown("daily_loss", self._daily_loss)
         self._emergency_stop = True
         self._emergency_stop_reason = reason
         self._emergency_stop_type = "daily_loss"
         self._persist_emergency_stop(True, reason, "daily_loss")
-        logger.warning(f"RiskManager: DAILY LOSS STOP triggered — {reason}")
         try:
             from src.config.settings import settings
             if settings.trading_mode.lower() == "live":

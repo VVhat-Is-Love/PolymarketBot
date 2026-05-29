@@ -958,9 +958,6 @@ def _restore_trading_mode() -> None:
         session.close()
 
 
-_paper_promote_done: bool = False
-
-
 def _check_emergency_stop_on_startup() -> None:
     """
     Auto-clear emergency stops that do NOT require manual intervention:
@@ -1001,90 +998,6 @@ def _check_emergency_stop_on_startup() -> None:
         )
 
 
-def _promote_paper_trades_to_live() -> None:
-    """
-    After a manual/daily_loss stop is cleared on startup: find recent open paper trades
-    (≤4 h old) whose bin prices haven't moved >5%. Logs eligible ones and notifies owner.
-    Actual placement is handled by _job_live_trade_engine() which follows immediately.
-    Runs only once per process startup (guarded by _paper_promote_done).
-    """
-    global _paper_promote_done
-    if _paper_promote_done:
-        return
-    _paper_promote_done = True
-
-    from src.risk.risk_manager import risk_manager
-    if risk_manager.is_emergency_stopped():
-        return  # stop still active — nothing to promote
-
-    cutoff = datetime.utcnow() - timedelta(hours=4)
-    session = get_session()
-    notifier = get_notifier()
-    try:
-        paper_trades = list(
-            session.execute(
-                select(PaperTrade).where(
-                    PaperTrade.decision_time >= cutoff,
-                    PaperTrade.status == "open",
-                )
-            ).scalars().all()
-        )
-        if not paper_trades:
-            return
-
-        eligible = []
-        for pt in paper_trades:
-            if not pt.basket_json:
-                continue
-            try:
-                basket = json.loads(pt.basket_json)
-            except Exception:
-                continue
-
-            # Check price drift per bin against latest snapshot
-            max_drift = 0.0
-            for entry in basket:
-                market_id = entry.get("market_id")
-                stored_price = float(entry.get("entry_price") or 0)
-                if not market_id or not stored_price:
-                    continue
-                snap = session.execute(
-                    select(MarketSnapshot)
-                    .where(MarketSnapshot.market_id == market_id)
-                    .order_by(MarketSnapshot.snapshot_time.desc())
-                    .limit(1)
-                ).scalar_one_or_none()
-                if snap and snap.best_ask:
-                    max_drift = max(max_drift, abs(snap.best_ask - stored_price))
-
-            if max_drift > 0.05:
-                logger.info(
-                    f"[promote] skip {pt.city or pt.group_id} — "
-                    f"price drift {max_drift:.3f} > 0.05"
-                )
-                continue
-
-            edge_pct = (pt.estimated_edge or 0.0) * 100
-            logger.info(
-                f"[promote] eligible: {pt.city or pt.group_id} "
-                f"stake=${pt.virtual_stake_usd:.2f} edge={edge_pct:.1f}% drift={max_drift:.3f}"
-            )
-            eligible.append(pt)
-
-        if eligible:
-            lines = "\n".join(
-                f"  • {pt.city or pt.group_id} edge={(pt.estimated_edge or 0)*100:.1f}%"
-                for pt in eligible
-            )
-            notifier.send(
-                f"🔄 Promote: {len(eligible)} бумажных сделки→live (drift≤5%)\n"
-                f"{lines}\n"
-                "Live-движок разместит их в следующем цикле."
-            )
-    except Exception as exc:
-        logger.warning(f"[promote] failed: {exc}")
-    finally:
-        session.close()
 
 
 def setup_scheduler() -> None:
@@ -1137,7 +1050,6 @@ def run_initial_jobs() -> None:
     _job_settle_paper()         # G3-3: Gamma paper settlement on startup
     _job_reconcile_pnl()       # G3-2: reconcile live PnL first
     _job_resolve_live_trades()
-    _promote_paper_trades_to_live()   # G4-3: identify recent paper trades eligible for live
     _job_paper_trade_engine()
     _job_live_trade_engine()
     _job_paper_trade_summary()
