@@ -72,6 +72,7 @@ class StrategySettings(BaseSettings):
     tail_min_no_ask: float = Field(default=0.85)       # below = event too likely to be worth it
     tail_max_no_ask: float = Field(default=0.94)       # above = payoff too thin for 100% loss risk
     tail_slippage_buffer: float = Field(default=0.01)  # buffer added on top of approximated ask
+    tail_min_model_no: float = Field(default=0.93)    # min P(NO) from Gaussian model for inline tail
 
 
 strategy_settings = StrategySettings()

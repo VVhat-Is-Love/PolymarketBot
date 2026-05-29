@@ -633,6 +633,172 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
             else:
                 logger.info(f"[basket_narrow] {group.city}: SKIP — disabled via Telegram bot")
 
+            # ── Strategy C (inline): tail_no after basket rejection ──────────
+            # Runs only when basket_wide AND basket_narrow are both skipped or
+            # rejected (no `continue` was hit above). Evaluates NO positions on
+            # longshot bins using real CLOB NO ask prices and the same Gaussian
+            # model that powers the standalone run_tail_engine.
+            if _strat_enabled("tail_no"):
+                from src.strategy.tail_seller import scan_tails as _scan_tails
+                from src.market.clob_client import get_no_ask_prices as _get_no_asks
+                from src.market.order_executor import place_limit_order as _place_lo
+
+                # Hours until resolution (resolution_date = end-of-day UTC 23:59)
+                _closes_at = datetime.combine(group.resolution_date, dtime(23, 59))
+                _h2c = (_closes_at - datetime.utcnow()).total_seconds() / 3600
+
+                # Capital already locked in open NO positions (across all groups)
+                _no_in_use: float = float(
+                    session.execute(
+                        select(sa_func.coalesce(sa_func.sum(LiveTrade.stake_usd), 0.0))
+                        .where(
+                            LiveTrade.strategy_name == "tail_no",
+                            LiveTrade.status.in_(["pending", "open", "filled"]),
+                        )
+                    ).scalar()
+                    or 0.0
+                )
+
+                # Fetch real CLOB NO ask prices for this group's markets
+                _no_token_ids = [m.token_id_no for m in markets if m.token_id_no]
+                _no_asks_map: dict[str, float | None] | None = None
+                if _no_token_ids:
+                    try:
+                        _raw = _get_no_asks(_no_token_ids)
+                        _no_asks_map = {
+                            m.market_id: _raw.get(m.token_id_no)
+                            for m in markets if m.token_id_no
+                        }
+                    except Exception as _exc:
+                        logger.warning(
+                            f"[tail] {group.city}: NO ask fetch failed: {_exc}"
+                        )
+
+                _scan = _scan_tails(
+                    markets=markets,
+                    prices=prices,
+                    consensus_temp=result.consensus_temp,
+                    unit=unit,
+                    hours_to_close=_h2c,
+                    available_capital=wallet_balance,
+                    no_capital_in_use=_no_in_use,
+                    ss=ss,
+                    no_asks=_no_asks_map,
+                )
+
+                # Log skip reasons at INFO so they're visible without DEBUG
+                for _skip in _scan.skipped:
+                    logger.info(f"[tail] {group.city}: SKIP {_skip}")
+
+                for _o in _scan.orders:
+                    logger.info(
+                        f"[tail] {group.city}: NO {_o.bin_label} "
+                        f"model_no={_o.p_model_no:.0%} "
+                        f"ask={_o.no_ask:.3f} "
+                        f"edge={_o.edge:+.3f}"
+                    )
+                    # Additional model-confidence gate (P_model_no must be strong)
+                    if _o.p_model_no < ss.tail_min_model_no:
+                        logger.info(
+                            f"[tail] {group.city}: NO {_o.bin_label} "
+                            f"SKIP model_no={_o.p_model_no:.0%} < "
+                            f"{ss.tail_min_model_no:.0%} threshold"
+                        )
+                        continue
+
+                    # Avoid placing twice if standalone tail engine already placed
+                    _existing_tail = session.execute(
+                        select(LiveTrade).where(
+                            LiveTrade.group_id == group.group_id,
+                            LiveTrade.strategy_name == "tail_no",
+                            LiveTrade.status.in_(["pending", "open"]),
+                        )
+                    ).scalars().first()
+                    if _existing_tail:
+                        logger.info(
+                            f"[tail] {group.city}: NO {_o.bin_label} "
+                            "SKIP already has open tail_no trade"
+                        )
+                        break
+
+                    _can, _why = risk_manager.can_place_order(_o.stake_usd)
+                    if not _can:
+                        logger.warning(
+                            f"[tail_no] Risk block {group.city} {_o.bin_label}: {_why}"
+                        )
+                        continue
+
+                    _mkt = next((m for m in markets if m.market_id == _o.market_id), None)
+                    _tok_no = (_mkt.token_id_no if _mkt else None) or ""
+                    if not _tok_no:
+                        logger.warning(
+                            f"[tail_no] No token_id_no for {_o.market_id} "
+                            f"({group.city} {_o.bin_label}) — skip"
+                        )
+                        continue
+
+                    _tail_trade = LiveTrade(
+                        id=str(uuid.uuid4()),
+                        group_id=group.group_id,
+                        market_id=_o.market_id,
+                        bin_label=_o.bin_label,
+                        target_price=_o.no_ask,
+                        size_shares=_o.shares,
+                        stake_usd=_o.stake_usd,
+                        basket_role="tail_no",
+                        strategy_name="tail_no",
+                        city=group.city,
+                        status="pending",
+                        side="buy",
+                        placed_at=datetime.utcnow(),
+                        condition_id=(_mkt.condition_id if _mkt else None),
+                        token_id=_tok_no,
+                    )
+                    session.add(_tail_trade)
+                    session.commit()
+
+                    notifier.send(
+                        f"📤 [tail_no] NO-хвост (inline): {group.city} {_o.bin_label}\n"
+                        f"${_o.stake_usd:.2f} @ {_o.no_ask:.3f} | "
+                        f"P(NO)={_o.p_model_no:.0%} edge={_o.edge:+.1%} "
+                        f"EV=${_o.ev_usd:+.2f}"
+                    )
+
+                    _oid = _place_lo(
+                        market_id=_o.market_id,
+                        token_id=_tok_no,
+                        side="BUY",
+                        price=_o.no_ask,
+                        size=_o.shares,
+                    )
+                    if _oid:
+                        _tail_trade.order_id = _oid
+                        _tail_trade.status = "open"
+                        session.commit()
+                        risk_manager.record_bet_placed(
+                            group.group_id, _o.stake_usd, strategy="tail_no"
+                        )
+                        trades_placed += 1
+                        logger.info(
+                            f"[tail_no] ORDER PLACED (inline): "
+                            f"{group.city} {_o.bin_label} "
+                            f"order_id={_oid} stake=${_o.stake_usd:.2f} "
+                            f"P(NO)={_o.p_model_no:.0%} edge={_o.edge:+.1%}"
+                        )
+                        notifier.send(
+                            f"✅ Размещён [tail_no]: {group.city} {_o.bin_label} | "
+                            f"order_id={_oid}"
+                        )
+                        break  # one tail_no per group per cycle
+                    else:
+                        _tail_trade.status = "cancelled"
+                        _tail_trade.cancelled_at = datetime.utcnow()
+                        session.commit()
+                        logger.warning(
+                            f"[tail_no] Order placement failed: "
+                            f"{group.city} {_o.bin_label}"
+                        )
+
         rejection_summary = ", ".join(
             f"{k}={v}" for k, v in sorted(rejection_counts.items(), key=lambda x: -x[1])
         )
