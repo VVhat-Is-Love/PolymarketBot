@@ -852,9 +852,11 @@ async def _callback_router(update, context) -> None:
         # ── mode switch: mode:live:confirm ───────────────────────────────
         if data == "mode:live:confirm":
             _apply_mode_switch("live")
-            logger.info("[telegram_bot] Mode switched to LIVE via confirmation callback")
+            from src.config.settings import settings as _s
+            actual = _s.trading_mode.upper()
+            logger.info(f"[telegram_bot] Mode switched to {actual} via confirmation callback")
             await query.edit_message_text(
-                "✅ Режим переключён в <b>LIVE</b>.\n"
+                f"✅ Режим переключён в <b>{actual}</b>.\n"
                 "⚠️ Бот размещает реальные ордера.\n"
                 "Для остановки: /mode paper или /stop",
                 parse_mode="HTML",
@@ -949,9 +951,10 @@ async def cmd_mode(update, context) -> None:
     if target == "paper":
         # Paper switch is safe — do immediately
         _apply_mode_switch("paper")
-        logger.info("[telegram_bot] Mode switched to PAPER via /mode command")
+        actual = settings.trading_mode.upper()
+        logger.info(f"[telegram_bot] Mode switched to {actual} via /mode command")
         await update.message.reply_text(
-            "✅ Режим переключён в <b>PAPER</b> (симуляция).\n"
+            f"✅ Режим переключён в <b>{actual}</b> (симуляция).\n"
             "Биржевые ордера размещаться не будут.",
             parse_mode="HTML",
         )
@@ -989,6 +992,10 @@ def _apply_mode_switch(mode: str) -> None:
         session.rollback()
     finally:
         session.close()
+
+    # Sync in-process settings so cmd_mode and schedulerjobs see the new mode immediately
+    from src.config.settings import settings
+    settings.trading_mode = mode
 
 
 # ---------------------------------------------------------------------------

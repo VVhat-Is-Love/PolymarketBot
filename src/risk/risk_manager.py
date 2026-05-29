@@ -133,10 +133,11 @@ class RiskManager:
                 ).scalar() or 0.0
                 self._daily_loss = abs(float(v))
 
-                # -- Total loss (all-time, negative PnL) --
+                # -- Total loss (all-time, reconciled live trades only) --
                 v = session.execute(
                     select(func.coalesce(func.sum(LiveTrade.pnl_usd), 0.0)).where(
                         LiveTrade.pnl_usd < 0,
+                        LiveTrade.reconciled_with_polymarket == True,  # noqa: E712
                     )
                 ).scalar() or 0.0
                 self._total_loss = abs(float(v))
@@ -206,6 +207,22 @@ class RiskManager:
             logger.warning(f"RiskManager: _get_deployed_by_strategy failed: {exc}")
             return {}
 
+    def _trigger_total_stop(self, reason: str) -> None:
+        """Edge-triggered: fires once on 0→1 transition; skips alert if already stopped."""
+        if self._emergency_stop:
+            return  # already stopped — no re-alert
+        self._emergency_stop = True
+        self._emergency_stop_reason = reason
+        self._persist_emergency_stop(True, reason)
+        logger.error(f"RiskManager: TOTAL STOP-LOSS triggered — {reason}")
+        try:
+            from src.config.settings import settings
+            if settings.trading_mode.lower() == "live":
+                from src.notifications.telegram import get_notifier
+                get_notifier().send(f"🛑 TOTAL STOP-LOSS: {reason}")
+        except Exception:
+            pass
+
     def is_emergency_stopped(self) -> bool:
         """Check DB directly — safe to call at startup before _load_live_stats."""
         try:
@@ -247,9 +264,7 @@ class RiskManager:
                     f"Total loss ${self._total_loss:.2f} >= "
                     f"TOTAL_STOP_LOSS ${self._total_stop_loss_usd:.2f}"
                 )
-                self._emergency_stop = True
-                self._emergency_stop_reason = reason
-                self._persist_emergency_stop(True, reason)
+                self._trigger_total_stop(reason)
                 return False, reason
 
             deployed = self._get_deployed_by_strategy()
@@ -301,9 +316,7 @@ class RiskManager:
                     f"Total loss ${self._total_loss:.2f} >= "
                     f"TOTAL_STOP_LOSS ${self._total_stop_loss_usd:.2f}"
                 )
-                self._emergency_stop = True
-                self._emergency_stop_reason = reason
-                self._persist_emergency_stop(True, reason)
+                self._trigger_total_stop(reason)
                 return False, reason
 
             deployed = self._get_deployed_by_strategy()
@@ -354,21 +367,13 @@ class RiskManager:
             if self._daily_loss >= self._daily_loss_limit_usd:
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
-            # 4. Total stop-loss → triggers persistent emergency stop
+            # 4. Total stop-loss → triggers persistent emergency stop (edge-triggered alert)
             if self._total_loss >= self._total_stop_loss_usd:
                 reason = (
                     f"Total loss ${self._total_loss:.2f} >= "
                     f"TOTAL_STOP_LOSS_USD ${self._total_stop_loss_usd:.2f}"
                 )
-                self._emergency_stop = True
-                self._emergency_stop_reason = reason
-                self._persist_emergency_stop(True, reason)
-                logger.error(f"RiskManager: TOTAL STOP-LOSS triggered — {reason}")
-                try:
-                    from src.notifications.telegram import get_notifier
-                    get_notifier().send(f"🛑 TOTAL STOP-LOSS: {reason}")
-                except Exception:
-                    pass
+                self._trigger_total_stop(reason)
                 return False, f"Total stop-loss triggered: {reason}"
 
             # 5. Concurrent open bets
