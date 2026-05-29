@@ -248,10 +248,15 @@ def _place_basket_orders(
     n_legs = len(decision.bins)
 
     # Single basket-level risk gate (P1-7: replaces per-leg can_place_order)
+    logger.info(
+        f"[{strategy_name}] Risk gate {group.city}: "
+        f"notional=${total_notional:.2f} legs={n_legs} — calling can_place_basket"
+    )
     ok, reason = risk_manager.can_place_basket(total_notional, n_legs)
     if not ok:
-        logger.info(f"[{strategy_name}] Basket risk-block {group.city}: {reason}")
+        logger.info(f"[{strategy_name}] Risk gate BLOCKED {group.city}: {reason}")
         return
+    logger.info(f"[{strategy_name}] Risk gate PASSED {group.city} — placing {n_legs} order(s)")
 
     # Shared basket_id links all legs for partial-fill detection (G2-5)
     basket_id = str(uuid.uuid4())
@@ -369,6 +374,12 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
         horizon = now + timedelta(hours=ss.strategy_time_horizon_hours)
         min_close = now + timedelta(hours=ss.strategy_min_hours_to_close)
 
+        logger.info(
+            f"[live_trader] Engine start: now={now.strftime('%H:%M UTC')} "
+            f"window=[{min_close.date()} → {horizon.date()}] "
+            f"({ss.strategy_min_hours_to_close}h–{ss.strategy_time_horizon_hours}h)"
+        )
+
         groups: list[MarketGroup] = list(
             session.execute(
                 select(MarketGroup).where(
@@ -382,20 +393,42 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
         )
 
         if not groups:
-            logger.debug("[live_trader] No groups in time horizon")
-            return
-
-        wallet_balance = _get_wallet_balance()
-        if wallet_balance < 0.10:
-            logger.warning(
-                f"[live_trader] Wallet balance ${wallet_balance:.2f} too low — skipping"
+            logger.info(
+                f"[live_trader] 0 active groups in date window "
+                f"[{min_close.date()} → {horizon.date()}] — nothing to trade"
             )
             return
+
+        logger.info(
+            f"[live_trader] {len(groups)} group(s) in window: "
+            + ", ".join(f"{g.city}/{g.resolution_date}" for g in groups[:10])
+            + ("…" if len(groups) > 10 else "")
+        )
+
+        wallet_balance = _get_wallet_balance()
+        logger.info(f"[live_trader] Wallet balance: ${wallet_balance:.4f}")
+        if wallet_balance < 0.10:
+            logger.warning(
+                f"[live_trader] Wallet ${wallet_balance:.4f} < $0.10 — skipping ALL groups"
+            )
+            return
+
+        # Risk-manager snapshot for diagnostics
+        rm_status = risk_manager.get_status()
+        logger.info(
+            f"[live_trader] Risk state: total_loss=${rm_status.total_loss:.2f} "
+            f"daily_loss=${rm_status.daily_loss:.2f} "
+            f"deployed=${rm_status.total_deployed_usd:.2f}/{rm_status.total_deployed_cap_usd:.2f} "
+            f"open_bets={rm_status.concurrent_open_bets} "
+            f"emergency_stop={rm_status.emergency_stop}"
+        )
 
         rejection_counts: dict[str, int] = {}
         trades_placed = 0
 
         for group in groups:
+            logger.info(f"[live_trader] ── Evaluating: {group.city} {group.resolution_date} ──")
+
             # Skip if this group already has an open/pending live trade
             existing = session.execute(
                 select(LiveTrade).where(
@@ -404,9 +437,9 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                 )
             ).scalars().first()
             if existing:
-                logger.debug(
-                    f"[live_trader] {group.city}: already has open trade "
-                    f"({existing.strategy_name}) — skip"
+                logger.info(
+                    f"[live_trader] SKIP {group.city}: existing {existing.strategy_name} "
+                    f"trade id={existing.id[:8]} status={existing.status}"
                 )
                 continue
 
@@ -421,6 +454,7 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                 .all()
             )
             if not markets:
+                logger.info(f"[live_trader] SKIP {group.city}: no active markets in DB")
                 continue
 
             market_ids = [m.market_id for m in markets]
@@ -428,22 +462,54 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
             prices = {mid: snapshots[mid]["price_yes"] for mid in market_ids}
 
             if all(p is None for p in prices.values()):
+                logger.info(
+                    f"[live_trader] SKIP {group.city}: all {len(market_ids)} market prices=None "
+                    "(no snapshots — run _job_snapshot_markets)"
+                )
                 continue
 
+            price_summary = ", ".join(
+                f"{snapshots[mid].get('best_ask','?'):.3f}" if snapshots[mid].get('best_ask') else "None"
+                for mid in market_ids[:5]
+            )
+            logger.info(
+                f"[live_trader] {group.city}: {len(market_ids)} markets, "
+                f"best_ask sample=[{price_summary}]"
+            )
+
             forecasts = _get_forecasts(session, group)
+            if not forecasts:
+                logger.info(
+                    f"[live_trader] SKIP {group.city}: no weather forecasts for "
+                    f"{group.resolution_date} (city='{group.city}')"
+                )
+                continue
+            logger.info(
+                f"[live_trader] {group.city}: {len(forecasts)} weather model(s) "
+                f"for {group.resolution_date}"
+            )
+
             result = evaluate_checklist(group, markets, prices, forecasts)
 
             if not result.passed:
                 reason_key = (result.rejection_reason or "unknown").split(":")[0]
                 rejection_counts[reason_key] = rejection_counts.get(reason_key, 0) + 1
-                logger.debug(
-                    f"[live_trader] {group.city} {group.resolution_date}: "
-                    f"checklist rejected — {result.rejection_reason}"
+                logger.info(
+                    f"[live_trader] SKIP {group.city}: checklist FAILED — "
+                    f"{result.rejection_reason}"
                 )
                 continue
 
+            logger.info(
+                f"[live_trader] {group.city}: checklist PASSED — "
+                f"consensus={result.consensus_temp} "
+                f"edge={result.estimated_edge:.1%} "
+                f"sum_prices={result.sum_of_prices:.3f}"
+            )
+
             basket_items = result.basket
             if not basket_items:
+                logger.info(f"[live_trader] SKIP {group.city}: no basket items after checklist")
                 continue
 
             unit = group.unit or "F"
@@ -489,14 +555,15 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                         session, group, decision_a, markets,
                         "basket_wide", settings, risk_manager, notifier,
                     )
+                    trades_placed += 1
                     continue  # one strategy per group per cycle
 
                 logger.info(
-                    f"[basket_wide] {group.city} {group.resolution_date}: "
-                    f"rejected ({decision_a.reason}) → trying basket_narrow"
+                    f"[basket_wide] {group.city}: REJECTED — {decision_a.reason} "
+                    f"→ trying basket_narrow"
                 )
             else:
-                logger.debug(f"[basket_wide] disabled via bot — skip {group.city}")
+                logger.info(f"[basket_wide] {group.city}: SKIP — disabled via Telegram bot")
 
             # ── Strategy B: basket_narrow (fallback) ────────────────────────
             if _strat_enabled("basket_narrow"):
@@ -520,22 +587,21 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                         session, group, decision_b, markets,
                         "basket_narrow", settings, risk_manager, notifier,
                     )
+                    trades_placed += 1
                 else:
                     logger.info(
-                        f"[basket_narrow] {group.city} {group.resolution_date}: "
-                        f"rejected ({decision_b.reason})"
+                        f"[basket_narrow] {group.city}: REJECTED — {decision_b.reason}"
                     )
             else:
-                logger.debug(f"[basket_narrow] disabled via bot — skip {group.city}")
+                logger.info(f"[basket_narrow] {group.city}: SKIP — disabled via Telegram bot")
 
-        if rejection_counts or trades_placed:
-            summary = ", ".join(
-                f"{k}={v}" for k, v in sorted(rejection_counts.items(), key=lambda x: -x[1])
-            )
-            logger.info(
-                f"[live_trader] Run complete: {len(groups)} groups | "
-                f"placed={trades_placed} | rejections: {summary or 'none'}"
-            )
+        rejection_summary = ", ".join(
+            f"{k}={v}" for k, v in sorted(rejection_counts.items(), key=lambda x: -x[1])
+        )
+        logger.info(
+            f"[live_trader] Run complete: {len(groups)} groups evaluated | "
+            f"placed={trades_placed} | rejections: {rejection_summary or 'none'}"
+        )
 
     except Exception:
         logger.exception("[live_trader] Engine error in run_live_trade_engine")

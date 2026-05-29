@@ -145,15 +145,18 @@ def _job_paper_trade_engine() -> None:
 def _job_live_trade_engine() -> None:
     from src.config.settings import settings
     from src.risk.risk_manager import risk_manager
-    if settings.trading_mode.lower() != "live":
+    mode = settings.trading_mode.lower()
+    stopped = risk_manager.is_emergency_stopped()
+    logger.info(f"JOB: live_trade_engine called — mode={mode} emergency_stop={stopped}")
+    if mode != "live":
+        logger.info("JOB: live_trade_engine SKIP — mode is not 'live'")
         return
-    if risk_manager.is_emergency_stopped():
-        logger.warning("JOB: live trade engine SKIPPED — emergency stop active")
+    if stopped:
+        logger.warning("JOB: live_trade_engine SKIP — emergency stop active")
         return
-    logger.info("JOB: live trade engine")
     try:
-        run_live_trade_engine(gamma=_gamma)   # Strategy A (basket_wide) + B (basket_narrow)
-        run_tail_engine()                      # Strategy C (tail_no — NO time-decay)
+        run_live_trade_engine(gamma=_gamma)
+        run_tail_engine()
     except Exception as e:
         logger.error(f"Live trade engine job failed: {e}")
 
