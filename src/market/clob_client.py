@@ -36,14 +36,32 @@ _CLOB_HEADERS = {
 # ---------------------------------------------------------------------------
 
 def _parse_book_response(book: dict) -> dict:
-    """Parse a single order-book dict into our canonical snapshot format."""
+    """Parse a single order-book dict into our canonical snapshot format.
+
+    Polymarket CLOB returns asks sorted HIGH→LOW (resting orders at 0.99+ come
+    first).  Best ask = MINIMUM of the asks array; best bid = MAXIMUM of bids.
+    Using min/max is robust regardless of sort direction.
+    """
     bids: list[dict] = book.get("bids") or []
     asks: list[dict] = book.get("asks") or []
 
-    best_bid = float(bids[0]["price"]) if bids else None
-    best_bid_size = float(bids[0]["size"]) if bids else None
-    best_ask = float(asks[0]["price"]) if asks else None
-    best_ask_size = float(asks[0]["size"]) if asks else None
+    # --- best ask: lowest ask price (cheapest for a buyer) ---
+    if asks:
+        best_ask_entry = min(asks, key=lambda a: float(a["price"]))
+        best_ask = float(best_ask_entry["price"])
+        best_ask_size = float(best_ask_entry.get("size", 0) or 0)
+    else:
+        best_ask = None
+        best_ask_size = None
+
+    # --- best bid: highest bid price (most a seller can get) ---
+    if bids:
+        best_bid_entry = max(bids, key=lambda b: float(b["price"]))
+        best_bid = float(best_bid_entry["price"])
+        best_bid_size = float(best_bid_entry.get("size", 0) or 0)
+    else:
+        best_bid = None
+        best_bid_size = None
 
     mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
     spread = (best_ask - best_bid) if best_bid and best_ask else None
@@ -91,7 +109,16 @@ def _get_single_book(token_id: str) -> dict | None:
                 time.sleep(retry_after)
                 continue
             resp.raise_for_status()
-            return _parse_book_response(resp.json())
+            parsed = _parse_book_response(resp.json())
+            ask = parsed.get("best_ask")
+            if ask is not None and ask > 0.95:
+                raw = resp.json()
+                logger.warning(
+                    f"[clob_parse] GET /book suspicious best_ask={ask:.4f} "
+                    f"token={token_id[:20]}… "
+                    f"asks[:4]={[(a.get('price'), a.get('size')) for a in (raw.get('asks') or [])[:4]]}"
+                )
+            return parsed
 
         except BookUnavailable:
             raise
@@ -154,16 +181,38 @@ def _post_batch_books(
             data = resp.json()
             if not isinstance(data, list):
                 logger.warning(
-                    f"[clob] POST /books unexpected response type {type(data).__name__}"
+                    f"[clob] POST /books unexpected response type {type(data).__name__}: "
+                    f"{str(data)[:200]}"
                 )
                 return [None] * len(token_ids)
 
             result: list[dict | None] = []
-            for book in data:
+            for i, book in enumerate(data):
                 if isinstance(book, dict) and book:
                     try:
-                        result.append(_parse_book_response(book))
-                    except Exception:
+                        parsed = _parse_book_response(book)
+                        # Diagnostic: log raw asks when best_ask looks wrong (>0.5 is odd
+                        # for most YES tokens; 0.99 for all bins is the known bad pattern)
+                        if log_raw or (parsed.get("best_ask") or 0) > 0.95:
+                            raw_asks = [
+                                {"p": a.get("price"), "s": a.get("size")}
+                                for a in (book.get("asks") or [])[:6]
+                            ]
+                            raw_bids = [
+                                {"p": b.get("price"), "s": b.get("size")}
+                                for b in (book.get("bids") or [])[:3]
+                            ]
+                            tok = token_ids[i] if i < len(token_ids) else "?"
+                            logger.info(
+                                f"[clob_parse] token={tok[:20]}… "
+                                f"best_ask={parsed.get('best_ask')} "
+                                f"best_bid={parsed.get('best_bid')} "
+                                f"asks[:6]={raw_asks} "
+                                f"bids[:3]={raw_bids}"
+                            )
+                        result.append(parsed)
+                    except Exception as _exc:
+                        logger.warning(f"[clob] _parse_book_response failed idx={i}: {_exc}")
                         result.append(None)
                 else:
                     result.append(None)
