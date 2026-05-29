@@ -842,38 +842,39 @@ def _job_daily_summary() -> None:
             ))
         session.commit()
 
-        # ── Build Telegram messages (G2-2/G2-4) ───────────────────────────
-        # Owner message: full details including paper
-        owner_msg = f"📅 <b>Итоги дня: {yesterday}</b>\n\n"
+        # ── Build Telegram messages (G3-6: per-strategy breakdown) ──────────
+        owner_msg = f"📅 <b>Итоги дня: {yesterday}</b> (по дате открытия)\n\n"
 
         if live_resolved:
             live_staked_total = sum(t.stake_usd or 0.0 for t in live_resolved)
             live_received = live_staked_total + live_pnl
-            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%" if live_resolved else "N/A"
+            live_rate = f"{live_wins / len(live_resolved) * 100:.0f}%"
             reconcile_flag = "✅" if all_reconciled else "⚠️ не сверено"
             owner_msg += (
-                f"💼 <b>LIVE СДЕЛКИ</b>\n"
-                f"Вложено: ${live_staked_total:.2f}   Получено: ${live_received:.2f}"
-                f"   Итог: ${live_pnl:+.2f}\n"
-                f"Сделок: {len(live_resolved)} | Побед: {live_wins} | Поражений: {live_losses}\n"
-                f"Winrate: {live_rate} | ROI: {live_roi:+.1f}%\n"
-                f"Сверено с Polymarket: {reconcile_flag}\n"
+                f"💼 <b>LIVE</b>\n"
+                f"Вложено: ${live_staked_total:.2f} | Получено: ${live_received:.2f} | "
+                f"Итог: ${live_pnl:+.2f} | Сверено: {reconcile_flag}\n"
             )
-            if live_by_strat:
-                for strat, sv in sorted(live_by_strat.items()):
-                    owner_msg += f"  {strat}: ${sv['pnl']:+.2f} ({sv['wins']}W/{sv['losses']}L)\n"
+            # Per-strategy breakdown (G3-6)
+            strat_order = ["basket_wide", "basket_narrow", "tail_no"]
+            for strat in strat_order + [s for s in live_by_strat if s not in strat_order]:
+                if strat not in live_by_strat:
+                    continue
+                sv = live_by_strat[strat]
+                short = {"basket_wide": "basket", "basket_narrow": "basket_n", "tail_no": "tail"}.get(strat, strat)
+                owner_msg += f"  ↳ {short}: ${sv['pnl']:+.2f} ({sv['wins']}W/{sv['losses']}L)\n"
             if live_best and live_best.pnl_usd:
                 owner_msg += f"🔝 {live_best.city or '?'} {live_best.bin_label}: ${live_best.pnl_usd:+.2f}\n"
             if live_worst and live_worst.pnl_usd and live_worst is not live_best:
                 owner_msg += f"💸 {live_worst.city or '?'} {live_worst.bin_label}: ${live_worst.pnl_usd:+.2f}\n"
         else:
-            owner_msg += "💼 <b>Живых сделок сегодня не было</b>\n"
+            owner_msg += "💼 <b>LIVE</b>: сделок за день нет\n"
 
         rate_str = f"{wins / len(resolved) * 100:.0f}%" if resolved else "N/A"
-        owner_msg += f"\n📝 <b>PAPER</b> (тест, не реальные деньги)\n"
+        owner_msg += f"\n📝 <b>PAPER</b> (тест)\n"
         if resolved:
             owner_msg += (
-                f"PnL: ${total_pnl:+.2f} ({len(resolved)} сделок) — информационно\n"
+                f"PnL: ${total_pnl:+.2f} ({len(resolved)} сделок)\n"
                 f"✅ {wins}W / ❌ {losses}L / 🚫 {basket_misses}BM | Winrate: {rate_str}\n"
             )
         else:
