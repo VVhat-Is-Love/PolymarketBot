@@ -404,12 +404,19 @@ def _job_expire_stale_pending() -> None:
 
 def _job_reconcile_pnl() -> None:
     """
-    G3-2: Reconcile live trade PnL against Polymarket Data API.
+    G3-2 / G4-13: Reconcile live trade PnL against Polymarket Data API.
 
-    Resolution gating: Gamma is_resolved_event(group_id) — not cash-flow heuristics.
-    PnL source: realized_pnl_by_token keyed by token_id.
-    Dedup: one primary row per token_id gets the real PnL; duplicates (retries) get 0.
-    PnL=$0 on a resolved losing position IS valid and IS written.
+    Resolution rule — only finalize PnL after one of:
+      1. REDEEM in /activity for the trade's conditionId  →  source=redeem (true PnL)
+      2. Gamma says market resolved AND we LOST (no REDEEM expected for losers)
+         →  source=gamma_close (PnL = buy cost, negative)
+      3. Gamma says market resolved AND we WON but no REDEEM yet
+         →  status=pending_redeem; re-checked every reconcile run until REDEEM arrives
+
+    This prevents the bug where pnl_map shows only the BUY cost before REDEEM,
+    making a winning position look like a total loss (e.g. Seoul 27°C+ NO).
+
+    Log: [resolve] {city} {bin} status={win|loss} pnl=${X} source={...} ui_value=${Y}
     """
     from collections import defaultdict as _dd
     from src.config.settings import settings
@@ -423,19 +430,22 @@ def _job_reconcile_pnl() -> None:
     notifier = get_notifier()
     session = get_session()
     try:
+        # Include pending_redeem so winning trades are re-checked each cycle
         unreconciled: list[LiveTrade] = list(
             session.execute(
                 select(LiveTrade).where(
                     LiveTrade.token_id.isnot(None),
                     LiveTrade.group_id.isnot(None),
                     LiveTrade.reconciled_with_polymarket == False,  # noqa: E712
-                    LiveTrade.status.in_(["filled", "open", "expired", "cancelled"]),
+                    LiveTrade.status.in_(
+                        ["filled", "open", "expired", "cancelled", "pending_redeem"]
+                    ),
                 )
             ).scalars().all()
         )
 
         if not unreconciled:
-            logger.debug("[reconcile_pnl] No unreconciled trades with token_id")
+            logger.debug("[reconcile_pnl] No unreconciled trades")
             return
 
         logger.info(f"[reconcile_pnl] Checking {len(unreconciled)} trades against Data API")
@@ -443,15 +453,38 @@ def _job_reconcile_pnl() -> None:
         activity = get_activity(settings.proxy_wallet_address)
         pnl_map = realized_pnl_by_token(activity)
 
-        # Cache Gamma resolution per group_id to avoid duplicate API calls
+        # --- Build REDEEM helpers from raw activity ---
+        # conditionIds that have had a REDEEM event (winning positions)
+        redeemed_cids: set[str] = set()
+        # Total REDEEM payout per conditionId (shown as ui_value in log)
+        redeem_payouts: dict[str, float] = {}
+        for _a in activity:
+            if _a.get("type", "").upper() == "REDEEM":
+                _cid = _a.get("conditionId", "")
+                if _cid:
+                    redeemed_cids.add(_cid)
+                    try:
+                        redeem_payouts[_cid] = (
+                            redeem_payouts.get(_cid, 0.0) + float(_a.get("usdcSize") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+        # Gamma caches — one API call per group_id
         resolved_cache: dict[str, bool] = {}
+        winner_cache: dict[str, str | None] = {}
 
-        def _is_resolved(group_id: str) -> bool:
-            if group_id not in resolved_cache:
-                resolved_cache[group_id] = _gamma.is_resolved_event(group_id)
-            return resolved_cache[group_id]
+        def _is_resolved(gid: str) -> bool:
+            if gid not in resolved_cache:
+                resolved_cache[gid] = _gamma.is_resolved_event(gid)
+            return resolved_cache[gid]
 
-        # Group by token_id for dedup; then by group_id for resolution check
+        def _winner_mid(gid: str) -> str | None:
+            if gid not in winner_cache:
+                winner_cache[gid] = _gamma.winning_market_id(gid)
+            return winner_cache[gid]
+
+        # Group by token_id for dedup (one primary gets real PnL; retries get 0)
         by_token: dict[str, list[LiveTrade]] = _dd(list)
         for t in unreconciled:
             if t.token_id:
@@ -460,12 +493,8 @@ def _job_reconcile_pnl() -> None:
         for token_id, trades in by_token.items():
             group_id = trades[0].group_id
             if not group_id or not _is_resolved(group_id):
-                continue  # market still live — skip
+                continue
 
-            # PnL from Polymarket cash flows (0.0 for a loss = valid)
-            realized = pnl_map.get(token_id, 0.0)
-
-            # Primary = filled > open > most-recently-placed (handles retries)
             primary = max(
                 trades,
                 key=lambda t: (
@@ -474,12 +503,55 @@ def _job_reconcile_pnl() -> None:
                     t.placed_at or datetime.min,
                 ),
             )
+            city = primary.city or group_id or "?"
+            condition_id = primary.condition_id
+            has_redeem = bool(condition_id and condition_id in redeemed_cids)
+
+            # ── Gate 1: REDEEM confirmed ────────────────────────────────────
+            if has_redeem:
+                realized = pnl_map.get(token_id, 0.0)
+                source = "redeem"
+                ui_value = redeem_payouts.get(condition_id or "", None)
+
+            else:
+                # ── Gate 2: Determine win/loss from Gamma ──────────────────
+                winner = _winner_mid(group_id)
+                if winner is None:
+                    # Gamma hasn't fully settled yet — wait
+                    logger.debug(
+                        f"[reconcile_pnl] {city}: Gamma resolved but no winner yet — skip"
+                    )
+                    continue
+
+                is_tail_no = primary.strategy_name == "tail_no"
+                # For tail_no we hold NO on primary.market_id;
+                # we win if the Gamma winner is some OTHER market (our YES didn't happen).
+                # For basket/YES trades we win if our market IS the winner.
+                we_won = (winner != primary.market_id) if is_tail_no else (winner == primary.market_id)
+
+                if we_won:
+                    # ── Gate 3: WIN but no REDEEM yet → pending_redeem ────
+                    if primary.status != "pending_redeem":
+                        primary.status = "pending_redeem"
+                        session.commit()
+                        logger.info(
+                            f"[reconcile_pnl] {city} {primary.bin_label}: "
+                            f"WIN confirmed by Gamma (winner={winner[:8]}…), "
+                            f"no REDEEM in /activity yet → pending_redeem"
+                        )
+                    continue  # re-check next cycle
+
+                # LOSS confirmed — no REDEEM will arrive; use BUY cost from pnl_map
+                realized = pnl_map.get(token_id, 0.0)  # negative (cost only)
+                source = "gamma_close"
+                ui_value = None
+
+            # ── Write final PnL ─────────────────────────────────────────────
             primary.pnl_usd = round(realized, 4)
             primary.reconciled_with_polymarket = True
             primary.resolved_at = primary.resolved_at or datetime.utcnow()
             primary.status = "resolved"
 
-            # Dedup: retries with same token get pnl=0 (the real PnL is on primary)
             for t in trades:
                 if t is not primary and not t.reconciled_with_polymarket:
                     t.pnl_usd = 0.0
@@ -488,17 +560,22 @@ def _job_reconcile_pnl() -> None:
 
             session.commit()
 
+            outcome = "win" if realized > 0 else "loss"
             pnl_sign = "+" if realized >= 0 else ""
-            city = primary.city or group_id or "?"
+            ui_str = f"${ui_value:.4f}" if ui_value is not None else "N/A"
             logger.info(
-                f"[reconcile_pnl] ✅ {city} {primary.bin_label} "
-                f"PnL={pnl_sign}${realized:.2f} token={token_id[:12]}…"
+                f"[resolve] {city} {primary.bin_label} "
+                f"status={outcome} "
+                f"pnl={pnl_sign}${abs(realized):.4f} "
+                f"source={source} "
+                f"ui_value={ui_str}"
                 + (f" ({len(trades)-1} deduped)" if len(trades) > 1 else "")
             )
             outcome_em = "✅" if realized > 0 else "❌"
             notifier.send(
                 f"{outcome_em} [{primary.strategy_name}] {city} {primary.bin_label} — "
-                f"закрыта {pnl_sign}${abs(realized):.2f} (сверено Polymarket)"
+                f"закрыта {pnl_sign}${abs(realized):.2f} "
+                f"(source={source}, ui={ui_str})"
             )
 
     except Exception as exc:
