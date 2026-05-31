@@ -73,6 +73,9 @@ class StrategySettings(BaseSettings):
     tail_max_no_ask: float = Field(default=0.94)       # above = payoff too thin for 100% loss risk
     tail_slippage_buffer: float = Field(default=0.01)  # buffer added on top of approximated ask
     tail_min_model_no: float = Field(default=0.93)    # min P(NO) from Gaussian model for inline tail
+    # Early exit: when an open NO position's bid reaches this, SELL to lock ~98%
+    # profit, free capital, and remove residual resolution risk (vs waiting for REDEEM).
+    tail_early_exit_price: float = Field(default=0.985)
 
 
 strategy_settings = StrategySettings()

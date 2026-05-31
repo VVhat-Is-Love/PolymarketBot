@@ -1083,3 +1083,115 @@ def run_tail_engine() -> None:
         logger.exception("[tail] Engine error in run_tail_engine")
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Tail early exit — SELL a winning NO position to lock profit before REDEEM
+# ---------------------------------------------------------------------------
+
+def run_tail_early_exit() -> None:
+    """
+    For every open/filled tail_no LiveTrade: if the NO token's best bid has
+    reached tail_early_exit_price (default 0.985), SELL the position now to
+    lock ~98% of profit, free the capital, and remove residual resolution risk.
+
+    We hold NO shares (token_id on the trade IS the NO token). To exit we place
+    a SELL limit at the current best bid (marketable). On success the trade is
+    marked status='sold' (excluded from deployed-capital and from re-entry);
+    the SELL appears in /activity so reconcile finalizes the true PnL.
+
+    Log: [tail_exit] {market} sell @ {price} locked_pnl=${X}
+    """
+    from src.config.settings import settings
+    from src.risk.risk_manager import risk_manager
+    from src.market.order_executor import place_limit_order
+    from src.market.clob_client import get_book_snapshot
+    from src.notifications.telegram import get_notifier
+
+    if settings.trading_mode.lower() != "live":
+        return
+
+    threshold = getattr(ss, "tail_early_exit_price", 0.985)
+    session = get_session()
+    notifier = get_notifier()
+    try:
+        positions: list[LiveTrade] = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.strategy_name == "tail_no",
+                    LiveTrade.status.in_(["open", "filled"]),
+                    LiveTrade.token_id.isnot(None),
+                    LiveTrade.order_id.isnot(None),
+                )
+            ).scalars().all()
+        )
+        if not positions:
+            logger.debug("[tail_exit] No open tail_no positions to evaluate")
+            return
+
+        logger.info(f"[tail_exit] Evaluating {len(positions)} open tail_no position(s)")
+
+        for t in positions:
+            try:
+                snap = get_book_snapshot(t.token_id)
+            except Exception as exc:
+                logger.warning(f"[tail_exit] book fetch failed {t.market_id}: {exc}")
+                continue
+            if not snap:
+                continue
+
+            best_bid = snap.get("best_bid")
+            if best_bid is None:
+                logger.debug(f"[tail_exit] {t.city} {t.market_id}: no bid — skip")
+                continue
+
+            if best_bid < threshold:
+                logger.debug(
+                    f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
+                    f"< {threshold} — hold"
+                )
+                continue
+
+            shares = t.size_shares or 0.0
+            stake = t.stake_usd or 0.0
+            sell_price = round(min(0.999, best_bid), 4)
+            locked_pnl = round(shares * sell_price - stake, 4)
+
+            logger.info(
+                f"[tail_exit] {t.city} {t.market_id} sell @ {sell_price:.4f} "
+                f"locked_pnl=${locked_pnl:+.4f} (shares={shares:.2f} stake=${stake:.2f})"
+            )
+
+            sell_oid = place_limit_order(
+                market_id=t.market_id,
+                token_id=t.token_id,
+                side="SELL",
+                price=sell_price,
+                size=shares,
+                skip_risk_check=True,   # closing a position never adds risk
+            )
+
+            if sell_oid:
+                t.status = "sold"
+                t.pnl_usd = locked_pnl          # provisional; reconcile confirms via SELL cashflow
+                t.resolved_at = t.resolved_at or datetime.utcnow()
+                session.commit()
+                # Free deployed capital immediately
+                try:
+                    risk_manager.record_bet_result(t.id, t.group_id or "", locked_pnl)
+                except Exception:
+                    pass
+                notifier.send(
+                    f"💰 [tail_exit] {t.city} {t.bin_label} — продано @ {sell_price:.3f} "
+                    f"| зафиксирован PnL ${locked_pnl:+.2f} (sell_order={sell_oid})"
+                )
+            else:
+                logger.warning(
+                    f"[tail_exit] SELL order failed {t.city} {t.market_id} "
+                    f"@ {sell_price:.4f}"
+                )
+
+    except Exception:
+        logger.exception("[tail_exit] Engine error in run_tail_early_exit")
+    finally:
+        session.close()

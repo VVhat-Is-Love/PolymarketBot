@@ -164,6 +164,18 @@ def _job_live_trade_engine() -> None:
         logger.error(f"Live trade engine job failed: {e}")
 
 
+def _job_tail_early_exit() -> None:
+    """G4-15: SELL winning NO positions at tail_early_exit_price to lock profit."""
+    from src.config.settings import settings
+    from src.strategy.live_trader import run_tail_early_exit
+    if settings.trading_mode.lower() != "live":
+        return
+    try:
+        run_tail_early_exit()
+    except Exception as e:
+        logger.error(f"Tail early-exit job failed: {e}")
+
+
 def _job_resolve_paper_trades() -> None:
     logger.info("JOB: resolve paper trades")
     try:
@@ -438,7 +450,7 @@ def _job_reconcile_pnl() -> None:
                     LiveTrade.group_id.isnot(None),
                     LiveTrade.reconciled_with_polymarket == False,  # noqa: E712
                     LiveTrade.status.in_(
-                        ["filled", "open", "expired", "cancelled", "pending_redeem"]
+                        ["filled", "open", "expired", "cancelled", "pending_redeem", "sold"]
                     ),
                 )
             ).scalars().all()
@@ -492,12 +504,13 @@ def _job_reconcile_pnl() -> None:
 
         for token_id, trades in by_token.items():
             group_id = trades[0].group_id
-            if not group_id or not _is_resolved(group_id):
+            if not group_id:
                 continue
 
             primary = max(
                 trades,
                 key=lambda t: (
+                    t.status == "sold",
                     t.status == "filled",
                     t.status == "open",
                     t.placed_at or datetime.min,
@@ -506,6 +519,33 @@ def _job_reconcile_pnl() -> None:
             city = primary.city or group_id or "?"
             condition_id = primary.condition_id
             has_redeem = bool(condition_id and condition_id in redeemed_cids)
+
+            # ── Gate 0: SOLD via early-exit — finalize from SELL cashflow ────
+            # A sold position is closed regardless of Gamma resolution; pnl_map
+            # already contains the SELL proceeds (and BUY cost).
+            if any(t.status == "sold" for t in trades):
+                realized = pnl_map.get(token_id, 0.0)
+                primary.pnl_usd = round(realized, 4)
+                primary.reconciled_with_polymarket = True
+                primary.resolved_at = primary.resolved_at or datetime.utcnow()
+                primary.status = "resolved"
+                for t in trades:
+                    if t is not primary and not t.reconciled_with_polymarket:
+                        t.pnl_usd = 0.0
+                        t.reconciled_with_polymarket = True
+                        t.status = "resolved"
+                session.commit()
+                outcome = "win" if realized > 0 else "loss"
+                pnl_sign = "+" if realized >= 0 else ""
+                logger.info(
+                    f"[resolve] {city} {primary.bin_label} status={outcome} "
+                    f"pnl={pnl_sign}${abs(realized):.4f} source=sell ui_value=N/A"
+                )
+                continue
+
+            # Past this point we need Gamma resolution
+            if not _is_resolved(group_id):
+                continue
 
             # ── Gate 1: REDEEM confirmed ────────────────────────────────────
             if has_redeem:
@@ -1124,6 +1164,7 @@ def setup_scheduler() -> None:
     schedule.every(60).minutes.do(_job_fetch_open_meteo)
     schedule.every(15).minutes.do(_job_paper_trade_engine)
     schedule.every(15).minutes.do(_job_live_trade_engine)   # runtime emergency_stop check inside
+    schedule.every(5).minutes.do(_job_tail_early_exit)       # G4-15: lock NO profit at ≥0.985
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(15).minutes.do(_job_settle_paper)   # G3-3: Gamma-based paper settlement
     schedule.every(60).minutes.do(_job_paper_trade_summary)
@@ -1191,6 +1232,7 @@ def run_initial_jobs() -> None:
     _job_settle_paper()         # G3-3: Gamma paper settlement on startup
     _job_reconcile_pnl()       # G3-2: reconcile live PnL first
     _job_resolve_live_trades()
+    _job_tail_early_exit()     # G4-15: lock winning NO positions on startup
     _job_paper_trade_engine()
     _job_live_trade_engine()
     _job_paper_trade_summary()
