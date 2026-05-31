@@ -214,6 +214,42 @@ def _poll_until_filled_or_timeout(
 # Order placement helper — shared by Strategy A and B
 # ---------------------------------------------------------------------------
 
+def _verify_order_market(expected_city: str, market: "Market | None") -> bool:
+    """
+    G4-14 safety gate: confirm the order's market really belongs to expected_city.
+
+    Re-parses the city from the market's actual Polymarket question and requires
+    it to equal the group's city. Prevents the Milan→Los Angeles class of bug
+    where 'LA' matched inside 'miLAn' and orders were routed to the wrong market.
+
+    Logs [order] city={X} bin={Y} market_id={Z} polymarket_question="..." for
+    every order so mismatches are visible. Returns False → caller MUST NOT place.
+    """
+    from src.config.cities import CITIES_WHITELIST
+    from src.market.parsers import parse_city_from_title, canonical_city
+
+    question = (market.question if market else "") or ""
+    market_id = market.market_id if market else "?"
+    bin_label = market.bin_label if market else "?"
+
+    parsed = parse_city_from_title(question, CITIES_WHITELIST)
+    parsed_canon = canonical_city(parsed) if parsed else None
+    expected_canon = canonical_city(expected_city)
+
+    match = parsed_canon is not None and parsed_canon == expected_canon
+    verdict = "OK" if match else "MISMATCH"
+    logger.info(
+        f"[order] city={expected_city} bin={bin_label} market_id={market_id} "
+        f'polymarket_question="{question}" parsed_city={parsed_canon} verify={verdict}'
+    )
+    if not match:
+        logger.error(
+            f"[order] BLOCKED — market {market_id} question is for "
+            f"{parsed_canon!r}, not {expected_city!r}. Refusing to place order."
+        )
+    return match
+
+
 def _entry_price(ask_price: float, settings) -> float:
     """
     G2-3: Return the order entry price.
@@ -286,6 +322,10 @@ def _place_basket_orders(
                     f"({group.city} {o.bin_label}) — skip leg"
                 )
                 continue
+
+            # G4-14: verify market's Polymarket question matches the group city
+            if not _verify_order_market(group.city, mkt):
+                continue  # wrong-market guard — skip this leg
 
             # G2-3: use best_ask price mode (marketable limit = faster fill)
             entry_price = _entry_price(o.ask_price, settings)
@@ -737,6 +777,10 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                         )
                         continue
 
+                    # G4-14: verify market's Polymarket question matches the group city
+                    if not _verify_order_market(group.city, _mkt):
+                        continue  # wrong-market guard — skip this tail order
+
                     _tail_trade = LiveTrade(
                         id=str(uuid.uuid4()),
                         group_id=group.group_id,
@@ -965,6 +1009,10 @@ def run_tail_engine() -> None:
                             f"({group.city} {o.bin_label}) — skip"
                         )
                         continue
+
+                    # G4-14: verify market's Polymarket question matches the group city
+                    if not _verify_order_market(group.city, mkt):
+                        continue  # wrong-market guard — skip this tail order
 
                     trade = LiveTrade(
                         id=str(uuid.uuid4()),

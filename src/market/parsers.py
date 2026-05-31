@@ -84,18 +84,46 @@ _BIN_POINT = re.compile(r"^(\d+(?:\.\d+)?)\s*°?[CFcf]?\s*$")
 # Public API
 # ---------------------------------------------------------------------------
 
+def _word_in(term: str, text: str) -> bool:
+    """
+    True if `term` appears in `text` as a standalone word (both lower-cased).
+
+    Uses letter-boundary lookarounds rather than plain substring so short
+    aliases like 'la' do NOT match inside other city names:
+        'la' in 'milan'  → substring match (WRONG, caused Milan→Los Angeles)
+        _word_in('la', 'milan') → False  (preceded by a letter)
+        _word_in('la', 'temp in la on may') → True
+    """
+    if not term:
+        return False
+    return re.search(r"(?<![a-z])" + re.escape(term) + r"(?![a-z])", text) is not None
+
+
 def parse_city_from_title(title: str, whitelist: dict) -> str | None:
-    """'Highest temperature in Seoul on May 5?' → 'Seoul' (canonical)."""
+    """'Highest temperature in Seoul on May 5?' → 'Seoul' (canonical).
+
+    Matching priority (CRITICAL — prevents wrong-market trades):
+      1. Exact canonical city name as a whole word, across the WHOLE whitelist.
+         This guarantees 'Milan' wins over the 'LA' alias substring inside it.
+      2. City aliases as whole words (e.g. 'NYC', 'HK').
+      3. CITY_CANONICAL fallback table.
+    """
     t = title.lower()
+
+    # Pass 1: exact canonical city name (whole-word) — highest priority
+    for city in whitelist:
+        if _word_in(city.lower(), t):
+            return city
+
+    # Pass 2: aliases (whole-word)
     for city, cfg in whitelist.items():
-        if city.lower() in t:
-            return city  # already canonical (key from whitelist)
         for alias in cfg.get("aliases", []):
-            if alias.lower() in t:
-                return city  # return the canonical key, not the alias
-    # Last-resort: check CITY_CANONICAL for titles like "highest temp in NYC"
+            if _word_in(alias.lower(), t):
+                return city
+
+    # Pass 3: CITY_CANONICAL table (whole-word) for titles like "highest temp in NYC"
     for raw, canonical in CITY_CANONICAL.items():
-        if raw in t and canonical in whitelist:
+        if _word_in(raw, t) and canonical in whitelist:
             return canonical
     return None
 
