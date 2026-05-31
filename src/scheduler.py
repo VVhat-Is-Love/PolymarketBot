@@ -496,21 +496,41 @@ def _job_reconcile_pnl() -> None:
                 winner_cache[gid] = _gamma.winning_market_id(gid)
             return winner_cache[gid]
 
-        # Group by token_id for dedup (one primary gets real PnL; retries get 0)
+        # ── SOLD positions (early-exit) — finalize per-lot from locked_pnl ──
+        # Each sold lot is an independent close at a known SELL price. Its PnL
+        # was computed at sell time (shares*sell_price - stake) and stored on
+        # the row. Do NOT re-derive from pnl_map: the /activity SELL may not have
+        # settled yet, and two lots sharing one token_id would aggregate/zero in
+        # a way that flips the sign (the +$0.38 win → −$5.30 loss bug).
+        sold_trades = [t for t in unreconciled if t.status == "sold"]
+        for t in sold_trades:
+            locked = t.pnl_usd if t.pnl_usd is not None else 0.0
+            t.reconciled_with_polymarket = True
+            t.resolved_at = t.resolved_at or datetime.utcnow()
+            t.status = "resolved"
+            outcome = "win" if locked > 0 else "loss"
+            sign = "+" if locked >= 0 else ""
+            logger.info(
+                f"[resolve] {t.city or t.group_id} {t.bin_label} status={outcome} "
+                f"pnl={sign}${abs(locked):.4f} source=sell ui_value=N/A"
+            )
+        if sold_trades:
+            session.commit()
+
+        # Group remaining (non-sold) by token_id for dedup
         by_token: dict[str, list[LiveTrade]] = _dd(list)
         for t in unreconciled:
-            if t.token_id:
+            if t.status != "sold" and t.token_id:
                 by_token[t.token_id].append(t)
 
         for token_id, trades in by_token.items():
             group_id = trades[0].group_id
-            if not group_id:
+            if not group_id or not _is_resolved(group_id):
                 continue
 
             primary = max(
                 trades,
                 key=lambda t: (
-                    t.status == "sold",
                     t.status == "filled",
                     t.status == "open",
                     t.placed_at or datetime.min,
@@ -519,33 +539,6 @@ def _job_reconcile_pnl() -> None:
             city = primary.city or group_id or "?"
             condition_id = primary.condition_id
             has_redeem = bool(condition_id and condition_id in redeemed_cids)
-
-            # ── Gate 0: SOLD via early-exit — finalize from SELL cashflow ────
-            # A sold position is closed regardless of Gamma resolution; pnl_map
-            # already contains the SELL proceeds (and BUY cost).
-            if any(t.status == "sold" for t in trades):
-                realized = pnl_map.get(token_id, 0.0)
-                primary.pnl_usd = round(realized, 4)
-                primary.reconciled_with_polymarket = True
-                primary.resolved_at = primary.resolved_at or datetime.utcnow()
-                primary.status = "resolved"
-                for t in trades:
-                    if t is not primary and not t.reconciled_with_polymarket:
-                        t.pnl_usd = 0.0
-                        t.reconciled_with_polymarket = True
-                        t.status = "resolved"
-                session.commit()
-                outcome = "win" if realized > 0 else "loss"
-                pnl_sign = "+" if realized >= 0 else ""
-                logger.info(
-                    f"[resolve] {city} {primary.bin_label} status={outcome} "
-                    f"pnl={pnl_sign}${abs(realized):.4f} source=sell ui_value=N/A"
-                )
-                continue
-
-            # Past this point we need Gamma resolution
-            if not _is_resolved(group_id):
-                continue
 
             # ── Gate 1: REDEEM confirmed ────────────────────────────────────
             if has_redeem:
