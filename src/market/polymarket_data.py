@@ -131,6 +131,39 @@ def realized_pnl_by_token(activity: list[dict]) -> dict[str, float]:
     return dict(pnl)
 
 
+def buy_shares_by_token(activity: list[dict]) -> dict[str, float]:
+    """
+    Σ of BUY share size per token_id from /activity.
+
+    This is the ONLY proof that a position actually exists on Polymarket — a
+    local order_id / CLOB 'matched' status does NOT mean the BUY settled.
+    Used to gate fills (forward) and PnL finalization (backward).
+    """
+    shares: dict[str, float] = defaultdict(float)
+    for a in activity:
+        if a.get("type") == "TRADE" and a.get("side", "").upper() == "BUY":
+            token = a.get("asset", "")
+            if not token:
+                continue
+            try:
+                sz = float(a.get("size") or 0)
+            except (TypeError, ValueError):
+                sz = 0.0
+            shares[token] += sz
+    return dict(shares)
+
+
+def redeemed_condition_ids(activity: list[dict]) -> set[str]:
+    """Set of conditionIds that have a REDEEM cash-in event (winning positions)."""
+    out: set[str] = set()
+    for a in activity:
+        if a.get("type", "").upper() == "REDEEM":
+            cid = a.get("conditionId", "")
+            if cid:
+                out.add(cid)
+    return out
+
+
 def realized_pnl_by_condition(activity: list[dict]) -> dict[str, float]:
     """Legacy alias — kept for any callers outside scheduler. Prefer realized_pnl_by_token."""
     # Build token map then collapse back to conditionId

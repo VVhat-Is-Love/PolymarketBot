@@ -124,7 +124,8 @@ class RiskManager:
                 self._daily_bets_count = int(
                     session.execute(
                         select(func.count()).select_from(LiveTrade).where(
-                            LiveTrade.placed_at >= today_start
+                            LiveTrade.placed_at >= today_start,
+                            LiveTrade.status != "not_filled",  # phantom isn't a bet
                         )
                     ).scalar() or 0
                 )

@@ -276,6 +276,7 @@ def _job_reconcile_orders() -> None:
     from datetime import timedelta
     from src.config.settings import settings
     from src.market.order_executor import get_order_status, cancel_order
+    from src.market.polymarket_data import get_activity, buy_shares_by_token
     from src.notifications.telegram import get_notifier
 
     notifier = get_notifier()
@@ -298,28 +299,52 @@ def _job_reconcile_orders() -> None:
 
         logger.debug(f"[reconcile] Checking {len(pending_open)} open/pending orders")
 
+        # G4-19: /activity BUY is the ONLY proof of fill. CLOB 'matched' status is
+        # a hint, not proof (phantom-fill bug: Lucknow had a matched order but no
+        # BUY on Polymarket). Build BUY-shares-per-token once for this run.
+        buy_shares: dict[str, float] = {}
+        if settings.proxy_wallet_address:
+            try:
+                buy_shares = buy_shares_by_token(get_activity(settings.proxy_wallet_address))
+            except Exception as exc:
+                logger.warning(f"[reconcile] /activity fetch failed — fill check deferred: {exc}")
+
+        def _has_matching_buy(tr: LiveTrade) -> bool:
+            if not tr.token_id:
+                return False
+            bought = buy_shares.get(tr.token_id, 0.0)
+            want = tr.size_shares or 0.0
+            # tolerance: 2% or 0.5 shares, whichever is larger
+            tol = max(0.5, want * 0.02)
+            return bought >= (want - tol)
+
         for t in pending_open:
+            placed_at = t.placed_at or now
+
+            # Fill is confirmed by /activity BUY, not by CLOB status
+            if _has_matching_buy(t):
+                t.status = "filled"
+                t.filled_price = t.target_price
+                t.filled_at = now
+                session.commit()
+                city = t.city or t.group_id or "?"
+                logger.info(
+                    f"[reconcile] FILLED (verified /activity BUY): {city} {t.bin_label} "
+                    f"order={t.order_id[:12]}…"
+                )
+                notifier.send(
+                    f"✅ Исполнен [{t.strategy_name}]: {city} {t.bin_label} | "
+                    f"${t.target_price:.4f} × {t.size_shares:.4f}"
+                )
+                continue
+
             try:
                 clob_status = get_order_status(t.order_id)
             except Exception as exc:
                 logger.warning(f"[reconcile] Status check failed for {t.order_id[:12]}…: {exc}")
                 continue
 
-            placed_at = t.placed_at or now
-
-            if clob_status == "filled":
-                t.status = "filled"
-                t.filled_price = t.target_price
-                t.filled_at = now
-                session.commit()
-                city = t.city or t.group_id or "?"
-                logger.info(f"[reconcile] FILLED: {city} {t.bin_label} order={t.order_id[:12]}…")
-                notifier.send(
-                    f"✅ Исполнен [{t.strategy_name}]: {city} {t.bin_label} | "
-                    f"${t.target_price:.4f} × {t.size_shares:.4f}"
-                )
-
-            elif clob_status == "cancelled":
+            if clob_status == "cancelled":
                 t.status = "cancelled"
                 t.cancelled_at = now
                 session.commit()
@@ -328,20 +353,30 @@ def _job_reconcile_orders() -> None:
                 )
 
             elif (now - placed_at) > timeout:
-                # Order timed out — cancel it
+                # Timed out. CLOB may say 'matched' but if /activity has no BUY it
+                # never really filled → not_filled (excluded from PnL/risk), not expired.
                 try:
                     cancel_order(t.order_id)
                 except Exception:
                     pass
-                t.status = "expired"
-                t.cancelled_at = now
-                session.commit()
                 city = t.city or t.group_id or "?"
-                logger.warning(
-                    f"[reconcile] EXPIRED (>{settings.order_timeout_minutes}m): "
-                    f"{city} {t.bin_label} order={t.order_id[:12]}…"
-                )
-                notifier.send(f"⏰ Истёк [{t.strategy_name}]: {city} {t.bin_label}")
+                if buy_shares and not _has_matching_buy(t):
+                    t.status = "not_filled"
+                    t.cancelled_at = now
+                    session.commit()
+                    logger.warning(
+                        f"[reconcile] NOT_FILLED (no /activity BUY after timeout, "
+                        f"clob={clob_status}): {city} {t.bin_label} order={t.order_id[:12]}…"
+                    )
+                else:
+                    t.status = "expired"
+                    t.cancelled_at = now
+                    session.commit()
+                    logger.warning(
+                        f"[reconcile] EXPIRED (>{settings.order_timeout_minutes}m): "
+                        f"{city} {t.bin_label} order={t.order_id[:12]}…"
+                    )
+                    notifier.send(f"⏰ Истёк [{t.strategy_name}]: {city} {t.bin_label}")
 
         # G2-5: After processing individual legs, detect partial basket fills
         _detect_partial_baskets(session, notifier)
@@ -514,8 +549,9 @@ def _job_reconcile_pnl() -> None:
     Log: [resolve] {city} {bin} status={win|loss} pnl=${X} source={...} ui_value=${Y}
     """
     from collections import defaultdict as _dd
+    from datetime import timedelta
     from src.config.settings import settings
-    from src.market.polymarket_data import get_activity, realized_pnl_by_token
+    from src.market.polymarket_data import get_activity, realized_pnl_by_token, buy_shares_by_token
     from src.notifications.telegram import get_notifier
 
     if not settings.proxy_wallet_address:
@@ -547,6 +583,15 @@ def _job_reconcile_pnl() -> None:
 
         activity = get_activity(settings.proxy_wallet_address)
         pnl_map = realized_pnl_by_token(activity)
+        buy_shares = buy_shares_by_token(activity)
+        _fill_timeout = timedelta(minutes=max(30, settings.order_timeout_minutes * 4))
+
+        def _has_buy(tr: LiveTrade) -> bool:
+            """/activity BUY is the only proof the position exists (size-matched)."""
+            bought = buy_shares.get(tr.token_id or "", 0.0)
+            want = tr.size_shares or 0.0
+            tol = max(0.5, want * 0.02)
+            return bought >= (want - tol)
 
         # --- Build REDEEM helpers from raw activity ---
         # conditionIds that have had a REDEEM event (winning positions)
@@ -608,7 +653,7 @@ def _job_reconcile_pnl() -> None:
 
         for token_id, trades in by_token.items():
             group_id = trades[0].group_id
-            if not group_id or not _is_resolved(group_id):
+            if not group_id:
                 continue
 
             primary = max(
@@ -622,6 +667,33 @@ def _job_reconcile_pnl() -> None:
             city = primary.city or group_id or "?"
             condition_id = primary.condition_id
             has_redeem = bool(condition_id and condition_id in redeemed_cids)
+
+            # ── BUY gate: position must exist on /activity ──────────────────
+            # No BUY in /activity = the order never really filled (phantom).
+            # After a grace window, mark not_filled and exclude from PnL/risk.
+            if not _has_buy(primary):
+                oldest = min((t.placed_at or datetime.utcnow()) for t in trades)
+                if (datetime.utcnow() - oldest) > _fill_timeout:
+                    for t in trades:
+                        t.status = "not_filled"
+                        t.pnl_usd = None
+                        # reconciled stays False → excluded from loss/deployed calcs
+                    session.commit()
+                    logger.warning(
+                        f"[reconcile_pnl] NOT_FILLED {city} {primary.bin_label}: "
+                        f"no /activity BUY for token={token_id[:12]}… "
+                        f"(want {primary.size_shares} shares) — phantom, excluded"
+                    )
+                else:
+                    logger.debug(
+                        f"[reconcile_pnl] {city}: no /activity BUY yet "
+                        f"(within grace window) — wait"
+                    )
+                continue
+
+            # Position confirmed real → require Gamma resolution to finalize
+            if not _is_resolved(group_id):
+                continue
 
             # ── Gate 1: REDEEM confirmed ────────────────────────────────────
             if has_redeem:
@@ -700,11 +772,111 @@ def _job_reconcile_pnl() -> None:
         session.close()
 
 
+def _job_audit_activity() -> None:
+    """
+    G4-19: audit every resolved/reconciled live trade against /activity and
+    repair the two unambiguous discrepancy classes:
+
+      • phantom  — no BUY in /activity for the token → status=not_filled, pnl=None
+                   (e.g. Lucknow: recorded resolved with a local −cost on placement)
+      • win-as-loss — REDEEM credit exists but stored pnl is negative → fix to the
+                   /activity value +(payout−cost) (e.g. Seoul: +$0.74 stored −$6.03)
+
+    Sold positions (per-lot locked_pnl, no REDEEM) are NOT touched. Pure-visibility
+    audit line for every trade:
+      [audit] {city} {bin} stored=$X activity=$Y filled={bool} → {OK|FIX:...}
+    """
+    from collections import defaultdict as _dd
+    from src.config.settings import settings
+    from src.market.polymarket_data import (
+        get_activity, realized_pnl_by_token, buy_shares_by_token, redeemed_condition_ids,
+    )
+
+    if not settings.proxy_wallet_address:
+        return
+
+    session = get_session()
+    try:
+        resolved: list[LiveTrade] = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.token_id.isnot(None),
+                    LiveTrade.status.in_(["resolved", "pending_redeem", "not_filled"]),
+                )
+            ).scalars().all()
+        )
+        if not resolved:
+            logger.debug("[audit] No resolved live trades to audit")
+            return
+
+        activity = get_activity(settings.proxy_wallet_address)
+        pnl_map = realized_pnl_by_token(activity)
+        buy_shares = buy_shares_by_token(activity)
+        redeemed = redeemed_condition_ids(activity)
+
+        by_token: dict[str, list[LiveTrade]] = _dd(list)
+        for t in resolved:
+            by_token[t.token_id].append(t)
+
+        fixes = 0
+        for token_id, trades in by_token.items():
+            want = max((t.size_shares or 0.0) for t in trades)
+            bought = buy_shares.get(token_id, 0.0)
+            tol = max(0.5, want * 0.02)
+            filled = bought >= (want - tol)
+            activity_pnl = pnl_map.get(token_id, 0.0)
+            stored_pnl = sum((t.pnl_usd or 0.0) for t in trades)
+            primary = max(trades, key=lambda t: (t.pnl_usd is not None, t.placed_at or datetime.min))
+            cid = primary.condition_id or ""
+            has_redeem = cid in redeemed
+
+            verdict = "OK"
+            # Phantom: never filled on Polymarket
+            if not filled and any(t.status != "not_filled" for t in trades):
+                for t in trades:
+                    t.status = "not_filled"
+                    t.pnl_usd = None
+                    t.reconciled_with_polymarket = False
+                verdict = "FIX:not_filled(no BUY)"
+                fixes += 1
+            # Win recorded as loss: redeem credit exists but stored is negative
+            elif filled and has_redeem and stored_pnl < 0 < activity_pnl:
+                primary.pnl_usd = round(activity_pnl, 4)
+                primary.status = "resolved"
+                primary.reconciled_with_polymarket = True
+                for t in trades:
+                    if t is not primary:
+                        t.pnl_usd = 0.0
+                        t.reconciled_with_polymarket = True
+                        t.status = "resolved"
+                verdict = f"FIX:win {activity_pnl:+.4f}"
+                fixes += 1
+
+            logger.info(
+                f"[audit] {primary.city or primary.group_id} {primary.bin_label} "
+                f"stored=${stored_pnl:+.4f} activity=${activity_pnl:+.4f} "
+                f"filled={filled} redeem={has_redeem} → {verdict}"
+            )
+
+        if fixes:
+            session.commit()
+            logger.info(f"[audit] Applied {fixes} repair(s) from /activity")
+    except Exception as exc:
+        logger.error(f"[audit] Job failed: {exc}")
+    finally:
+        session.close()
+
+
 def _job_resolve_live_trades() -> None:
     """
     LEGACY: weather-based resolution for trades WITHOUT condition_id.
     For trades that were placed before G2-1 (no Polymarket matching keys).
     New trades use _job_reconcile_pnl instead.
+
+    G4-19: NEVER touch trades that have a token_id — those are reconciled solely
+    against /activity by _job_reconcile_pnl. This legacy local-PnL (−stake) path
+    is the source of phantom losses (e.g. Lucknow) and must not write PnL for any
+    trade with Polymarket matching keys.
     """
     session = get_session()
     notifier = get_notifier()
@@ -714,6 +886,7 @@ def _job_resolve_live_trades() -> None:
                 select(LiveTrade).where(
                     LiveTrade.status == "filled",
                     LiveTrade.resolved_at.is_(None),
+                    LiveTrade.token_id.is_(None),   # only pre-G2-1 trades w/o keys
                 )
             ).scalars().all()
         )
@@ -1247,6 +1420,7 @@ def setup_scheduler() -> None:
     schedule.every(60).minutes.do(_job_paper_trade_summary)
     schedule.every(2).minutes.do(_job_reconcile_orders)
     schedule.every(15).minutes.do(_job_reconcile_pnl)
+    schedule.every(30).minutes.do(_job_audit_activity)      # G4-19: /activity audit + repair
     schedule.every(30).minutes.do(_job_expire_stale_pending)
     schedule.every(30).minutes.do(_job_resolve_live_trades)
     schedule.every().sunday.at("04:00").do(_job_cleanup_snapshots)
@@ -1312,6 +1486,7 @@ def run_initial_jobs() -> None:
     _job_tail_early_exit()     # G4-15: capture early-exit window missed overnight
     _job_reconcile_pnl()       # G3-2: finalize sells + mark wins pending_redeem
     _job_auto_redeem()         # G4-17: redeem stuck wins (no bid / market closed)
+    _job_audit_activity()      # G4-19: repair phantom/win-as-loss vs /activity
     _job_resolve_live_trades()
     _job_paper_trade_engine()
     _job_live_trade_engine()
