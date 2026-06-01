@@ -1089,16 +1089,23 @@ def run_tail_engine() -> None:
 # Tail early exit — SELL a winning NO position to lock profit before REDEEM
 # ---------------------------------------------------------------------------
 
-def run_tail_early_exit() -> None:
+def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
     """
-    For every open/filled tail_no LiveTrade: if the NO token's best bid has
-    reached tail_early_exit_price (default 0.985), SELL the position now to
-    lock ~98% of profit, free the capital, and remove residual resolution risk.
+    Lock profit on winning NO positions by SELLING — but ONLY on LIVE markets.
 
-    We hold NO shares (token_id on the trade IS the NO token). To exit we place
-    a SELL limit at the current best bid (marketable). On success the trade is
-    marked status='sold' (excluded from deployed-capital and from re-entry);
-    the SELL appears in /activity so reconcile finalizes the true PnL.
+    A SELL is only possible while the order book is live. Once the market is
+    closed/resolved on Polymarket, the ERC-1155 shares convert to a redemption
+    claim and the order-book balance is 0 (SELL fails with balance:0). Such
+    positions must go through auto_redeem, NOT SELL.
+
+    Gate per position:
+      • market resolved (group.is_active=False OR Gamma is_resolved_event) →
+        route to redeem: ensure status=pending_redeem, skip SELL.
+      • market live AND best_bid ≥ tail_early_exit_price → SELL at the bid.
+      • market live but bid < threshold → hold.
+
+    On a successful SELL the trade is marked status='sold'; reconcile finalizes
+    the true PnL from the SELL cash-flow.
 
     Log: [tail_exit] {market} sell @ {price} locked_pnl=${X}
     """
@@ -1114,6 +1121,26 @@ def run_tail_early_exit() -> None:
     threshold = getattr(ss, "tail_early_exit_price", 0.985)
     session = get_session()
     notifier = get_notifier()
+    _resolved_cache: dict[str, bool] = {}
+
+    def _market_resolved(group_id: str) -> bool:
+        """True if the market is closed/resolved (shares no longer tradeable)."""
+        if not group_id:
+            return False
+        if group_id in _resolved_cache:
+            return _resolved_cache[group_id]
+        # Local signal first: _job_deactivate_resolved_groups sets is_active=False
+        grp = session.get(MarketGroup, group_id)
+        resolved = bool(grp is not None and grp.is_active is False)
+        # Confirm with Gamma when available (covers lag before deactivation job runs)
+        if not resolved and gamma is not None:
+            try:
+                resolved = gamma.is_resolved_event(group_id)
+            except Exception:
+                pass
+        _resolved_cache[group_id] = resolved
+        return resolved
+
     try:
         positions: list[LiveTrade] = list(
             session.execute(
@@ -1132,6 +1159,17 @@ def run_tail_early_exit() -> None:
         logger.info(f"[tail_exit] Evaluating {len(positions)} open tail_no position(s)")
 
         for t in positions:
+            # ── Resolved market → redeem path, never SELL (avoids balance:0) ──
+            if _market_resolved(t.group_id):
+                if t.status != "pending_redeem":
+                    t.status = "pending_redeem"
+                    session.commit()
+                logger.info(
+                    f"[tail_exit] {t.city} {t.market_id}: market RESOLVED — "
+                    f"route to auto_redeem (no SELL, shares in redemption)"
+                )
+                continue
+
             try:
                 snap = get_book_snapshot(t.token_id)
             except Exception as exc:

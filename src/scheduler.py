@@ -171,7 +171,7 @@ def _job_tail_early_exit() -> None:
     if settings.trading_mode.lower() != "live":
         return
     try:
-        run_tail_early_exit()
+        run_tail_early_exit(gamma=_gamma)   # G4-18: gate SELL on live markets only
     except Exception as e:
         logger.error(f"Tail early-exit job failed: {e}")
 
