@@ -176,6 +176,89 @@ def _job_tail_early_exit() -> None:
         logger.error(f"Tail early-exit job failed: {e}")
 
 
+def _job_auto_redeem() -> None:
+    """
+    G4-17: redeem won positions that reached resolution without an early-exit
+    sell (no bid / market closed). Targets pending_redeem trades (Gamma win
+    confirmed by reconcile). Initiates the on-chain redeem; the resulting REDEEM
+    in /activity is then finalized by reconcile (source=redeem).
+    """
+    from src.config.settings import settings
+    from src.blockchain.redeem import redeem_position
+    from src.market.polymarket_data import get_positions
+
+    if settings.trading_mode.lower() != "live" or not settings.auto_redeem_enabled:
+        return
+
+    session = get_session()
+    try:
+        pending: list[LiveTrade] = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.status == "pending_redeem",
+                    LiveTrade.reconciled_with_polymarket == False,  # noqa: E712
+                    LiveTrade.condition_id.isnot(None),
+                )
+            ).scalars().all()
+        )
+        if not pending:
+            logger.debug("[auto_redeem] No pending_redeem positions")
+            return
+
+        logger.info(f"[auto_redeem] {len(pending)} pending_redeem position(s) to redeem")
+
+        # Polymarket's own redeemable signal + negRisk flag, keyed by conditionId
+        redeemable_by_cid: dict[str, dict] = {}
+        try:
+            for p in get_positions(settings.proxy_wallet_address, redeemable=True) or []:
+                cid = p.get("conditionId")
+                if cid:
+                    redeemable_by_cid[cid] = p
+        except Exception as exc:
+            logger.warning(f"[auto_redeem] data-api positions unavailable: {exc}")
+
+        # Redeem once per conditionId (a basket may have several legs on one cond)
+        done_cids: set[str] = set()
+        for t in pending:
+            cid = t.condition_id
+            if not cid or cid in done_cids:
+                continue
+
+            pos = redeemable_by_cid.get(cid)
+            if redeemable_by_cid and pos is None:
+                # data-api responded but this cond isn't (yet) redeemable — wait
+                logger.info(
+                    f"[auto_redeem] {t.city} {t.bin_label}: not yet redeemable "
+                    f"per data-api — skip"
+                )
+                continue
+
+            # negRisk flag: prefer data-api, default True (weather bins are NegRisk)
+            neg_risk = True
+            if pos is not None:
+                neg_risk = bool(pos.get("negativeRisk", pos.get("negRisk", True)))
+            size = float(pos.get("size")) if (pos and pos.get("size")) else (t.size_shares or 0.0)
+
+            tx = redeem_position(
+                condition_id=cid,
+                size_shares=size,
+                neg_risk=neg_risk,
+                market_label=f"{t.city} {t.bin_label}",
+            )
+            if tx:
+                done_cids.add(cid)
+
+        # Let reconcile finalize PnL from the new REDEEM cash-flows
+        if done_cids:
+            logger.info(f"[auto_redeem] Redeemed {len(done_cids)} condition(s) — reconciling")
+            _job_reconcile_pnl()
+
+    except Exception as e:
+        logger.error(f"Auto-redeem job failed: {e}")
+    finally:
+        session.close()
+
+
 def _job_resolve_paper_trades() -> None:
     logger.info("JOB: resolve paper trades")
     try:
@@ -1158,6 +1241,7 @@ def setup_scheduler() -> None:
     schedule.every(15).minutes.do(_job_paper_trade_engine)
     schedule.every(15).minutes.do(_job_live_trade_engine)   # runtime emergency_stop check inside
     schedule.every(5).minutes.do(_job_tail_early_exit)       # G4-15: lock NO profit at ≥0.985
+    schedule.every(10).minutes.do(_job_auto_redeem)          # G4-17: redeem stuck wins on-chain
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(15).minutes.do(_job_settle_paper)   # G3-3: Gamma-based paper settlement
     schedule.every(60).minutes.do(_job_paper_trade_summary)
@@ -1223,9 +1307,12 @@ def run_initial_jobs() -> None:
     _job_snapshot_markets()
     _job_resolve_paper_trades()
     _job_settle_paper()         # G3-3: Gamma paper settlement on startup
-    _job_reconcile_pnl()       # G3-2: reconcile live PnL first
+    # Order matters after downtime: sell at bid FIRST (best outcome), then
+    # reconcile marks remaining wins pending_redeem, then redeem the no-bid ones.
+    _job_tail_early_exit()     # G4-15: capture early-exit window missed overnight
+    _job_reconcile_pnl()       # G3-2: finalize sells + mark wins pending_redeem
+    _job_auto_redeem()         # G4-17: redeem stuck wins (no bid / market closed)
     _job_resolve_live_trades()
-    _job_tail_early_exit()     # G4-15: lock winning NO positions on startup
     _job_paper_trade_engine()
     _job_live_trade_engine()
     _job_paper_trade_summary()

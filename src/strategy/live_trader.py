@@ -1119,7 +1119,7 @@ def run_tail_early_exit() -> None:
             session.execute(
                 select(LiveTrade).where(
                     LiveTrade.strategy_name == "tail_no",
-                    LiveTrade.status.in_(["open", "filled"]),
+                    LiveTrade.status.in_(["open", "filled", "pending_redeem"]),
                     LiveTrade.token_id.isnot(None),
                     LiveTrade.order_id.isnot(None),
                 )

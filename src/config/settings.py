@@ -60,6 +60,17 @@ class Settings(BaseSettings):
     # Set to your actual Polymarket USDC balance so Kelly stake is calculated correctly.
     live_wallet_balance_usd: float = Field(default=0.0)
 
+    # Auto-redeem (G4-17): on-chain redemption of won positions that reached
+    # resolution without an early-exit sell (no bid / market closed).
+    # Every broadcast is preflight-simulated (eth_call); a malformed call reverts
+    # in simulation and is skipped without spending gas.
+    auto_redeem_enabled: bool = Field(default=True)
+    redeem_min_matic: float = Field(default=0.02)   # skip if gas balance below this
+    # Polymarket Polygon contracts (mainnet)
+    ctf_address: str = Field(default="0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+    neg_risk_adapter_address: str = Field(default="0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+    usdc_collateral_address: str = Field(default="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+
     # Order entry price mode (G2-3)
     # 'ask' = best_ask + entry_tick (marketable limit, higher fill rate)
     # 'mid' = passive limit at mid-price (cheaper but may not fill on thin markets)
