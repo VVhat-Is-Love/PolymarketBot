@@ -53,9 +53,11 @@ def _make_rm(**kwargs):
         rm._open_bets = {}
         rm._reserved_usd = 0.0
         rm._basket_legs_open = 0
+        rm._tail_token_reserved = {}
         # Disable DB sync so tests run against pure in-memory state
         rm._load_live_stats = lambda: None
         rm._get_deployed_by_strategy = lambda: {}
+        rm._tail_committed_for_token = lambda token_id: 0.0  # no DB
         return rm
 
 
@@ -185,6 +187,51 @@ def test_emergency_stop_checked_before_daily_loss():
     ok, reason = rm.can_place_order(1.0)
     assert ok is False
     assert "Emergency stop" in reason  # not "Daily loss"
+
+
+# ---------------------------------------------------------------------------
+# G4-20: per-token_id aggregate tail cap (double-guard)
+# ---------------------------------------------------------------------------
+
+def test_tail_token_first_order_passes():
+    rm = _make_rm(tail_max_usd=18.0)  # tail_max_position_usd defaults 6.0
+    ok, reason = rm.can_place_tail_token("tokA", 4.0)
+    assert ok is True and reason == "ok"
+
+
+def test_tail_token_second_order_same_token_rejected():
+    """Two orders on the SAME token in one run: 2nd sees the 1st's reservation."""
+    rm = _make_rm()
+    ok1, _ = rm.can_place_tail_token("tokA", 4.0)   # reserves 4.0
+    ok2, reason2 = rm.can_place_tail_token("tokA", 4.0)  # 4+4=8 > 6 cap
+    assert ok1 is True
+    assert ok2 is False
+    assert "token_cap_reached" in reason2
+
+
+def test_tail_token_different_tokens_both_pass():
+    """Different bins/cities (different token_id) are NOT blocked by each other."""
+    rm = _make_rm()
+    ok1, _ = rm.can_place_tail_token("tokA", 5.0)
+    ok2, _ = rm.can_place_tail_token("tokB", 5.0)
+    assert ok1 is True and ok2 is True
+
+
+def test_tail_token_release_frees_reservation():
+    rm = _make_rm()
+    rm.can_place_tail_token("tokA", 4.0)
+    rm.release_tail_token_reservation("tokA", 4.0)
+    ok, _ = rm.can_place_tail_token("tokA", 5.0)  # cap not exceeded after release
+    assert ok is True
+
+
+def test_tail_token_respects_db_committed():
+    """DB already has $5 on the token → a $2 order (total $7) exceeds $6 cap."""
+    rm = _make_rm()
+    rm._tail_committed_for_token = lambda token_id: 5.0
+    ok, reason = rm.can_place_tail_token("tokA", 2.0)
+    assert ok is False
+    assert "token_cap_reached" in reason
 
 
 # ---------------------------------------------------------------------------

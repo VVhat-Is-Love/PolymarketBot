@@ -781,6 +781,12 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                     if not _verify_order_market(group.city, _mkt):
                         continue  # wrong-market guard — skip this tail order
 
+                    # G4-20: aggregate per-token cap (reserves notional this run)
+                    _tcan, _twhy = risk_manager.can_place_tail_token(_tok_no, _o.stake_usd)
+                    if not _tcan:
+                        logger.warning(f"[tail_no] {group.city} {_o.bin_label}: {_twhy}")
+                        continue
+
                     _tail_trade = LiveTrade(
                         id=str(uuid.uuid4()),
                         group_id=group.group_id,
@@ -838,6 +844,7 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                         _tail_trade.status = "cancelled"
                         _tail_trade.cancelled_at = datetime.utcnow()
                         session.commit()
+                        risk_manager.release_tail_token_reservation(_tok_no, _o.stake_usd)
                         logger.warning(
                             f"[tail_no] Order placement failed: "
                             f"{group.city} {_o.bin_label}"
@@ -1014,6 +1021,12 @@ def run_tail_engine() -> None:
                     if not _verify_order_market(group.city, mkt):
                         continue  # wrong-market guard — skip this tail order
 
+                    # G4-20: aggregate per-token cap (reserves notional this run)
+                    _tcan, _twhy = risk_manager.can_place_tail_token(token_no, o.stake_usd)
+                    if not _tcan:
+                        logger.warning(f"[tail_no] {group.city} {o.bin_label}: {_twhy}")
+                        continue
+
                     trade = LiveTrade(
                         id=str(uuid.uuid4()),
                         group_id=group.group_id,
@@ -1069,6 +1082,7 @@ def run_tail_engine() -> None:
                         trade.status = "cancelled"
                         trade.cancelled_at = datetime.utcnow()
                         session.commit()
+                        risk_manager.release_tail_token_reservation(token_no, o.stake_usd)
                         logger.warning(
                             f"[tail_no] Order placement failed for {o.market_id} "
                             f"({group.city} {o.bin_label})"

@@ -1472,9 +1472,56 @@ def _reset_phantom_paper_losses() -> None:
         session.close()
 
 
+def _void_legacy_paper_ledger() -> None:
+    """
+    G4-21: void paper trades settled BEFORE the ledger fix (G3-3 Gamma settler,
+    resolved_via='gamma_api'). Pre-fix settlements (resolved_via NULL /
+    'polymarket_api' / 'weather_api') used inflated stakes and the old loss path —
+    they pollute paper_loss_calc and falsely pause the paper engine.
+
+    Marks them status='voided_legacy' (excluded from paper_loss_calc). Idempotent:
+    re-running skips already-voided rows. Going forward, clean sims settle via
+    _job_settle_paper (gamma_api) and count normally.
+    """
+    session = get_session()
+    try:
+        rows: list[PaperTrade] = list(
+            session.execute(
+                select(PaperTrade).where(
+                    PaperTrade.pnl_usd.isnot(None),
+                    PaperTrade.pnl_usd < 0,
+                    PaperTrade.status.like("resolved%"),
+                    PaperTrade.status != "voided_legacy",
+                    (PaperTrade.resolved_via.is_(None))
+                    | (PaperTrade.resolved_via.notin_(["gamma_api"])),
+                )
+            ).scalars().all()
+        )
+        voided = 0
+        total = 0.0
+        for pt in rows:
+            total += pt.pnl_usd or 0.0
+            pt.status = "voided_legacy"
+            voided += 1
+        if voided:
+            session.commit()
+            logger.info(
+                f"[void_legacy_paper] Voided {voided} pre-ledger-fix paper losses "
+                f"(${total:.2f}) — excluded from paper_loss_calc"
+            )
+        else:
+            logger.info("[void_legacy_paper] No legacy paper trades to void")
+    except Exception as exc:
+        logger.warning(f"[void_legacy_paper] Failed: {exc}")
+        session.rollback()
+    finally:
+        session.close()
+
+
 def run_initial_jobs() -> None:
     logger.info("Running initial data collection on startup...")
     _reset_phantom_paper_losses()    # cancel flat -stake losses from broken settle path
+    _void_legacy_paper_ledger()      # G4-21: void pre-ledger-fix paper losses (phantom $65)
     _job_expire_stale_pending()
     _job_discover_markets()
     _job_fetch_open_meteo()

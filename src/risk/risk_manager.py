@@ -61,6 +61,8 @@ class RiskManager:
         # In-session reservations: notional pre-approved but not yet in DB
         self._reserved_usd: float = 0.0
         self._basket_legs_open: int = 0
+        # G4-20: per-token_id in-run reservations for tail aggregate cap
+        self._tail_token_reserved: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -197,19 +199,21 @@ class RiskManager:
                 # ── PAPER CONTOUR ────────────────────────────────────────────
                 # Exclusively PaperTrade rows — never touches live limits.
 
-                # Paper daily loss (36h)
+                # Paper daily loss (36h) — exclude voided legacy (pre-ledger-fix) sims
                 v = session.execute(
                     select(func.coalesce(func.sum(PaperTrade.pnl_usd), 0.0)).where(
                         PaperTrade.resolved_at >= cutoff_36h,
                         PaperTrade.pnl_usd < 0,
+                        PaperTrade.status != "voided_legacy",
                     )
                 ).scalar() or 0.0
                 self._paper_daily_loss = abs(float(v))
 
-                # Paper total loss (all-time)
+                # Paper total loss (all-time) — clean post-fix simulations only
                 v = session.execute(
                     select(func.coalesce(func.sum(PaperTrade.pnl_usd), 0.0)).where(
                         PaperTrade.pnl_usd < 0,
+                        PaperTrade.status != "voided_legacy",
                     )
                 ).scalar() or 0.0
                 self._paper_total_loss = abs(float(v))
@@ -217,7 +221,10 @@ class RiskManager:
                 # Detail for log: up to 5 contributing paper trades
                 paper_detail = session.execute(
                     select(PaperTrade.id, PaperTrade.city, PaperTrade.pnl_usd)
-                    .where(PaperTrade.pnl_usd < 0)
+                    .where(
+                        PaperTrade.pnl_usd < 0,
+                        PaperTrade.status != "voided_legacy",
+                    )
                     .order_by(PaperTrade.resolved_at.desc())
                     .limit(5)
                 ).all()
@@ -380,23 +387,43 @@ class RiskManager:
         """
         Check if paper trading is allowed against the virtual bankroll.
         Completely independent from live risk: paper losses NEVER block live.
+
+        G4-21: any alert from the paper contour is PAPER-labelled and uses neutral
+        wording — never the live-stop emoji/words (🛑 TOTAL STOP-LOSS /
+        ⚠️ DAILY LOSS LIMIT), so a paper threshold can never be mistaken for a
+        real live stop. Edge-triggered (one alert per block→unblock transition).
         """
         with self._lock:
             self._maybe_roll_day()
             self._load_live_stats()
 
+            blocked_reason = ""
             if self._paper_daily_loss >= self._paper_daily_loss_limit_usd:
-                return False, (
+                blocked_reason = (
                     f"Paper daily loss ${self._paper_daily_loss:.2f} >= "
                     f"limit ${self._paper_daily_loss_limit_usd:.2f}"
                 )
-
-            if self._paper_total_loss >= self._paper_total_stop_loss_usd:
-                return False, (
+            elif self._paper_total_loss >= self._paper_total_stop_loss_usd:
+                blocked_reason = (
                     f"Paper total loss ${self._paper_total_loss:.2f} >= "
                     f"virtual stop ${self._paper_total_stop_loss_usd:.2f}"
                 )
 
+            if blocked_reason:
+                if not getattr(self, "_paper_block_alerted", False):
+                    self._paper_block_alerted = True
+                    try:
+                        from src.notifications.telegram import get_notifier
+                        get_notifier().send(
+                            f"📊 PAPER (тест): симуляция на паузе — {blocked_reason}. "
+                            f"Это виртуальный бюджет, на live-торговлю не влияет."
+                        )
+                    except Exception:
+                        pass
+                return False, blocked_reason
+
+            # Unblocked → reset edge-trigger so the next block re-alerts
+            self._paper_block_alerted = False
             return True, "ok"
 
     def can_place_basket(self, notional: float, n_legs: int) -> tuple[bool, str]:
@@ -504,6 +531,66 @@ class RiskManager:
         with self._lock:
             self._reserved_usd = max(0.0, self._reserved_usd - notional)
             self._basket_legs_open = max(0, self._basket_legs_open - n_legs)
+
+    def _tail_committed_for_token(self, token_id: str) -> float:
+        """DB: Σ stake_usd of live tail positions already on this token_id."""
+        try:
+            from sqlalchemy import select, func
+            from src.db.session import get_session
+            from src.db.models import LiveTrade
+            session = get_session()
+            try:
+                v = session.execute(
+                    select(func.coalesce(func.sum(LiveTrade.stake_usd), 0.0)).where(
+                        LiveTrade.token_id == token_id,
+                        LiveTrade.strategy_name == "tail_no",
+                        LiveTrade.status.in_(["pending", "open", "filled"]),
+                    )
+                ).scalar() or 0.0
+                return float(v)
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"RiskManager: _tail_committed_for_token failed: {exc}")
+            return 0.0
+
+    def can_place_tail_token(self, token_id: str, notional: float) -> tuple[bool, str]:
+        """
+        G4-20: aggregate exposure cap PER token_id (double-guard).
+
+        committed = (open+pending+filled in DB) + (reserved earlier THIS run).
+        If committed + notional > tail_max_position_usd → reject token_cap_reached.
+        On pass, RESERVES notional for this token so a second order in the same
+        cycle sees the first order's commitment. Reservation is released by
+        release_tail_token_reservation() (call on failure) — successful orders
+        keep the reservation until _load_live_stats picks up the DB row.
+        """
+        from src.strategy.config import strategy_settings as ss
+        cap = getattr(ss, "tail_max_position_usd", 6.0)
+        if not token_id:
+            return True, "ok"
+        with self._lock:
+            committed = self._tail_committed_for_token(token_id)
+            committed += self._tail_token_reserved.get(token_id, 0.0)
+            if committed + notional > cap + 1e-9:
+                return False, (
+                    f"token_cap_reached: ${committed + notional:.2f} > "
+                    f"tail_max_position ${cap:.2f} (token={token_id[:10]}…)"
+                )
+            self._tail_token_reserved[token_id] = (
+                self._tail_token_reserved.get(token_id, 0.0) + notional
+            )
+            return True, "ok"
+
+    def release_tail_token_reservation(self, token_id: str, notional: float) -> None:
+        """Release a per-token tail reservation (on placement failure/cancel)."""
+        with self._lock:
+            cur = self._tail_token_reserved.get(token_id, 0.0)
+            new = max(0.0, cur - notional)
+            if new <= 1e-9:
+                self._tail_token_reserved.pop(token_id, None)
+            else:
+                self._tail_token_reserved[token_id] = new
 
     def can_place_order(self, bet_size_usd: float) -> tuple[bool, str]:
         """
