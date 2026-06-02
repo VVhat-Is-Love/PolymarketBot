@@ -13,8 +13,18 @@ from loguru import logger
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 REQUEST_DELAY = 0.3  # stay well within 500 req/10s limit for /events
 
-_FAILURE_THRESHOLD = 5
+# G4-24: classify failures. A read-timeout means Gamma is ALIVE but slow — it
+# must not trip the breaker on its own. A connection error / 5xx means Gamma is
+# DOWN — trip faster. Separate counters with separate thresholds.
+_HARD_FAILURE_THRESHOLD = 2   # connection error / 5xx → endpoint dead
+_TIMEOUT_THRESHOLD = 5        # consecutive read-timeouts → sustained slowness
 _COOLDOWN_MINUTES = 10
+
+# Discovery has a hard wall-clock budget so one slow page can't hang the whole
+# scheduler. Better to skip a cycle than block every other job behind it.
+_DISCOVERY_BUDGET_S = 90.0    # total time allowed for one get_all_weather_events
+_DISCOVERY_TIMEOUT_S = 20.0   # per-attempt HTTP read timeout for discovery pages
+_DISCOVERY_PAGE_RETRIES = 3   # in-cycle retries (with backoff) per page on timeout
 
 
 class GammaClient:
@@ -24,30 +34,72 @@ class GammaClient:
             "Accept": "application/json",
             "User-Agent": "polymarket-bot/0.1",
         })
-        self._consecutive_failures: int = 0
+        self._consec_hard: int = 0       # connection/5xx in a row
+        self._consec_timeout: int = 0    # read-timeouts in a row
         self._circuit_open_until: datetime | None = None
+        # Reason the last fetch returned nothing, for funnel attribution:
+        # "ok" | "breaker_open" | "timeout_budget" | "endpoint_error"
+        self._last_fetch_status: str = "ok"
+        self._last_fail_kind: str = ""
+
+    @property
+    def last_fetch_status(self) -> str:
+        return self._last_fetch_status
 
     def _is_circuit_open(self) -> bool:
         if self._circuit_open_until is None:
             return False
         if datetime.now() >= self._circuit_open_until:
             self._circuit_open_until = None
-            self._consecutive_failures = 0
+            self._consec_hard = 0
+            self._consec_timeout = 0
             logger.info("Gamma circuit breaker: cooldown finished, resuming")
             return False
         return True
 
-    def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= _FAILURE_THRESHOLD:
-            self._circuit_open_until = datetime.now() + timedelta(minutes=_COOLDOWN_MINUTES)
-            logger.warning(
-                f"Gamma circuit breaker OPEN — {self._consecutive_failures} consecutive failures. "
-                f"Pausing until {self._circuit_open_until:%H:%M:%S}"
-            )
+    @staticmethod
+    def _classify(exc: BaseException) -> str:
+        """timeout = alive-but-slow (read timeout / 429); hard = dead (connect/5xx)."""
+        # ReadTimeout is a Timeout but NOT a connection failure → soft.
+        if isinstance(exc, requests.exceptions.ReadTimeout):
+            return "timeout"
+        # ConnectTimeout/ConnectionError → endpoint unreachable → hard.
+        if isinstance(exc, (requests.exceptions.ConnectTimeout, requests.ConnectionError)):
+            return "hard"
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            code = exc.response.status_code
+            if code in (500, 502, 503, 504):
+                return "hard"
+            if code == 429:
+                return "timeout"  # rate-limited = slow, not dead
+            return "other"  # 400/403/404 — not a health signal
+        if isinstance(exc, requests.Timeout):
+            return "timeout"  # generic/unknown timeout — treat as soft
+        return "other"
+
+    def _open_circuit(self, reason: str) -> None:
+        self._circuit_open_until = datetime.now() + timedelta(minutes=_COOLDOWN_MINUTES)
+        logger.warning(
+            f"Gamma circuit breaker OPEN ({reason}) — "
+            f"hard={self._consec_hard} timeout={self._consec_timeout}. "
+            f"Pausing until {self._circuit_open_until:%H:%M:%S}"
+        )
+
+    def _record_failure(self, kind: str = "hard") -> None:
+        """kind: 'timeout' (soft) or 'hard'. Only sustained failure opens breaker."""
+        if kind == "timeout":
+            self._consec_timeout += 1
+            if self._consec_timeout >= _TIMEOUT_THRESHOLD:
+                self._open_circuit(f"{self._consec_timeout} consecutive read-timeouts")
+        elif kind == "hard":
+            self._consec_hard += 1
+            if self._consec_hard >= _HARD_FAILURE_THRESHOLD:
+                self._open_circuit(f"{self._consec_hard} consecutive connection/5xx errors")
+        # "other" (4xx) is not a health signal — don't touch the breaker.
 
     def _record_success(self) -> None:
-        self._consecutive_failures = 0
+        self._consec_hard = 0
+        self._consec_timeout = 0
 
     @staticmethod
     def _is_retryable(exc: BaseException) -> bool:
@@ -99,10 +151,67 @@ class GammaClient:
             return result.get("data", [])
         return result
 
-    def _paginate_events(self, **kwargs) -> list[dict]:
-        """Fetch all pages for a given set of get_events kwargs."""
+    def _get_once(self, path: str, params: dict | None = None,
+                  timeout: float = _DISCOVERY_TIMEOUT_S) -> list | dict:
+        """Single-attempt GET (no tenacity) for budget-bounded discovery paging."""
+        url = f"{GAMMA_BASE}{path}"
+        try:
+            resp = self._session.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        finally:
+            time.sleep(REQUEST_DELAY)
+
+    def _fetch_events_page(self, offset: int, limit: int, deadline: float | None,
+                           label: str, kwargs: dict) -> list[dict] | None:
+        """
+        Fetch ONE page with in-cycle backoff. Returns the page list ([] at end of
+        feed), or None to stop paginating (hard failure or budget/retries spent).
+        Records + classifies failures so the breaker only trips on real trouble.
+        """
+        params: dict = {"closed": "false", "active": "true", "limit": limit, "offset": offset}
+        if kwargs.get("tag_id") is not None:
+            params["tag_id"] = kwargs["tag_id"]
+        if kwargs.get("q") is not None:
+            params["q"] = kwargs["q"]
+
+        backoff = 2.0
+        last_kind = "timeout"
+        for attempt in range(1, _DISCOVERY_PAGE_RETRIES + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                last_kind = "timeout"
+                break
+            try:
+                result = self._get_once("/events", params=params)
+                data = result.get("data", []) if isinstance(result, dict) else result
+                return data or []
+            except Exception as e:
+                last_kind = self._classify(e)
+                logger.warning(
+                    f"Gamma /events {label} offset={offset} "
+                    f"attempt {attempt}/{_DISCOVERY_PAGE_RETRIES} [{last_kind}]: {e}"
+                )
+                if last_kind == "hard":
+                    break  # endpoint down — don't burn budget retrying
+                # soft (read-timeout / 429): back off within the deadline, retry
+                if attempt < _DISCOVERY_PAGE_RETRIES:
+                    sleep_for = backoff
+                    if deadline is not None:
+                        sleep_for = min(sleep_for, max(0.0, deadline - time.monotonic()))
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    backoff *= 2
+        # One failure per page give-up (NOT per retry attempt) — a single slow
+        # page must not, by itself, march the breaker toward open.
+        self._last_fail_kind = last_kind
+        self._record_failure(last_kind)
+        return None
+
+    def _paginate_events(self, deadline: float | None = None, **kwargs) -> list[dict]:
+        """Fetch all pages for a given set of get_events kwargs, within a budget."""
         if self._is_circuit_open():
             logger.debug("Gamma circuit open — skipping paginated fetch")
+            self._last_fetch_status = "breaker_open"
             return []
 
         all_events: list[dict] = []
@@ -111,26 +220,38 @@ class GammaClient:
         label = str(kwargs)
         pages = 0
         t0 = time.monotonic()
+        status = "ok"
+        self._last_fail_kind = ""
 
         while True:
-            try:
-                page = self.get_events(offset=offset, limit=limit, **kwargs)
-                if not page:
-                    break
-                all_events.extend(page)
-                pages += 1
-                logger.debug(f"Gamma /events {label} offset={offset}: {len(page)} events")
-                if len(page) < limit:
-                    break
-                offset += limit
-                self._record_success()
-            except Exception as e:
-                self._record_failure()
-                logger.error(f"Gamma /events {label} offset={offset}: {e}")
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    f"Gamma {label}: time budget exhausted at offset={offset} — "
+                    f"skipping rest of cycle"
+                )
+                status = "timeout_budget"
                 break
+            page = self._fetch_events_page(offset, limit, deadline, label, kwargs)
+            if page is None:
+                # Failure already recorded + classified in _fetch_events_page.
+                status = "endpoint_error" if self._last_fail_kind == "hard" else "timeout_budget"
+                break
+            if not page:
+                break
+            all_events.extend(page)
+            pages += 1
+            logger.debug(f"Gamma /events {label} offset={offset}: {len(page)} events")
+            self._record_success()
+            if len(page) < limit:
+                break
+            offset += limit
 
         elapsed = time.monotonic() - t0
-        logger.info(f"Gamma {label}: {len(all_events)} events in {pages} pages ({elapsed:.1f}s)")
+        logger.info(
+            f"Gamma {label}: {len(all_events)} events in {pages} pages "
+            f"({elapsed:.1f}s, status={status})"
+        )
+        self._last_fetch_status = status
         return all_events
 
     def get_prices_for_group(self, event_id: str) -> dict[str, float]:
@@ -144,7 +265,7 @@ class GammaClient:
             resp = self._get(f"/events/{event_id}")
             self._record_success()
         except Exception as e:
-            self._record_failure()
+            self._record_failure(self._classify(e))
             logger.warning(f"Gamma prices fetch failed for event {event_id}: {e}")
             return {}
 
@@ -187,17 +308,32 @@ class GammaClient:
         """
         Fetch weather events via targeted keyword search to avoid the 403 that
         Gamma returns when paginating beyond offset=900 on the full /events feed.
+
+        G4-24: bounded by a hard wall-clock budget so one slow page can't hang the
+        scheduler. last_fetch_status carries the reason a cycle came back short
+        ("ok" / "breaker_open" / "timeout_budget" / "endpoint_error").
         """
         seen_ids: set = set()
         all_events: list[dict] = []
+        deadline = time.monotonic() + _DISCOVERY_BUDGET_S
+        statuses: list[str] = []
 
         for keyword in ("temperature", "precipitation"):
-            page_events = self._paginate_events(q=keyword)
+            page_events = self._paginate_events(deadline=deadline, q=keyword)
+            statuses.append(self._last_fetch_status)
             new = [e for e in page_events if e.get("id") not in seen_ids]
             for e in new:
                 seen_ids.add(e["id"])
             all_events.extend(new)
-            logger.info(f"Gamma keyword={keyword!r}: {len(page_events)} events ({len(new)} new)")
+            logger.info(
+                f"Gamma keyword={keyword!r}: {len(page_events)} events ({len(new)} new) "
+                f"[status={self._last_fetch_status}]"
+            )
 
-        logger.info(f"Gamma: {len(all_events)} unique weather events fetched")
+        # Surface the worst reason (any non-ok) so discovery can attribute a 0-cycle.
+        final = next((s for s in statuses if s != "ok"), "ok")
+        self._last_fetch_status = final
+        logger.info(
+            f"Gamma: {len(all_events)} unique weather events fetched (status={final})"
+        )
         return all_events

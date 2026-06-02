@@ -164,8 +164,15 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
             saved_markets += 1
 
     session.close()
+    # G4-24: attribute the funnel every cycle. fetch_status distinguishes a
+    # genuinely empty/healthy feed from endpoint trouble so a 0-cycle is never
+    # ambiguous: "ok" = events arrived (any loss is filter); breaker_open /
+    # timeout_budget / endpoint_error = the fetch came back short, not the filter.
+    fetch_status = getattr(gamma, "last_fetch_status", "ok")
+    cause = "filter" if fetch_status == "ok" else fetch_status
     logger.info(
-        f"Discovery funnel: {len(active_events)} active → "
+        f"Discovery funnel: fetch_status={fetch_status} cause={cause} | "
+        f"{len(active_events)} active → "
         f"−{funnel['keyword']} non-weather title → −{funnel['volume']} low-vol → "
         f"−{funnel['city']} city-miss → −{funnel['metric']} metric-miss → "
         f"−{funnel['date']} date-miss → {saved_groups} groups kept"
