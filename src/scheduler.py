@@ -772,6 +772,30 @@ def _job_reconcile_pnl() -> None:
         session.close()
 
 
+def _audit_verdict(
+    filled: bool, has_redeem: bool, sold: bool,
+    stored_pnl: float, activity_pnl: float, tol: float = 0.01,
+) -> str:
+    """
+    G4-22: three-way diagnostic verdict for one token's audit line.
+
+    Pure function (no DB/network) so the rule is unit-testable. Returns one of
+    "OK", "PENDING_REDEEM", or "DRIFT Δ=$X". The two auto-repaired classes
+    (phantom / win-as-loss) are handled by the caller and short-circuit this.
+    """
+    delta = stored_pnl - activity_pnl
+    if abs(delta) < tol:
+        return "OK"
+    if not filled:
+        # No BUY on Polymarket: OK only if nothing was stored (honest pending).
+        return "OK" if stored_pnl == 0 else f"DRIFT Δ=${delta:+.4f}"
+    if not (has_redeem or sold):
+        # Filled winner, resolved but neither redeemed nor sold → still hanging.
+        return "PENDING_REDEEM"
+    # Filled AND finalized but stored disagrees with /activity by ≥ tol.
+    return f"DRIFT Δ=${delta:+.4f}"
+
+
 def _job_audit_activity() -> None:
     """
     G4-19: audit every resolved/reconciled live trade against /activity and
@@ -782,9 +806,22 @@ def _job_audit_activity() -> None:
       • win-as-loss — REDEEM credit exists but stored pnl is negative → fix to the
                    /activity value +(payout−cost) (e.g. Seoul: +$0.74 stored −$6.03)
 
-    Sold positions (per-lot locked_pnl, no REDEEM) are NOT touched. Pure-visibility
-    audit line for every trade:
-      [audit] {city} {bin} stored=$X activity=$Y filled={bool} → {OK|FIX:...}
+    Sold positions (per-lot locked_pnl, no REDEEM) are NOT touched.
+
+    G4-22: the per-trade verdict is no longer binary OK/FIX. A drift no longer
+    hides behind OK. Three explicit diagnostic verdicts (in addition to FIX:* for
+    the two auto-repaired classes):
+      • OK             — abs(stored − activity) < $0.01, OR honest pending
+                         (not filled, nothing stored).
+      • PENDING_REDEEM — filled winner, resolved but neither redeemed nor sold:
+                         win recorded before REDEEM is realized (e.g. Seattle).
+                         Surfaced as waiting, NOT OK, so hung positions are visible.
+      • DRIFT Δ=$X     — filled AND finalized (redeem/sell) but stored ≠ /activity
+                         truth by ≥ $0.01 (e.g. Milan/Austin/Atlanta/Chicago):
+                         the local PnL estimate has diverged from the source of truth.
+
+    Audit line for every trade:
+      [audit] {city} {bin} stored=$X activity=$Y filled={b} redeem={b} sold={b} → {verdict}
     """
     from collections import defaultdict as _dd
     from src.config.settings import settings
@@ -829,8 +866,10 @@ def _job_audit_activity() -> None:
             primary = max(trades, key=lambda t: (t.pnl_usd is not None, t.placed_at or datetime.min))
             cid = primary.condition_id or ""
             has_redeem = cid in redeemed
+            sold = any((t.status or "") == "sold" for t in trades)
 
-            verdict = "OK"
+            verdict = None
+            # --- Repairs (unchanged): act on the two unambiguous classes ---
             # Phantom: never filled on Polymarket
             if not filled and any(t.status != "not_filled" for t in trades):
                 for t in trades:
@@ -852,10 +891,16 @@ def _job_audit_activity() -> None:
                 verdict = f"FIX:win {activity_pnl:+.4f}"
                 fixes += 1
 
+            # --- Three-way diagnostic verdict (G4-22): no silent OK on drift ---
+            if verdict is None:
+                verdict = _audit_verdict(
+                    filled, has_redeem, sold, stored_pnl, activity_pnl
+                )
+
             logger.info(
                 f"[audit] {primary.city or primary.group_id} {primary.bin_label} "
                 f"stored=${stored_pnl:+.4f} activity=${activity_pnl:+.4f} "
-                f"filled={filled} redeem={has_redeem} → {verdict}"
+                f"filled={filled} redeem={has_redeem} sold={sold} → {verdict}"
             )
 
         if fixes:
