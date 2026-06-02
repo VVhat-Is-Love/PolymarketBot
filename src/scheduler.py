@@ -551,7 +551,10 @@ def _job_reconcile_pnl() -> None:
     from collections import defaultdict as _dd
     from datetime import timedelta
     from src.config.settings import settings
-    from src.market.polymarket_data import get_activity, realized_pnl_by_token, buy_shares_by_token
+    from src.market.polymarket_data import (
+        get_activity, realized_pnl_by_token, buy_shares_by_token,
+        redeem_payout_by_condition,
+    )
     from src.notifications.telegram import get_notifier
 
     if not settings.proxy_wallet_address:
@@ -594,21 +597,10 @@ def _job_reconcile_pnl() -> None:
             return bought >= (want - tol)
 
         # --- Build REDEEM helpers from raw activity ---
-        # conditionIds that have had a REDEEM event (winning positions)
-        redeemed_cids: set[str] = set()
-        # Total REDEEM payout per conditionId (shown as ui_value in log)
-        redeem_payouts: dict[str, float] = {}
-        for _a in activity:
-            if _a.get("type", "").upper() == "REDEEM":
-                _cid = _a.get("conditionId", "")
-                if _cid:
-                    redeemed_cids.add(_cid)
-                    try:
-                        redeem_payouts[_cid] = (
-                            redeem_payouts.get(_cid, 0.0) + float(_a.get("usdcSize") or 0)
-                        )
-                    except (TypeError, ValueError):
-                        pass
+        # G4-23: de-duplicate NegRisk twin-index REDEEM rows so the payout (and
+        # thus the stored PnL written below) is net, not double-counted.
+        redeem_payouts: dict[str, float] = redeem_payout_by_condition(activity)
+        redeemed_cids: set[str] = set(redeem_payouts.keys())
 
         # Gamma caches — one API call per group_id
         resolved_cache: dict[str, bool] = {}

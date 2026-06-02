@@ -77,6 +77,55 @@ def get_positions(wallet: str, redeemable: bool | None = None) -> list[dict[str,
         return []
 
 
+def _redeem_amount_by_event(activity: list[dict]) -> dict[tuple[str, str], float]:
+    """
+    De-duplicated REDEEM payout per (conditionId, on-chain event).
+
+    G4-23: a NegRisk redemption — redeemPositions(conditionId, [yesIdx, noIdx]) —
+    reports the GROSS payout on EACH index row in /activity. The winning index
+    carries the full $1/share, the losing index carries the same gross again
+    (or $0), so naively summing every REDEEM row double-counts the payout
+    (Seoul +$0.74 → +$7.45, Chicago +$0.57 → +$7.16 = 2×redeem − cost).
+
+    We collapse rows that belong to the SAME on-chain redemption to a single
+    payout. Identity = (conditionId, transactionHash) when a hash is present,
+    else (conditionId, timestamp). Within one identity the rows are the same
+    economic event, so we keep the MAX usdcSize (the winning leg) ONCE. Two
+    genuinely separate redeems of the same condition (different tx/timestamp)
+    keep distinct identities and are both counted.
+    """
+    amt_by_event: dict[tuple[str, str], float] = {}
+    for a in activity:
+        if a.get("type", "").upper() != "REDEEM":
+            continue
+        cid = a.get("conditionId", "")
+        if not cid:
+            continue
+        try:
+            amt = float(a.get("usdcSize") or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        txid = (
+            a.get("transactionHash")
+            or a.get("transaction_hash")
+            or a.get("hash")
+            or str(a.get("timestamp", ""))
+        )
+        key = (cid, str(txid))
+        # Same on-chain event reported on both index rows → count once (max leg).
+        if amt > amt_by_event.get(key, 0.0):
+            amt_by_event[key] = amt
+    return amt_by_event
+
+
+def redeem_payout_by_condition(activity: list[dict]) -> dict[str, float]:
+    """De-duplicated total REDEEM payout per conditionId (G4-23). UI/ledger truth."""
+    out: dict[str, float] = defaultdict(float)
+    for (cid, _txid), amt in _redeem_amount_by_event(activity).items():
+        out[cid] += amt
+    return dict(out)
+
+
 def realized_pnl_by_token(activity: list[dict]) -> dict[str, float]:
     """
     Aggregate realized PnL per token_id from cash flows.
@@ -87,6 +136,10 @@ def realized_pnl_by_token(activity: list[dict]) -> dict[str, float]:
     BUY token bought for that conditionId (confirmed: each resolved conditionId
     has exactly one winning BUY asset). Falls back to keying by "cond:<id>" in
     the rare case of multiple BUY tokens per condition (e.g. averaged-in).
+
+    REDEEM payouts are de-duplicated per on-chain event first (see
+    _redeem_amount_by_event) — NegRisk reports the gross payout on every index
+    row, which would otherwise double-count the win.
     """
     # Pass 1: build conditionId → [token_ids] map from BUY activity
     cond_tokens: dict[str, list[str]] = defaultdict(list)
@@ -97,36 +150,35 @@ def realized_pnl_by_token(activity: list[dict]) -> dict[str, float]:
             if token and cid:
                 cond_tokens[cid].append(token)
 
-    # Pass 2: aggregate PnL per token_id
+    # Pass 2: TRADE cash flows (BUY debit / SELL proceeds) inline
     pnl: dict[str, float] = defaultdict(float)
     for a in activity:
-        t = a.get("type", "").upper()
+        if a.get("type", "").upper() != "TRADE":
+            continue
         try:
             amt = float(a.get("usdcSize") or 0)
         except (TypeError, ValueError):
             amt = 0.0
-
         token = a.get("asset", "")
-        cid = a.get("conditionId", "")
+        side = a.get("side", "").upper()
+        if side == "BUY" and token:
+            pnl[token] -= amt
+        elif side == "SELL" and token:
+            pnl[token] += amt
 
-        if t == "TRADE":
-            side = a.get("side", "").upper()
-            if side == "BUY" and token:
-                pnl[token] -= amt
-            elif side == "SELL" and token:
-                pnl[token] += amt
-        elif t == "REDEEM":
-            tokens = cond_tokens.get(cid, [])
-            if len(tokens) == 1:
-                pnl[tokens[0]] += amt
-            elif tokens:
-                # Multiple BUY tokens for same condition (averaged-in): split evenly
-                per = amt / len(tokens)
-                for tok in tokens:
-                    pnl[tok] += per
-            else:
-                # No matching BUY found — fall back to conditionId key
-                pnl[f"cond:{cid}"] += amt
+    # Pass 3: REDEEM payouts — de-duplicated per on-chain event, then routed to token
+    for (cid, _txid), amt in _redeem_amount_by_event(activity).items():
+        tokens = cond_tokens.get(cid, [])
+        if len(tokens) == 1:
+            pnl[tokens[0]] += amt
+        elif tokens:
+            # Multiple BUY tokens for same condition (averaged-in): split evenly
+            per = amt / len(tokens)
+            for tok in tokens:
+                pnl[tok] += per
+        else:
+            # No matching BUY found — fall back to conditionId key
+            pnl[f"cond:{cid}"] += amt
 
     return dict(pnl)
 

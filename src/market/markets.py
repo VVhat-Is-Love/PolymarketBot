@@ -67,6 +67,10 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
 
     saved_groups = 0
     saved_markets = 0
+    # G4-23 diagnostic: per-stage discovery funnel so a 0-result cycle is
+    # attributable in one line — distinguishes "endpoint returned nothing"
+    # from "keyword/city/metric filter cut everything" (e.g. Polymarket retitled).
+    funnel = {"keyword": 0, "volume": 0, "city": 0, "metric": 0, "date": 0}
 
     for event in active_events:
         title: str = event.get("title") or ""
@@ -74,26 +78,31 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
 
         # 1. Only temperature / precipitation events
         if not any(kw in title_lower for kw in _WEATHER_KEYWORDS):
+            funnel["keyword"] += 1
             continue
 
         # 2. Volume filter at event level
         event_volume = float(event.get("volume") or 0)
         if event_volume < MIN_VOLUME:
+            funnel["volume"] += 1
             continue
 
         # 3. City must be in our whitelist
         city = parse_city_from_title(title, CITIES_WHITELIST)
         if not city:
+            funnel["city"] += 1
             continue
         city = canonical_city(city)  # G3-5: ensure canonical form (e.g. Nyc → New York)
 
         # 4. Metric and resolution date
         metric = parse_metric_from_title(title)
         if not metric:
+            funnel["metric"] += 1
             continue
 
         res_date = parse_date_from_title(title)
         if not res_date:
+            funnel["date"] += 1
             continue
 
         # 5. Weather station (description fallback to whitelist default)
@@ -155,5 +164,11 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
             saved_markets += 1
 
     session.close()
+    logger.info(
+        f"Discovery funnel: {len(active_events)} active → "
+        f"−{funnel['keyword']} non-weather title → −{funnel['volume']} low-vol → "
+        f"−{funnel['city']} city-miss → −{funnel['metric']} metric-miss → "
+        f"−{funnel['date']} date-miss → {saved_groups} groups kept"
+    )
     logger.info(f"Discovery complete: {saved_groups} groups, {saved_markets} markets saved")
     return saved_markets

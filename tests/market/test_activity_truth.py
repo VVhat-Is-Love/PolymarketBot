@@ -3,6 +3,7 @@ from src.market.polymarket_data import (
     realized_pnl_by_token,
     buy_shares_by_token,
     redeemed_condition_ids,
+    redeem_payout_by_condition,
 )
 
 
@@ -65,3 +66,60 @@ def test_phantom_token_absent_from_pnl():
     # No BUY → token never appears → caller treats as not_filled (excluded)
     pnl = realized_pnl_by_token(_seoul_win())
     assert "lucknow_no" not in pnl
+
+
+# ---------------------------------------------------------------------------
+# G4-23: NegRisk twin-index REDEEM rows must not double-count the payout
+# ---------------------------------------------------------------------------
+
+def _chicago_negrisk_double_redeem():
+    # Bought NO @0.913 ($6.02 / 6.59 sh); resolution emits TWO REDEEM rows for
+    # the SAME on-chain tx (yes-index + no-index) each carrying the gross $6.59.
+    # Net truth = 6.59 − 6.02 = +$0.57, NOT 2×6.59 − 6.02 = +$7.16.
+    return [
+        {"type": "TRADE", "side": "BUY", "asset": "chi_no",
+         "size": "6.59", "usdcSize": "6.02", "conditionId": "cid_chi"},
+        {"type": "REDEEM", "asset": "", "usdcSize": "6.59",
+         "conditionId": "cid_chi", "transactionHash": "0xabc"},
+        {"type": "REDEEM", "asset": "", "usdcSize": "6.59",
+         "conditionId": "cid_chi", "transactionHash": "0xabc"},
+    ]
+
+
+def test_negrisk_double_redeem_not_double_counted():
+    pnl = realized_pnl_by_token(_chicago_negrisk_double_redeem())
+    assert round(pnl["chi_no"], 2) == 0.57   # net, NOT +7.16
+
+
+def test_negrisk_roi_within_yield_ceiling():
+    # ROI must never exceed (1/entry − 1). entry ≈ 6.02/6.59 = 0.9135 → ceil ≈ 9.5%
+    pnl = realized_pnl_by_token(_chicago_negrisk_double_redeem())
+    cost, shares = 6.02, 6.59
+    entry = cost / shares
+    ceiling = (1.0 / entry - 1.0) * cost  # max $ profit
+    assert pnl["chi_no"] <= ceiling + 1e-6
+
+
+def test_redeem_payout_dedup_by_condition():
+    # Two twin rows of one tx → single $6.59 payout, not $13.18
+    payouts = redeem_payout_by_condition(_chicago_negrisk_double_redeem())
+    assert round(payouts["cid_chi"], 2) == 6.59
+
+
+def test_distinct_redeems_same_condition_both_counted():
+    # Two SEPARATE redemptions (different tx) of the same cid are both real
+    act = [
+        {"type": "TRADE", "side": "BUY", "asset": "tok", "size": "10",
+         "usdcSize": "5.00", "conditionId": "cid_x"},
+        {"type": "REDEEM", "asset": "", "usdcSize": "3.00",
+         "conditionId": "cid_x", "transactionHash": "0x1"},
+        {"type": "REDEEM", "asset": "", "usdcSize": "3.00",
+         "conditionId": "cid_x", "transactionHash": "0x2"},
+    ]
+    assert round(redeem_payout_by_condition(act)["cid_x"], 2) == 6.00
+
+
+def test_single_redeem_unchanged():
+    # Regression: the ordinary single-redeem win still nets +0.74
+    pnl = realized_pnl_by_token(_seoul_win())
+    assert round(pnl["seoul_no"], 2) == 0.74
