@@ -205,6 +205,35 @@ def buy_shares_by_token(activity: list[dict]) -> dict[str, float]:
     return dict(shares)
 
 
+def open_cost_by_token(activity: list[dict]) -> dict[str, float]:
+    """
+    Current open USD exposure per token_id from /activity cash flows:
+        Σ(BUY usdcSize) − Σ(SELL usdcSize), floored at 0.
+
+    G4-25: the token-cap double-guard uses this so an order that FAILED on the
+    client but actually executed on-chain (status=None / timeout) still counts
+    toward the per-token cap — the DB alone misses it (recorded cancelled/absent).
+    A sold position nets back toward 0, so legitimate re-entry isn't blocked.
+    """
+    cost: dict[str, float] = defaultdict(float)
+    for a in activity:
+        if a.get("type", "").upper() != "TRADE":
+            continue
+        token = a.get("asset", "")
+        if not token:
+            continue
+        try:
+            amt = float(a.get("usdcSize") or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        side = a.get("side", "").upper()
+        if side == "BUY":
+            cost[token] += amt
+        elif side == "SELL":
+            cost[token] -= amt
+    return {tok: v for tok, v in cost.items() if v > 1e-9}
+
+
 def redeemed_condition_ids(activity: list[dict]) -> set[str]:
     """Set of conditionIds that have a REDEEM cash-in event (winning positions)."""
     out: set[str] = set()

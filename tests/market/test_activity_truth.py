@@ -4,6 +4,7 @@ from src.market.polymarket_data import (
     buy_shares_by_token,
     redeemed_condition_ids,
     redeem_payout_by_condition,
+    open_cost_by_token,
 )
 
 
@@ -123,3 +124,36 @@ def test_single_redeem_unchanged():
     # Regression: the ordinary single-redeem win still nets +0.74
     pnl = realized_pnl_by_token(_seoul_win())
     assert round(pnl["seoul_no"], 2) == 0.74
+
+
+# ---------------------------------------------------------------------------
+# G4-25: open_cost_by_token — on-chain exposure for the token-cap double-guard
+# ---------------------------------------------------------------------------
+
+def test_open_cost_counts_buy():
+    act = [{"type": "TRADE", "side": "BUY", "asset": "tok", "usdcSize": "6.00"}]
+    assert round(open_cost_by_token(act)["tok"], 2) == 6.00
+
+
+def test_open_cost_nets_sell_to_zero():
+    # Fully sold position → no longer counts toward the cap (token absent)
+    act = [
+        {"type": "TRADE", "side": "BUY", "asset": "tok", "usdcSize": "6.00"},
+        {"type": "TRADE", "side": "SELL", "asset": "tok", "usdcSize": "6.10"},
+    ]
+    assert "tok" not in open_cost_by_token(act)
+
+
+def test_open_cost_partial_sell():
+    act = [
+        {"type": "TRADE", "side": "BUY", "asset": "tok", "usdcSize": "6.00"},
+        {"type": "TRADE", "side": "SELL", "asset": "tok", "usdcSize": "2.00"},
+    ]
+    assert round(open_cost_by_token(act)["tok"], 2) == 4.00
+
+
+def test_open_cost_failed_but_executed_order_is_counted():
+    # The Dallas case: an order that errored on the client but executed on-chain
+    # still shows a BUY → cap must see it even though the DB recorded nothing.
+    act = [{"type": "TRADE", "side": "BUY", "asset": "dallas_no", "usdcSize": "6.00"}]
+    assert open_cost_by_token(act).get("dallas_no", 0.0) == 6.00

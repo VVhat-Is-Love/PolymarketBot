@@ -533,25 +533,51 @@ class RiskManager:
             self._basket_legs_open = max(0, self._basket_legs_open - n_legs)
 
     def _tail_committed_for_token(self, token_id: str) -> float:
-        """DB: Σ stake_usd of live tail positions already on this token_id."""
+        """
+        Committed USD already on this token_id = max(DB intent, on-chain /activity).
+
+        G4-25: take the MAX of the local DB sum and the actual on-chain BUY
+        exposure from /activity. A transient placement error (status=None /
+        timeout) can leave an order recorded cancelled/absent in the DB while it
+        executed on-chain; counting only the DB would let a retry double the fill
+        (the Dallas $12 bug). max() picks up the on-chain reality without
+        double-counting an order present in both.
+        """
+        db_val = 0.0
         try:
             from sqlalchemy import select, func
             from src.db.session import get_session
             from src.db.models import LiveTrade
             session = get_session()
             try:
-                v = session.execute(
+                db_val = float(session.execute(
                     select(func.coalesce(func.sum(LiveTrade.stake_usd), 0.0)).where(
                         LiveTrade.token_id == token_id,
                         LiveTrade.strategy_name == "tail_no",
                         LiveTrade.status.in_(["pending", "open", "filled"]),
                     )
-                ).scalar() or 0.0
-                return float(v)
+                ).scalar() or 0.0)
             finally:
                 session.close()
         except Exception as exc:
-            logger.warning(f"RiskManager: _tail_committed_for_token failed: {exc}")
+            logger.warning(f"RiskManager: _tail_committed_for_token (DB) failed: {exc}")
+
+        onchain = self._onchain_committed_for_token(token_id)
+        return max(db_val, onchain)
+
+    def _onchain_committed_for_token(self, token_id: str) -> float:
+        """Actual open USD exposure on this token from /activity (BUY−SELL)."""
+        if not token_id:
+            return 0.0
+        try:
+            from src.config.settings import settings
+            from src.market.polymarket_data import get_activity, open_cost_by_token
+            wallet = settings.proxy_wallet_address
+            if not wallet:
+                return 0.0
+            return float(open_cost_by_token(get_activity(wallet)).get(token_id, 0.0))
+        except Exception as exc:
+            logger.warning(f"RiskManager: _onchain_committed_for_token failed: {exc}")
             return 0.0
 
     def can_place_tail_token(self, token_id: str, notional: float) -> tuple[bool, str]:
@@ -569,9 +595,12 @@ class RiskManager:
         cap = getattr(ss, "tail_max_position_usd", 6.0)
         if not token_id:
             return True, "ok"
+        # Compute committed (DB + on-chain /activity) OUTSIDE the lock — it may
+        # hit the network; holding the risk lock through pagination would stall
+        # every other risk check. The reservation update below stays atomic.
+        committed_external = self._tail_committed_for_token(token_id)
         with self._lock:
-            committed = self._tail_committed_for_token(token_id)
-            committed += self._tail_token_reserved.get(token_id, 0.0)
+            committed = committed_external + self._tail_token_reserved.get(token_id, 0.0)
             if committed + notional > cap + 1e-9:
                 return False, (
                     f"token_cap_reached: ${committed + notional:.2f} > "
