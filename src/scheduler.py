@@ -176,6 +176,243 @@ def _job_tail_early_exit() -> None:
         logger.error(f"Tail early-exit job failed: {e}")
 
 
+def _classify_imported_token(
+    net_usd: float,
+    cid: str | None,
+    redeemed_cids: set,
+    pos: dict | None,
+    gamma_resolved: bool | None,
+    min_usd: float = 1.0,
+) -> str:
+    """
+    G4-26: classify ONE on-chain token before assigning a DB status. Pure (no
+    DB/network) so the rule is unit-testable. Returns "open" | "pending_redeem"
+    | "skip". Priority:
+
+      1. conditionId already has a REDEEM in /activity → skip (position closed).
+      2. net BUY−SELL below the noise floor → skip (sold / flat).
+      3. /positions known:
+           redeemable=True OR curPrice≥0.99            → pending_redeem (won).
+           live curPrice (≥0.02) and Gamma not resolved → open.
+           live curPrice but Gamma resolved             → pending_redeem.
+           curPrice≈0: Gamma resolved → pending_redeem; live → open; unknown →
+             pending_redeem (don't risk a SELL on a maybe-dead market).
+      4. not in /positions: fall back to Gamma (resolved→pending_redeem, live→open).
+      5. SAFE DEFAULT when neither /positions nor Gamma can tell → pending_redeem,
+         NEVER open (the invariant: resolved must never land in open).
+    """
+    if cid and cid in redeemed_cids:
+        return "skip"
+    if net_usd < min_usd:
+        return "skip"
+    if pos is not None:
+        try:
+            cur = float(pos.get("curPrice") or 0)
+        except (TypeError, ValueError):
+            cur = 0.0
+        if pos.get("redeemable") or cur >= 0.99:
+            return "pending_redeem"
+        if cur >= 0.02:
+            return "pending_redeem" if gamma_resolved is True else "open"
+        # curPrice ≈ 0 — resolved-lost or deep-OTM-live; need the resolution signal.
+        if gamma_resolved is True:
+            return "pending_redeem"
+        if gamma_resolved is False:
+            return "open"
+        return "pending_redeem"  # unknown → safe default
+    # Not present in /positions.
+    if gamma_resolved is True:
+        return "pending_redeem"
+    if gamma_resolved is False:
+        return "open"
+    return "pending_redeem"  # no /positions AND no Gamma → safe default
+
+
+def _import_apply_canonical(
+    session, token_id, net_usd, shares, verdict,
+    existing, cid, gid, city, bin_label, market_id, strat,
+):
+    """
+    Ensure EXACTLY ONE canonical live row per token carries the full on-chain
+    exposure with status=verdict. Idempotent: reuses an existing open/pending row
+    instead of inserting. Other rows for the same token are demoted to not_filled
+    so deployed/open_bets count the position ONCE (a UI position = one token),
+    while the canonical row keeps the REAL exposure (Dallas $11.22, not collapsed).
+    """
+    canonical = next(
+        (r for r in existing if r.status in ("open", "filled", "pending_redeem")), None
+    )
+    if canonical is None:
+        promotable = [
+            r for r in existing
+            if r.status in ("not_filled", "cancelled", "pending", "expired")
+        ]
+        if promotable:
+            canonical = max(promotable, key=lambda r: r.placed_at or datetime.min)
+    if canonical is None and not existing:
+        canonical = LiveTrade(
+            market_id=market_id or "imported", bin_label=bin_label or "?",
+            side="buy", status="pending", strategy_name=strat or "tail_no",
+            group_id=gid, city=city, condition_id=cid, token_id=token_id,
+        )
+        session.add(canonical)
+    if canonical is None:
+        return
+
+    canonical.status = verdict
+    canonical.token_id = token_id
+    canonical.condition_id = canonical.condition_id or cid
+    canonical.group_id = canonical.group_id or gid
+    canonical.city = canonical.city or city
+    canonical.bin_label = canonical.bin_label or bin_label
+    canonical.market_id = canonical.market_id or market_id or "imported"
+    canonical.strategy_name = canonical.strategy_name or strat or "tail_no"
+    canonical.stake_usd = round(net_usd, 4)          # ACTUAL exposure, not collapsed
+    if shares:
+        canonical.size_shares = round(shares, 4)
+    if not canonical.order_id:
+        canonical.order_id = f"imported-onchain:{token_id[:16]}"
+    canonical.reconciled_with_polymarket = False     # let reconcile finalize PnL
+
+    # Collapse duplicate live rows for this token → one counted position.
+    for r in existing:
+        if r is not canonical and r.status in ("open", "filled", "pending", "pending_redeem"):
+            r.status = "not_filled"
+
+
+def _job_import_onchain_positions(dry_run: bool | None = None) -> None:
+    """
+    G4-26: reconcile the DB from /activity as the source of truth for position
+    EXISTENCE. Resurrect mislabeled not_filled/cancelled rows and create missing
+    rows for real on-chain BUYs — but classify each token (open vs pending_redeem
+    vs skip) via /positions.redeemable + Gamma BEFORE writing, never blindly.
+
+    DRY-RUN by default (settings.onchain_import_dry_run): logs the full per-token
+    classification every cycle and writes NOTHING, so it can be eye-checked
+    against the UI first. Idempotent once applied (keyed by token, no blind insert).
+    """
+    from collections import defaultdict as _dd
+    from src.config.settings import settings
+    from src.market.polymarket_data import (
+        get_activity, get_positions, open_cost_by_token,
+        redeemed_condition_ids, buy_shares_by_token,
+    )
+
+    if settings.trading_mode.lower() != "live" or not settings.proxy_wallet_address:
+        return
+    if dry_run is None:
+        dry_run = settings.onchain_import_dry_run
+    min_usd = float(getattr(settings, "onchain_import_min_usd", 1.0))
+
+    activity = get_activity(settings.proxy_wallet_address)
+    open_cost = open_cost_by_token(activity)
+    redeemed = redeemed_condition_ids(activity)
+    buy_shares = buy_shares_by_token(activity)
+
+    pos_by_cid: dict[str, dict] = {}
+    pos_by_token: dict[str, dict] = {}
+    try:
+        for p in get_positions(settings.proxy_wallet_address) or []:
+            c = p.get("conditionId")
+            if c:
+                pos_by_cid[c] = p
+            a = str(p.get("asset") or "")
+            if a:
+                pos_by_token[a] = p
+    except Exception as exc:
+        logger.warning(f"[import] /positions unavailable: {exc}")
+
+    gres_cache: dict[str, bool | None] = {}
+
+    def _gres(gid: str | None) -> bool | None:
+        if not gid:
+            return None
+        if gid not in gres_cache:
+            try:
+                prices = _gamma.get_prices_for_group(gid)
+                gres_cache[gid] = (max(prices.values()) >= 0.99) if prices else None
+            except Exception:
+                gres_cache[gid] = None
+        return gres_cache[gid]
+
+    session = get_session()
+    try:
+        rows_by_token: dict[str, list] = _dd(list)
+        for t in session.execute(
+            select(LiveTrade).where(LiveTrade.token_id.isnot(None))
+        ).scalars():
+            rows_by_token[t.token_id].append(t)
+
+        meta_by_token: dict[str, tuple] = {}
+        for m in session.execute(select(Market)).scalars():
+            if m.token_id_no:
+                meta_by_token[m.token_id_no] = (m, "no")
+            if m.token_id_yes:
+                meta_by_token[m.token_id_yes] = (m, "yes")
+        city_by_group = {
+            g.group_id: g.city for g in session.execute(select(MarketGroup)).scalars()
+        }
+
+        verdict_counts: dict[str, int] = _dd(int)
+        changed = 0
+        for token_id, net in sorted(open_cost.items(), key=lambda x: -x[1]):
+            existing = rows_by_token.get(token_id, [])
+            cid = gid = city = bin_label = market_id = None
+            strat = "tail_no"
+            if existing:
+                e = max(existing, key=lambda r: (r.order_id is not None, r.placed_at or datetime.min))
+                cid, gid, city, bin_label, market_id = (
+                    e.condition_id, e.group_id, e.city, e.bin_label, e.market_id
+                )
+                strat = e.strategy_name or "tail_no"
+            elif token_id in meta_by_token:
+                m, side_kind = meta_by_token[token_id]
+                cid, gid, bin_label, market_id = (
+                    m.condition_id, m.group_id, m.bin_label, m.market_id
+                )
+                city = city_by_group.get(gid)
+                strat = "tail_no" if side_kind == "no" else "basket_narrow"
+
+            pos = pos_by_token.get(token_id) or (pos_by_cid.get(cid) if cid else None)
+            gres = _gres(gid)
+            verdict = _classify_imported_token(net, cid, redeemed, pos, gres, min_usd)
+            verdict_counts[verdict] += 1
+
+            signal = (
+                "redeemed" if (cid and cid in redeemed) else
+                "positions" if pos is not None else
+                "gamma" if gres is not None else "default"
+            )
+            logger.info(
+                f"[import] token={str(token_id)[:14]}… city={city} bin={bin_label} "
+                f"cid={str(cid)[:10]} net=${net:.2f} signal={signal} "
+                f"redeemable={pos.get('redeemable') if pos else None} "
+                f"curPrice={pos.get('curPrice') if pos else None} "
+                f"gamma_resolved={gres} → {verdict}"
+            )
+
+            if verdict == "skip" or dry_run:
+                continue
+            _import_apply_canonical(
+                session, token_id, net, buy_shares.get(token_id, 0.0), verdict,
+                existing, cid, gid, city, bin_label, market_id, strat,
+            )
+            changed += 1
+
+        mode = "DRY-RUN (no writes — verify vs UI, then set ONCHAIN_IMPORT_DRY_RUN=false)" \
+            if dry_run else "APPLIED"
+        logger.info(
+            f"[import] {mode}: verdicts={dict(verdict_counts)} "
+            f"over {len(open_cost)} on-chain tokens; rows changed={changed}"
+        )
+        if not dry_run and changed:
+            session.commit()
+    except Exception as exc:
+        logger.error(f"[import] job failed: {exc}")
+    finally:
+        session.close()
+
+
 def _job_auto_redeem() -> None:
     """
     G4-17: redeem won positions that reached resolution without an early-exit
@@ -1456,6 +1693,7 @@ def setup_scheduler() -> None:
     schedule.every(15).minutes.do(_job_settle_paper)   # G3-3: Gamma-based paper settlement
     schedule.every(60).minutes.do(_job_paper_trade_summary)
     schedule.every(2).minutes.do(_job_reconcile_orders)
+    schedule.every(15).minutes.do(_job_import_onchain_positions)  # G4-26: DB⟵/activity truth
     schedule.every(15).minutes.do(_job_reconcile_pnl)
     schedule.every(30).minutes.do(_job_audit_activity)      # G4-19: /activity audit + repair
     schedule.every(30).minutes.do(_job_expire_stale_pending)
@@ -1568,6 +1806,7 @@ def run_initial_jobs() -> None:
     # Order matters after downtime: sell at bid FIRST (best outcome), then
     # reconcile marks remaining wins pending_redeem, then redeem the no-bid ones.
     _job_tail_early_exit()     # G4-15: capture early-exit window missed overnight
+    _job_import_onchain_positions()  # G4-26: DB⟵/activity (dry-run until verified)
     _job_reconcile_pnl()       # G3-2: finalize sells + mark wins pending_redeem
     _job_auto_redeem()         # G4-17: redeem stuck wins (no bid / market closed)
     _job_audit_activity()      # G4-19: repair phantom/win-as-loss vs /activity
