@@ -412,6 +412,16 @@ class RiskManager:
             if blocked_reason:
                 if not getattr(self, "_paper_block_alerted", False):
                     self._paper_block_alerted = True
+                    # G4-28: the alert quotes _paper_total_loss / _paper_daily_loss —
+                    # the SAME fields just logged as paper_loss_calc by
+                    # _load_live_stats. No legacy/unfiltered source. Log the exact
+                    # value sent so the prod Telegram and the log provably agree.
+                    logger.info(
+                        f"PAPER pause alert: {blocked_reason} "
+                        f"(paper_total=${self._paper_total_loss:.4f} "
+                        f"paper_daily=${self._paper_daily_loss:.4f}) — "
+                        f"NEUTRAL 📊 wording, no live stop"
+                    )
                     try:
                         from src.notifications.telegram import get_notifier
                         get_notifier().send(

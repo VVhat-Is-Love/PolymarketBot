@@ -276,3 +276,43 @@ def test_paper_loss_does_not_block_live():
 
     ok2, reason2 = rm.can_place_basket(2.0, 2)
     assert ok2 is True, f"Live basket blocked by paper losses: {reason2}"
+
+
+# ---------------------------------------------------------------------------
+# G4-28 regression lock: paper threshold → ONLY 📊, never live-stop wording
+# ---------------------------------------------------------------------------
+
+def test_paper_block_alert_is_neutral_never_live_format():
+    """A paper threshold sends exactly one 📊 PAPER alert — never 🛑/⚠️ live-stop
+    wording — and never trips the live emergency stop."""
+    from unittest.mock import patch, MagicMock
+    rm = _make_rm(paper_total_stop_loss_usd=20.0)
+    rm._paper_total_loss = 25.0
+    notifier = MagicMock()
+    with patch("src.notifications.telegram.get_notifier", return_value=notifier):
+        ok, reason = rm.can_run_paper()
+
+    assert ok is False
+    assert notifier.send.call_count == 1
+    msg = notifier.send.call_args[0][0]
+    assert "📊" in msg and "PAPER" in msg
+    assert "🛑" not in msg
+    assert "TOTAL STOP-LOSS" not in msg
+    assert "DAILY LOSS LIMIT" not in msg
+    # paper threshold must NOT activate the live emergency stop
+    assert rm._emergency_stop is False
+    # alert quotes _paper_total_loss (the paper_loss_calc source), not a legacy value
+    assert "25.00" in msg
+
+
+def test_paper_block_alert_edge_triggered_once():
+    """Edge-triggered: blocked every cycle, but only ONE alert until unblocked."""
+    from unittest.mock import patch, MagicMock
+    rm = _make_rm(paper_total_stop_loss_usd=20.0)
+    rm._paper_total_loss = 25.0
+    notifier = MagicMock()
+    with patch("src.notifications.telegram.get_notifier", return_value=notifier):
+        rm.can_run_paper()
+        rm.can_run_paper()
+        rm.can_run_paper()
+    assert notifier.send.call_count == 1

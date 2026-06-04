@@ -305,6 +305,14 @@ def _job_import_onchain_positions(dry_run: bool | None = None) -> None:
     min_usd = float(getattr(settings, "onchain_import_min_usd", 1.0))
 
     activity = get_activity(settings.proxy_wallet_address)
+    # G4-28: empty /activity == data-api unavailable. Importing/demoting against it
+    # would be based on a false "no positions" view — defer this cycle.
+    if not activity:
+        logger.warning(
+            "[import] /activity unavailable (empty/failed) — "
+            "skipping reconcile, no status change"
+        )
+        return
     open_cost = open_cost_by_token(activity)
     redeemed = redeemed_condition_ids(activity)
     buy_shares = buy_shares_by_token(activity)
@@ -840,6 +848,17 @@ def _job_reconcile_pnl() -> None:
         logger.info(f"[reconcile_pnl] Checking {len(unreconciled)} trades against Data API")
 
         activity = get_activity(settings.proxy_wallet_address)
+        # G4-28: an empty /activity is NOT proof that no BUY exists — the data-api
+        # intermittently returns [] on timeout/error. Treating that as "no fill"
+        # marked real positions not_filled and created the $1.71-vs-$110 wipeout.
+        # A wallet that has open/unreconciled trades cannot truly have zero
+        # activity, so empty == unavailable → defer, change NO status this cycle.
+        if not activity:
+            logger.warning(
+                "[reconcile_pnl] /activity unavailable (empty/failed) — "
+                "skipping reconcile, no status change"
+            )
+            return
         pnl_map = realized_pnl_by_token(activity)
         buy_shares = buy_shares_by_token(activity)
         _fill_timeout = timedelta(minutes=max(30, settings.order_timeout_minutes * 4))
@@ -1094,6 +1113,15 @@ def _job_audit_activity() -> None:
             return
 
         activity = get_activity(settings.proxy_wallet_address)
+        # G4-28: empty /activity == data-api unavailable, NOT "no fills". Auditing
+        # against it would compute filled=False for everything and re-demote real
+        # positions to not_filled (the wipeout). Defer — change nothing this cycle.
+        if not activity:
+            logger.warning(
+                "[audit] /activity unavailable (empty/failed) — "
+                "skipping reconcile, no status change"
+            )
+            return
         pnl_map = realized_pnl_by_token(activity)
         buy_shares = buy_shares_by_token(activity)
         redeemed = redeemed_condition_ids(activity)
