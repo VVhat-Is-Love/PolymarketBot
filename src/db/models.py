@@ -236,6 +236,11 @@ class LiveTrade(Base):
     reconciled_with_polymarket: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0"
     )
+    # G4-27: True once the "✅ Исполнен" alert has been sent, so reconcile's
+    # per-cycle re-verification of an already-filled position never re-announces.
+    fill_notified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
 
 
 class ChecklistEvaluation(Base):

@@ -571,19 +571,26 @@ def _job_reconcile_orders() -> None:
 
             # Fill is confirmed by /activity BUY, not by CLOB status
             if _has_matching_buy(t):
+                # G4-27: notify only on the pending/open → filled TRANSITION.
+                # reconcile re-verifies the same position every cycle; without
+                # this gate it re-sends "✅ Исполнен" for hours (Seattle/Dallas).
+                first_fill = not t.fill_notified
                 t.status = "filled"
                 t.filled_price = t.target_price
                 t.filled_at = now
+                t.fill_notified = True
                 session.commit()
                 city = t.city or t.group_id or "?"
                 logger.info(
                     f"[reconcile] FILLED (verified /activity BUY): {city} {t.bin_label} "
                     f"order={t.order_id[:12]}…"
+                    + ("" if first_fill else " (already notified — no alert)")
                 )
-                notifier.send(
-                    f"✅ Исполнен [{t.strategy_name}]: {city} {t.bin_label} | "
-                    f"${t.target_price:.4f} × {t.size_shares:.4f}"
-                )
+                if first_fill:
+                    notifier.send(
+                        f"✅ Исполнен [{t.strategy_name}]: {city} {t.bin_label} | "
+                        f"${t.target_price:.4f} × {t.size_shares:.4f}"
+                    )
                 continue
 
             try:
