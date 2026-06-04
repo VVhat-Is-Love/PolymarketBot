@@ -68,11 +68,12 @@ class Settings(BaseSettings):
     redeem_min_matic: float = Field(default=0.02)   # skip if gas balance below this
 
     # On-chain position import (G4-26): reconcile the DB from /activity as the
-    # source of truth for position EXISTENCE. Starts in DRY-RUN: the job logs the
-    # per-token classification every cycle but writes NOTHING until this is set
-    # False, so the classification can be eye-checked against the Polymarket UI
-    # first. Flip to False (e.g. ONCHAIN_IMPORT_DRY_RUN=false in .env) to apply.
-    onchain_import_dry_run: bool = Field(default=True)
+    # source of truth for position EXISTENCE. Classification (open vs
+    # pending_redeem vs skip) was eye-checked against the Polymarket UI and is
+    # now LIVE (writes applied). The job is idempotent — it reuses the canonical
+    # row per token and skips redeemed/orphan tokens — so it runs safely every
+    # cycle. Set ONCHAIN_IMPORT_DRY_RUN=true to revert to log-only.
+    onchain_import_dry_run: bool = Field(default=False)
     onchain_import_min_usd: float = Field(default=1.0)  # below this = noise, skip
     # Polymarket Polygon contracts (mainnet)
     ctf_address: str = Field(default="0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")

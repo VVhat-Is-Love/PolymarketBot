@@ -373,7 +373,18 @@ def _job_import_onchain_positions(dry_run: bool | None = None) -> None:
                 city = city_by_group.get(gid)
                 strat = "tail_no" if side_kind == "no" else "basket_narrow"
 
-            pos = pos_by_token.get(token_id) or (pos_by_cid.get(cid) if cid else None)
+            # Orphan: a real on-chain BUY we can't map to any market/conditionId.
+            # Without a conditionId it can't be redeemed or resolved → don't import
+            # (would be a dead pending_redeem row auto_redeem can't process).
+            if not cid:
+                verdict_counts["skip_orphan"] += 1
+                logger.info(
+                    f"[import] token={str(token_id)[:14]}… net=${net:.2f} "
+                    f"→ SKIP (orphan: no conditionId mapping in markets/live_trades)"
+                )
+                continue
+
+            pos = pos_by_token.get(token_id) or pos_by_cid.get(cid)
             gres = _gres(gid)
             verdict = _classify_imported_token(net, cid, redeemed, pos, gres, min_usd)
             verdict_counts[verdict] += 1
