@@ -1,10 +1,15 @@
+import os
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Dev/prod split: point at a non-prod env file with
+    #   BOT_ENV_FILE=.env.dev   (e.g. NOTIFICATIONS_ENABLED=false, no admin ids)
+    # so local development and manual script runs never touch the live Telegram.
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.getenv("BOT_ENV_FILE", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -33,6 +38,9 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = Field(default="")
     admin_telegram_id: str = Field(default="")
+    # Master kill-switch for outbound Telegram. Set NOTIFICATIONS_ENABLED=false in
+    # a dev/test env to silence the notifier even when a token/admin id is present.
+    notifications_enabled: bool = Field(default=True)
 
     # Risk Management
     max_single_bet_usd: float = Field(default=3.0)

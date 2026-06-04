@@ -97,4 +97,8 @@ class TelegramNotifier:
 
 def get_notifier() -> TelegramNotifier:
     from src.config.settings import settings
+    # Master kill-switch: a disabled notifier (empty token) never sends. Lets dev
+    # and tests run with NOTIFICATIONS_ENABLED=false without touching prod Telegram.
+    if not getattr(settings, "notifications_enabled", True):
+        return TelegramNotifier("", "")
     return TelegramNotifier(settings.telegram_bot_token, settings.admin_telegram_id)
