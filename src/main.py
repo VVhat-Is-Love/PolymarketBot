@@ -72,6 +72,29 @@ def _report_open_trades() -> None:
         session.close()
 
 
+def _bucket_executed(all_trades: list) -> tuple[list, list, list]:
+    """
+    Split executed trades into (closed, pending_redeem, open_filled).
+
+    • closed        = sold + resolved → outcome final, realized PnL is honest.
+    • pending_redeem = won, awaiting on-chain redemption → expected GAIN, never
+                       booked at −cost (that is the G4-23 win-as-loss bug).
+    • open_filled    = filled but market not resolved yet → still live.
+    """
+    closed = [t for t in all_trades if t.status in ("sold", "resolved")]
+    pending = [t for t in all_trades if t.status == "pending_redeem"]
+    open_filled = [t for t in all_trades if t.status == "filled"]
+    return closed, pending, open_filled
+
+
+def _pending_expected_gain(pending: list) -> float:
+    """Expected net gain for won-unredeemed legs: shares pay $1 each at redemption,
+    so gain ≈ shares − cost. Floored at 0 — a pending win is never shown negative."""
+    return round(
+        sum(max(0.0, (t.size_shares or 0.0) - (t.stake_usd or 0.0)) for t in pending), 2
+    )
+
+
 def _executed_realized_pnl(executed: list) -> tuple[float, str]:
     """
     Realized PnL for the executed trades, summed over the SAME set used for
@@ -191,28 +214,42 @@ def _report_live_status() -> None:
             session.execute(select(LiveTrade)).scalars().all()
         )
         open_trades = [t for t in all_trades if t.status in ("pending", "open")]
-        # "Executed" = trades that actually filled on-chain and hold/held a real
-        # position: filled, resolved, sold, pending_redeem. PnL and stake MUST be
-        # summed over this SAME set — the old code took PnL over all_trades but
-        # stake over filled-only, yielding −$9.19 against $6.02 staked (impossible).
-        EXECUTED = ("filled", "resolved", "sold", "pending_redeem")
-        executed = [t for t in all_trades if t.status in EXECUTED]
+        # G4-29b: realized PnL counts ONLY closed positions (sold + resolved).
+        # Won-but-unredeemed legs (pending_redeem) are NOT booked at −cost — that
+        # repeats the G4-23 win-as-loss bug (6 pending wins showed −$26). They go
+        # to a separate "ждёт redeem" bucket as an expected gain. Numerator and
+        # denominator of the realized line come from the SAME closed set.
+        closed, pending_redeem, open_filled = _bucket_executed(all_trades)
         not_filled = [t for t in all_trades if t.status == "not_filled"]
         expired = [t for t in all_trades if t.status == "expired"]
         cancelled = [t for t in all_trades if t.status == "cancelled"]
+        executed_n = len(closed) + len(pending_redeem) + len(open_filled)
 
-        total_staked = sum(t.stake_usd or 0.0 for t in executed)
-        total_pnl, pnl_source = _executed_realized_pnl(executed)
-        filled = executed  # for the "последние исполненные" listing below
+        realized_pnl, pnl_source = _executed_realized_pnl(closed)
+        staked_closed = sum(t.stake_usd or 0.0 for t in closed)
+        pending_cost = sum(t.stake_usd or 0.0 for t in pending_redeem)
+        pending_expected = _pending_expected_gain(pending_redeem)
+        filled = closed + pending_redeem + open_filled  # for the listing below
 
         logger.info(
-            f"  ✅  DB сделки: открытых={len(open_trades)} | исполнено={len(executed)} | "
+            f"  ✅  DB сделки: открытых={len(open_trades)} | исполнено={executed_n} | "
             f"not_filled={len(not_filled)} | истекло={len(expired)} | отменено={len(cancelled)}"
         )
         logger.info(
-            f"       Поставлено (исполнено): ${total_staked:.2f} | "
-            f"PnL: ${total_pnl:+.2f} (source={pnl_source})"
+            f"       Реализовано (закрытые {len(closed)}): PnL ${realized_pnl:+.2f} "
+            f"| поставлено ${staked_closed:.2f} (source={pnl_source})"
         )
+        if pending_redeem:
+            logger.info(
+                f"       Ждёт redeem: {len(pending_redeem)} поз. — в рынке "
+                f"${pending_cost:.2f}, ожидается ~+${pending_expected:.2f} "
+                f"(НЕ вычитается из PnL)"
+            )
+        if open_filled:
+            staked_open = sum(t.stake_usd or 0.0 for t in open_filled)
+            logger.info(
+                f"       Открыто (ждёт резолва): {len(open_filled)} поз. — ${staked_open:.2f}"
+            )
 
         if open_trades:
             logger.info("  --- Открытые позиции (DB) ---")
