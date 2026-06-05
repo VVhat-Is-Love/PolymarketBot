@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from datetime import datetime, date, timedelta
 import schedule
@@ -19,6 +20,15 @@ _gamma = GammaClient()
 
 
 _discovery_zero_count: int = 0  # G2-8: consecutive zero-event discovery counter
+
+# ── G4-30: tail-exit runs on its OWN thread, decoupled from the single-threaded
+# schedule.run_pending() loop. Heavy jobs (discover/snapshot/import) block that
+# loop for minutes; measured tail tick drifted 5–47 min and missed the 45¢ window.
+# The dedicated ticker guarantees DELIVERY of the tick on cadence; the per-position
+# hot/normal gate in live_trader (decide_tail_exit) is untouched and still decides. ──
+_TAIL_TICK_FLOOR_SECONDS: int = 60      # never tick faster than this (misconfig guard)
+_tail_exit_stop = threading.Event()
+_tail_exit_thread: "threading.Thread | None" = None
 
 
 def _job_discover_markets() -> None:
@@ -1734,7 +1744,8 @@ def setup_scheduler() -> None:
     schedule.every(60).minutes.do(_job_fetch_open_meteo)
     schedule.every(15).minutes.do(_job_paper_trade_engine)
     schedule.every(15).minutes.do(_job_live_trade_engine)   # runtime emergency_stop check inside
-    schedule.every(5).minutes.do(_job_tail_early_exit)       # A2: tz-aware exit (5min tick, 10min normal)
+    # G4-30: tail-exit is NOT registered here — it runs on its own thread
+    # (start_tail_exit_thread) so the blocking run_pending() loop can't starve it.
     schedule.every(10).minutes.do(_job_auto_redeem)          # G4-17: redeem stuck wins on-chain
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(15).minutes.do(_job_settle_paper)   # G3-3: Gamma-based paper settlement
@@ -1753,6 +1764,7 @@ def setup_scheduler() -> None:
         "open-meteo=60 min | deactivate=60 min | "
         "paper-trade=15 min | live-trade=15 min (always registered, runtime-gated) | "
         "resolve-paper=60 min | resolve-live=30 min | expire-pending=30 min | "
+        "tail-exit=dedicated thread (hot 5 min / normal 10 min, decoupled) | "
         "summary=60 min | daily=00:05 UTC"
     )
 
@@ -1840,6 +1852,61 @@ def _void_legacy_paper_ledger() -> None:
         session.close()
 
 
+def _compute_tail_tick_seconds() -> int:
+    """Base tick for the dedicated tail-exit ticker = the hot poll interval.
+
+    The per-position cadence gate in live_trader spaces hot positions at
+    tail_poll_hot_minutes (5) and normal at tail_poll_normal_minutes (10).
+    Ticking the thread at the hot interval lets the gate deliver both: hot →
+    every tick (~5 min), normal → every other tick (~10 min). Floored so a
+    misconfigured 0 can't busy-spin.
+    """
+    from src.strategy.config import strategy_settings as ss
+    return max(
+        _TAIL_TICK_FLOOR_SECONDS,
+        int(getattr(ss, "tail_poll_hot_minutes", 5)) * 60,
+    )
+
+
+def _tail_exit_loop(base_seconds: float) -> None:
+    """G4-30: dedicated tail-exit ticker, independent of schedule.run_pending().
+
+    Waits `base_seconds` between ticks on an interruptible Event (immune to the
+    main loop blocking on a 90 s discover job). This fixes tick DELIVERY only —
+    it calls the same _job_tail_early_exit(); no exit branch / decide_tail_exit
+    logic is touched. Stop via _tail_exit_stop.set().
+    """
+    logger.info(
+        f"[tail_exit] dedicated ticker started — base tick {base_seconds:.0f}s "
+        f"(own thread, decoupled from scheduler)"
+    )
+    while not _tail_exit_stop.wait(base_seconds):
+        try:
+            _job_tail_early_exit()
+        except Exception:
+            logger.exception("[tail_exit] dedicated ticker iteration failed")
+    logger.info("[tail_exit] dedicated ticker stopped")
+
+
+def start_tail_exit_thread(base_seconds: "float | None" = None) -> "threading.Thread":
+    """Start the decoupled tail-exit ticker and return the thread (daemon)."""
+    global _tail_exit_thread
+    _tail_exit_stop.clear()
+    base = base_seconds if base_seconds is not None else _compute_tail_tick_seconds()
+    _tail_exit_thread = threading.Thread(
+        target=_tail_exit_loop, args=(base,), name="tail-exit-ticker", daemon=True
+    )
+    _tail_exit_thread.start()
+    return _tail_exit_thread
+
+
+def stop_tail_exit_thread(timeout: float = 5.0) -> None:
+    """Signal the ticker to stop and join it (best-effort)."""
+    _tail_exit_stop.set()
+    if _tail_exit_thread is not None:
+        _tail_exit_thread.join(timeout)
+
+
 def run_initial_jobs() -> None:
     logger.info("Running initial data collection on startup...")
     _reset_phantom_paper_losses()    # cancel flat -stake losses from broken settle path
@@ -1866,6 +1933,8 @@ def run_initial_jobs() -> None:
 def run_forever() -> None:
     setup_scheduler()
     run_initial_jobs()
+    # G4-30: tail-exit on its own thread so heavy jobs in this loop can't starve it.
+    start_tail_exit_thread()
     logger.info("Entering scheduler loop — Ctrl+C / Shift+F5 to stop")
     while True:
         schedule.run_pending()
