@@ -1103,36 +1103,77 @@ def run_tail_engine() -> None:
 # Tail early exit — SELL a winning NO position to lock profit before REDEEM
 # ---------------------------------------------------------------------------
 
+# A2: adaptive-polling state (in-memory; resets on restart, which is fine — the
+# next cycle re-derives cadence). Keyed by trade id.
+_tail_last_eval: dict[str, datetime] = {}
+_tail_last_bid: dict[str, float] = {}
+
+
+def decide_tail_exit(
+    best_bid: float, in_window: bool, *,
+    take_profit: float, hard_floor: float, time_gate: float,
+) -> str:
+    """
+    Pure tail-exit decision (no DB/network) — branches in CHECK ORDER:
+
+      1. take_profit — ANY time: bid ≥ take_profit → grab near-par, wrap capital.
+      2. hard_floor  — post-peak ONLY: bid ≤ hard_floor → market-dump the loser.
+      3. time_gate   — post-peak ONLY: bid < time_gate → SELL the loser at bid.
+      else → hold (before the local peak a dip is intraday noise that recovers).
+
+    `in_window` is True only when the city local hour is at/after the peak hour;
+    when local time is unknown it is False, so floor/time-gate never fire on UTC.
+    """
+    if best_bid >= take_profit:
+        return "take_profit"
+    if in_window and best_bid <= hard_floor:
+        return "hard_floor"
+    if in_window and best_bid < time_gate:
+        return "time_gate"
+    return "hold"
+
+
 def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
     """
-    Lock profit on winning NO positions by SELLING — but ONLY on LIVE markets.
+    Manage open NO positions by SELLING on LIVE markets — A2: tz-aware, 3 branches.
 
     A SELL is only possible while the order book is live. Once the market is
-    closed/resolved on Polymarket, the ERC-1155 shares convert to a redemption
-    claim and the order-book balance is 0 (SELL fails with balance:0). Such
-    positions must go through auto_redeem, NOT SELL.
+    closed/resolved on Polymarket the shares convert to a redemption claim and the
+    book balance is 0 (SELL fails with balance:0) → route to auto_redeem instead.
 
-    Gate per position:
-      • market resolved (group.is_active=False OR Gamma is_resolved_event) →
-        route to redeem: ensure status=pending_redeem, skip SELL.
-      • market live AND best_bid ≥ tail_early_exit_price → SELL at the bid.
-      • market live but bid < threshold → hold.
+    Per live position, in CHECK ORDER (see decide_tail_exit):
+      1. take_profit — ANY time: bid ≥ tail_take_profit_price → SELL @ bid.
+      2. hard_floor  — post local peak ONLY (local_hour ≥ tail_local_peak_hour):
+                       bid ≤ tail_hard_floor_price → market-dump (sweep), honest
+                       actual-fill logging.
+      3. time_gate   — post-peak ONLY: bid < tail_time_gate_price → SELL @ bid.
+      else → hold (pre-peak dips are intraday noise that recover).
 
-    On a successful SELL the trade is marked status='sold'; reconcile finalizes
-    the true PnL from the SELL cash-flow.
+    Local time comes from MarketGroup.utc_offset_seconds (Open-Meteo, DST-aware);
+    unknown offset ⇒ not-in-window ⇒ only take_profit can fire (safe).
 
-    Log: [tail_exit] {market} sell @ {price} locked_pnl=${X}
+    Adaptive polling: post-peak OR bid < tail_hot_bid_threshold ⇒ hot (5 min);
+    else normal (10 min). On a SELL the trade is marked 'sold'; reconcile finalizes
+    true PnL from the /activity SELL cash-flow.
     """
     from src.config.settings import settings
     from src.risk.risk_manager import risk_manager
     from src.market.order_executor import place_limit_order
     from src.market.clob_client import get_book_snapshot
     from src.notifications.telegram import get_notifier
+    from src.strategy.local_time import local_hour
 
     if settings.trading_mode.lower() != "live":
         return
 
-    threshold = getattr(ss, "tail_early_exit_price", 0.985)
+    take_profit = getattr(ss, "tail_take_profit_price", 0.99)
+    hard_floor = getattr(ss, "tail_hard_floor_price", 0.45)
+    time_gate = getattr(ss, "tail_time_gate_price", 0.55)
+    sweep_price = getattr(ss, "tail_hard_floor_sweep_price", 0.01)
+    peak_hour = int(getattr(ss, "tail_local_peak_hour", 16))
+    hot_thr = getattr(ss, "tail_hot_bid_threshold", 0.65)
+    hot_min = int(getattr(ss, "tail_poll_hot_minutes", 5))
+    normal_min = int(getattr(ss, "tail_poll_normal_minutes", 10))
     session = get_session()
     notifier = get_notifier()
     _resolved_cache: dict[str, bool] = {}
@@ -1173,6 +1214,8 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
         logger.info(f"[tail_exit] Evaluating {len(positions)} open tail_no position(s)")
 
         for t in positions:
+            grp = session.get(MarketGroup, t.group_id) if t.group_id else None
+
             # ── Resolved market → redeem path, never SELL (avoids balance:0) ──
             if _market_resolved(t.group_id):
                 if t.status != "pending_redeem":
@@ -1183,6 +1226,21 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
                     f"route to auto_redeem (no SELL, shares in redemption)"
                 )
                 continue
+
+            # ── Adaptive polling: post-peak OR a soft bid is 'hot' (5 min); else
+            #    'normal' (10 min). The job ticks every 5 min; normal positions are
+            #    skipped on the off-tick so they effectively poll at 10 min. ──
+            lhour = local_hour(grp)
+            in_window = lhour is not None and lhour >= peak_hour
+            last_bid = _tail_last_bid.get(t.id)
+            hot = in_window or (last_bid is not None and last_bid < hot_thr)
+            cadence = hot_min if hot else normal_min
+            now = datetime.utcnow()
+            last_eval = _tail_last_eval.get(t.id)
+            if last_eval is not None and \
+                    (now - last_eval) < timedelta(minutes=cadence) - timedelta(seconds=30):
+                continue  # not due this tick
+            _tail_last_eval[t.id] = now
 
             try:
                 snap = get_book_snapshot(t.token_id)
@@ -1196,51 +1254,74 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
             if best_bid is None:
                 logger.debug(f"[tail_exit] {t.city} {t.market_id}: no bid — skip")
                 continue
+            _tail_last_bid[t.id] = best_bid
 
-            if best_bid < threshold:
-                logger.debug(
-                    f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
-                    f"< {threshold} — hold"
-                )
+            action = decide_tail_exit(
+                best_bid, in_window,
+                take_profit=take_profit, hard_floor=hard_floor, time_gate=time_gate,
+            )
+            logger.info(
+                f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
+                f"local_hour={lhour if lhour is not None else '?'} in_window={in_window} "
+                f"poll={'hot' if hot else 'normal'} → {action}"
+            )
+            if action == "hold":
                 continue
 
             shares = t.size_shares or 0.0
             stake = t.stake_usd or 0.0
-            sell_price = round(min(0.999, best_bid), 4)
-            locked_pnl = round(shares * sell_price - stake, 4)
 
-            logger.info(
-                f"[tail_exit] {t.city} {t.market_id} sell @ {sell_price:.4f} "
-                f"locked_pnl=${locked_pnl:+.4f} (shares={shares:.2f} stake=${stake:.2f})"
-            )
+            if action == "hard_floor":
+                # Market dump: sweep bids down to sweep_price. On a thin book the
+                # actual fill may be BELOW best_bid — logged honestly here; the
+                # true VWAP is confirmed by reconcile from the /activity SELL.
+                exec_price = round(max(0.001, sweep_price), 4)
+                provisional = round(shares * best_bid - stake, 4)  # estimate from bid
+                logger.warning(
+                    f"[tail_exit] HARD_FLOOR {t.city} {t.market_id}: market SELL "
+                    f"sweep≤{exec_price} (bid={best_bid:.3f} ≤ {hard_floor}, local_hour={lhour}); "
+                    f"ACTUAL fill may be < {best_bid:.3f} on a thin book — "
+                    f"reconcile confirms real price from /activity SELL"
+                )
+            else:
+                # take_profit / time_gate → limit SELL at the bid
+                exec_price = round(min(0.999, best_bid), 4)
+                provisional = round(shares * exec_price - stake, 4)
+                logger.info(
+                    f"[tail_exit] {action.upper()} {t.city} {t.market_id} sell @ "
+                    f"{exec_price:.4f} est_pnl=${provisional:+.4f} "
+                    f"(shares={shares:.2f} stake=${stake:.2f})"
+                )
 
             sell_oid = place_limit_order(
                 market_id=t.market_id,
                 token_id=t.token_id,
                 side="SELL",
-                price=sell_price,
+                price=exec_price,
                 size=shares,
                 skip_risk_check=True,   # closing a position never adds risk
             )
 
             if sell_oid:
                 t.status = "sold"
-                t.pnl_usd = locked_pnl          # provisional; reconcile confirms via SELL cashflow
+                t.pnl_usd = provisional         # provisional; reconcile confirms via SELL cashflow
                 t.resolved_at = t.resolved_at or datetime.utcnow()
                 session.commit()
+                _tail_last_eval.pop(t.id, None)
+                _tail_last_bid.pop(t.id, None)
                 # Free deployed capital immediately
                 try:
-                    risk_manager.record_bet_result(t.id, t.group_id or "", locked_pnl)
+                    risk_manager.record_bet_result(t.id, t.group_id or "", provisional)
                 except Exception:
                     pass
                 notifier.send(
-                    f"💰 [tail_exit] {t.city} {t.bin_label} — продано @ {sell_price:.3f} "
-                    f"| зафиксирован PnL ${locked_pnl:+.2f} (sell_order={sell_oid})"
+                    f"💰 [tail_exit/{action}] {t.city} {t.bin_label} — продано @ "
+                    f"{exec_price:.3f} | est PnL ${provisional:+.2f} (sell_order={sell_oid})"
                 )
             else:
                 logger.warning(
                     f"[tail_exit] SELL order failed {t.city} {t.market_id} "
-                    f"@ {sell_price:.4f}"
+                    f"action={action} @ {exec_price:.4f}"
                 )
 
     except Exception:

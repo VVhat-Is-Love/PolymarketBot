@@ -165,7 +165,8 @@ def _job_live_trade_engine() -> None:
 
 
 def _job_tail_early_exit() -> None:
-    """G4-15: SELL winning NO positions at tail_early_exit_price to lock profit."""
+    """A2: tz-aware tail exit — take_profit (any time) / hard_floor + time_gate
+    (post local peak). Ticks every 5 min; normal positions self-throttle to 10."""
     from src.config.settings import settings
     from src.strategy.live_trader import run_tail_early_exit
     if settings.trading_mode.lower() != "live":
@@ -1733,7 +1734,7 @@ def setup_scheduler() -> None:
     schedule.every(60).minutes.do(_job_fetch_open_meteo)
     schedule.every(15).minutes.do(_job_paper_trade_engine)
     schedule.every(15).minutes.do(_job_live_trade_engine)   # runtime emergency_stop check inside
-    schedule.every(5).minutes.do(_job_tail_early_exit)       # G4-15: lock NO profit at ≥0.985
+    schedule.every(5).minutes.do(_job_tail_early_exit)       # A2: tz-aware exit (5min tick, 10min normal)
     schedule.every(10).minutes.do(_job_auto_redeem)          # G4-17: redeem stuck wins on-chain
     schedule.every(60).minutes.do(_job_resolve_paper_trades)
     schedule.every(15).minutes.do(_job_settle_paper)   # G3-3: Gamma-based paper settlement

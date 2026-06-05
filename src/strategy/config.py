@@ -77,5 +77,21 @@ class StrategySettings(BaseSettings):
     # profit, free capital, and remove residual resolution risk (vs waiting for REDEEM).
     tail_early_exit_price: float = Field(default=0.985)
 
+    # ── A2: tz-aware tail exit (three branches in check order) ───────────────
+    # 1. Take-profit — ANY time: NO-bid ≥ this → SELL at bid (near-par, wrap capital)
+    tail_take_profit_price: float = Field(default=0.99)
+    # 2. Hard floor — ONLY after the local temperature peak: NO-bid ≤ this →
+    #    market-dump SELL. Before the peak a dip is intraday noise that recovers.
+    tail_hard_floor_price: float = Field(default=0.45)
+    tail_hard_floor_sweep_price: float = Field(default=0.01)  # sweep limit = market dump
+    # 3. Time-gate — after the peak AND NO-bid < this → SELL at bid (cut the loser)
+    tail_time_gate_price: float = Field(default=0.55)
+    # Local hour (city time) at/after which the floor + time-gate arm (post-peak).
+    tail_local_peak_hour: int = Field(default=16)
+    # Adaptive polling: a position post-peak OR with bid below this is "hot".
+    tail_hot_bid_threshold: float = Field(default=0.65)
+    tail_poll_hot_minutes: int = Field(default=5)
+    tail_poll_normal_minutes: int = Field(default=10)
+
 
 strategy_settings = StrategySettings()

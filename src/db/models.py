@@ -33,6 +33,9 @@ class MarketGroup(Base):
     unit: Mapped[str | None] = mapped_column(String(1), nullable=True)  # 'F' | 'C'
     event_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # G-A1: city UTC offset (seconds, DST-aware) from Open-Meteo timezone="auto".
+    # Drives local_now(group) for the time-gate / hard-floor tail exits.
+    utc_offset_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     markets: Mapped[list["Market"]] = relationship("Market", back_populates="group")
