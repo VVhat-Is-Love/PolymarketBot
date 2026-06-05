@@ -287,6 +287,9 @@ def main() -> None:
     from src.config.settings import settings
     logger.info(f"Trading mode: {settings.trading_mode.upper()}")
 
+    from src.telegram.strategy_flags import log_startup_flags
+    log_startup_flags()   # spells out "basket DISABLED" hard flag at startup
+
     if settings.trading_mode == "live":
         _report_live_status()
 
