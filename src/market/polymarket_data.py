@@ -28,13 +28,25 @@ CASH_IN_TYPES = {"REDEEM", "SELL", "REWARD", "REBATE", "MERGE"}
 CASH_OUT_TYPES = {"BUY", "SPLIT"}
 
 
-def get_activity(wallet: str, limit: int = 500) -> list[dict[str, Any]]:
+def get_activity_checked(
+    wallet: str, limit: int = 500
+) -> tuple[bool, list[dict[str, Any]]]:
     """
-    Fetch all activity for a wallet from Polymarket Data API.
-    Paginates automatically until exhausted.
+    Fetch all activity for a wallet, returning an EXPLICIT (ok, items) tuple.
+
+    ok=True  → every HTTP page returned 200 (the list is complete; an empty
+               list here means a genuine zero-activity wallet).
+    ok=False → a page request failed (timeout/HTTP error). The list may be
+               partial and MUST NOT be treated as "no activity".
+
+    G4-32: callers that gate fill-detection on /activity must branch on this
+    flag, never on the emptiness of the list. Inferring "unavailable" from an
+    empty list is the ambiguity that let a MATCHED on-chain fill be marked
+    expired (and orphaned) during a /activity timeout.
     """
     items: list[dict] = []
     offset = 0
+    ok = True
     while True:
         try:
             r = _SESSION.get(
@@ -46,6 +58,7 @@ def get_activity(wallet: str, limit: int = 500) -> list[dict[str, Any]]:
             batch: list[dict] = r.json()
         except Exception as exc:
             logger.error(f"[polymarket_data] get_activity failed at offset={offset}: {exc}")
+            ok = False
             break
 
         if not batch:
@@ -56,8 +69,23 @@ def get_activity(wallet: str, limit: int = 500) -> list[dict[str, Any]]:
         offset += limit
         time.sleep(0.3)
 
-    logger.debug(f"[polymarket_data] Fetched {len(items)} activity items for {wallet[:12]}…")
-    return items
+    logger.debug(
+        f"[polymarket_data] Fetched {len(items)} activity items "
+        f"for {wallet[:12]}… (ok={ok})"
+    )
+    return ok, items
+
+
+def get_activity(wallet: str, limit: int = 500) -> list[dict[str, Any]]:
+    """
+    Fetch all activity for a wallet from Polymarket Data API.
+    Paginates automatically until exhausted.
+
+    Back-compat wrapper over get_activity_checked: returns only the items.
+    Existing callers treat an empty list as "unavailable" (the G4-28 heuristic);
+    prefer get_activity_checked where the success/empty distinction matters.
+    """
+    return get_activity_checked(wallet, limit)[1]
 
 
 def get_positions(wallet: str, redeemable: bool | None = None) -> list[dict[str, Any]]:

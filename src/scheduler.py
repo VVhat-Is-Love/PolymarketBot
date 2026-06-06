@@ -538,12 +538,18 @@ def _job_reconcile_orders() -> None:
     """
     Non-blocking reconciliation: poll CLOB status for all open/pending orders.
     Runs every 2 minutes — replaces the blocking _poll_until_filled_or_timeout loop.
-    Orders older than ORDER_TIMEOUT_MINUTES are cancelled and marked expired.
+
+    Orders older than ORDER_TIMEOUT_MINUTES are cancelled and marked not_filled —
+    but ONLY once /activity is confirmed reachable AND shows no BUY (G4-32). When
+    /activity is unavailable the whole cycle defers: marking expired during a
+    timeout cancelled MATCHED on-chain fills and orphaned them (excluded from
+    tail-exit and from this job's re-check). A recovery pass re-attaches any
+    pre-existing expired-but-on-chain orphans while /activity is live.
     """
     from datetime import timedelta
     from src.config.settings import settings
     from src.market.order_executor import get_order_status, cancel_order
-    from src.market.polymarket_data import get_activity, buy_shares_by_token
+    from src.market.polymarket_data import get_activity_checked, buy_shares_by_token
     from src.notifications.telegram import get_notifier
 
     notifier = get_notifier()
@@ -561,20 +567,40 @@ def _job_reconcile_orders() -> None:
             ).scalars().all()
         )
 
-        if not pending_open:
-            return
+        # G4-32 recovery: expired rows that may actually be live on-chain.
+        orphans = list(
+            session.execute(
+                select(LiveTrade).where(
+                    LiveTrade.status == "expired",
+                    LiveTrade.token_id.isnot(None),
+                    LiveTrade.order_id.isnot(None),
+                )
+            ).scalars().all()
+        )
 
-        logger.debug(f"[reconcile] Checking {len(pending_open)} open/pending orders")
+        if not pending_open and not orphans:
+            return
 
         # G4-19: /activity BUY is the ONLY proof of fill. CLOB 'matched' status is
         # a hint, not proof (phantom-fill bug: Lucknow had a matched order but no
-        # BUY on Polymarket). Build BUY-shares-per-token once for this run.
+        # BUY on Polymarket). G4-32: read availability from an EXPLICIT flag, never
+        # from an empty buy_shares — a /activity timeout returns [] too, and that
+        # ambiguity is what marked matched fills expired.
+        activity_ok = False
         buy_shares: dict[str, float] = {}
         if settings.proxy_wallet_address:
-            try:
-                buy_shares = buy_shares_by_token(get_activity(settings.proxy_wallet_address))
-            except Exception as exc:
-                logger.warning(f"[reconcile] /activity fetch failed — fill check deferred: {exc}")
+            activity_ok, _activity = get_activity_checked(settings.proxy_wallet_address)
+            if activity_ok:
+                buy_shares = buy_shares_by_token(_activity)
+
+        # /activity unavailable → defer the whole cycle: do NOT change any status,
+        # do NOT cancel any order. Same guard as reconcile_pnl/audit/import.
+        if not activity_ok:
+            logger.warning(
+                "[reconcile] deferred: /activity unavailable — no status change "
+                f"({len(pending_open)} open/pending, {len(orphans)} orphan(s) held for next cycle)"
+            )
+            return
 
         def _has_matching_buy(tr: LiveTrade) -> bool:
             if not tr.token_id:
@@ -584,6 +610,39 @@ def _job_reconcile_orders() -> None:
             # tolerance: 2% or 0.5 shares, whichever is larger
             tol = max(0.5, want * 0.02)
             return bought >= (want - tol)
+
+        # ── G4-32 recovery: re-attach expired rows that are live on-chain ──────
+        # /activity is confirmed reachable here. An expired row with a matching
+        # BUY on an UNRESOLVED market is a real position wrongly retired during a
+        # /activity outage — restore it to 'open' so tail-exit manages it again
+        # (next cycle promotes it open→filled and finally fires the fill alert).
+        # Idempotent: only status=='expired' is scanned, so a recovered row is
+        # never re-processed. reconciled_with_polymarket stays False so
+        # reconcile_pnl still finalizes PnL/redeem at resolution (mirror of the
+        # G4-26 import re-attach; True would exclude it from finalization and
+        # skew risk loss calc).
+        recovered = 0
+        for t in orphans:
+            if not _has_matching_buy(t):
+                continue
+            try:
+                if t.group_id and _gamma.is_resolved_event(t.group_id):
+                    continue  # resolved → leave for reconcile_pnl (redeem/close)
+            except Exception:
+                continue  # Gamma unknown → leave as-is, retry next cycle
+            t.status = "open"
+            t.reconciled_with_polymarket = False
+            session.commit()
+            recovered += 1
+            logger.warning(
+                f"[reconcile] RECOVERED orphan: {t.city or t.group_id} {t.bin_label} "
+                f"order={t.order_id[:12]}… → managed"
+            )
+        if recovered:
+            logger.info(f"[reconcile] recovered {recovered}/{len(orphans)} expired orphan(s)")
+
+        if pending_open:
+            logger.debug(f"[reconcile] Checking {len(pending_open)} open/pending orders")
 
         for t in pending_open:
             placed_at = t.placed_at or now
@@ -627,30 +686,24 @@ def _job_reconcile_orders() -> None:
                 )
 
             elif (now - placed_at) > timeout:
-                # Timed out. CLOB may say 'matched' but if /activity has no BUY it
-                # never really filled → not_filled (excluded from PnL/risk), not expired.
+                # G4-32: activity_ok is True (cycle deferred otherwise) and there
+                # is no matching /activity BUY → the order genuinely never filled.
+                # Cancel ONLY now that non-fill is confirmed: cancelling before the
+                # BUY check killed MATCHED on-chain orders and marked them expired.
+                # No 'expired' outcome here anymore — a matched fill can never land
+                # in this branch (it is caught as FILLED above or deferred).
+                city = t.city or t.group_id or "?"
                 try:
                     cancel_order(t.order_id)
                 except Exception:
                     pass
-                city = t.city or t.group_id or "?"
-                if buy_shares and not _has_matching_buy(t):
-                    t.status = "not_filled"
-                    t.cancelled_at = now
-                    session.commit()
-                    logger.warning(
-                        f"[reconcile] NOT_FILLED (no /activity BUY after timeout, "
-                        f"clob={clob_status}): {city} {t.bin_label} order={t.order_id[:12]}…"
-                    )
-                else:
-                    t.status = "expired"
-                    t.cancelled_at = now
-                    session.commit()
-                    logger.warning(
-                        f"[reconcile] EXPIRED (>{settings.order_timeout_minutes}m): "
-                        f"{city} {t.bin_label} order={t.order_id[:12]}…"
-                    )
-                    notifier.send(f"⏰ Истёк [{t.strategy_name}]: {city} {t.bin_label}")
+                t.status = "not_filled"
+                t.cancelled_at = now
+                session.commit()
+                logger.warning(
+                    f"[reconcile] NOT_FILLED (no /activity BUY after timeout, "
+                    f"clob={clob_status}): {city} {t.bin_label} order={t.order_id[:12]}…"
+                )
 
         # G2-5: After processing individual legs, detect partial basket fills
         _detect_partial_baskets(session, notifier)

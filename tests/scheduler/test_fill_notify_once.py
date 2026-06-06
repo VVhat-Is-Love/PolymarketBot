@@ -25,7 +25,7 @@ def _activity(token, shares):
 def _run_reconcile(Session, activity):
     notifier = MagicMock()
     with patch("src.scheduler.get_session", Session), \
-         patch("src.market.polymarket_data.get_activity", return_value=activity), \
+         patch("src.market.polymarket_data.get_activity_checked", return_value=(True, activity)), \
          patch("src.notifications.telegram.get_notifier", return_value=notifier), \
          patch("src.market.order_executor.get_order_status", return_value="open"), \
          patch("src.market.order_executor.cancel_order", return_value=True), \
