@@ -115,6 +115,47 @@ def _get_wallet_balance() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Equity — cash + MTM of open positions; base for portfolio caps
+# ---------------------------------------------------------------------------
+
+# (value, timestamp, is_fallback)
+_equity_cache: Optional[tuple[float, datetime, bool]] = None
+_EQUITY_TTL = timedelta(minutes=5)
+_EQUITY_FAIL_TTL = timedelta(minutes=1)   # retry sooner after API failure
+
+
+def _get_equity() -> float:
+    """
+    Total equity = USDC cash in exchange + MTM value of open positions.
+    Cache: 5 min on success, 1 min on API failure (retries sooner on outage).
+
+    Fallback note: if portfolio API is unavailable, returns wallet cash only.
+    Cap will shrink while cash is used as base — safe default (under-deploy
+    beats over-deploy), recovers automatically within 1 scheduler cycle.
+    """
+    global _equity_cache
+    now = datetime.utcnow()
+    if _equity_cache is not None:
+        val, ts, is_fallback = _equity_cache
+        ttl = _EQUITY_FAIL_TTL if is_fallback else _EQUITY_TTL
+        if now - ts < ttl:
+            return val
+    try:
+        from src.telegram.stats import get_portfolio_breakdown
+        breakdown = get_portfolio_breakdown()
+        equity = breakdown.get("total", 0.0)
+        if equity > 0.01:
+            logger.info(f"[live_trader] Equity (cash + MTM): ${equity:.2f}")
+            _equity_cache = (equity, now, False)
+            return equity
+    except Exception as exc:
+        logger.warning(f"[live_trader] Equity fetch failed, falling back to cash: {exc}")
+    equity = _get_wallet_balance()
+    _equity_cache = (equity, now, True)
+    return equity
+
+
+# ---------------------------------------------------------------------------
 # Session helpers — shared by basket and tail engines
 # ---------------------------------------------------------------------------
 
@@ -445,11 +486,11 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
             + ("…" if len(groups) > 10 else "")
         )
 
-        wallet_balance = _get_wallet_balance()
-        logger.info(f"[live_trader] Wallet balance: ${wallet_balance:.4f}")
+        wallet_balance = _get_equity()
+        logger.info(f"[live_trader] Equity (cash + MTM): ${wallet_balance:.4f}")
         if wallet_balance < 0.10:
             logger.warning(
-                f"[live_trader] Wallet ${wallet_balance:.4f} < $0.10 — skipping ALL groups"
+                f"[live_trader] Equity ${wallet_balance:.4f} < $0.10 — skipping ALL groups"
             )
             return
 
@@ -641,7 +682,9 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                     f"→ trying basket_narrow"
                 )
             else:
-                logger.info(f"[basket_wide] {group.city}: SKIP — disabled via Telegram bot")
+                from src.telegram.strategy_flags import is_hard_disabled as _hard
+                _why = "HARD-DISABLED (no basket orders ever)" if _hard("basket_wide") else "disabled via Telegram bot"
+                logger.info(f"[basket_wide] {group.city}: SKIP — strategy disabled: {_why}")
 
             # ── Strategy B: basket_narrow (fallback) ────────────────────────
             if _strat_enabled("basket_narrow"):
@@ -671,7 +714,9 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                         f"[basket_narrow] {group.city}: REJECTED — {decision_b.reason}"
                     )
             else:
-                logger.info(f"[basket_narrow] {group.city}: SKIP — disabled via Telegram bot")
+                from src.telegram.strategy_flags import is_hard_disabled as _hard
+                _why = "HARD-DISABLED (no basket orders ever)" if _hard("basket_narrow") else "disabled via Telegram bot"
+                logger.info(f"[basket_narrow] {group.city}: SKIP — strategy disabled: {_why}")
 
             # ── Strategy C (inline): tail_no after basket rejection ──────────
             # Runs only when basket_wide AND basket_narrow are both skipped or
@@ -720,7 +765,7 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                     consensus_temp=result.consensus_temp,
                     unit=unit,
                     hours_to_close=_h2c,
-                    available_capital=wallet_balance,
+                    available_capital=wallet_balance,   # equity already (see above)
                     no_capital_in_use=_no_in_use,
                     ss=ss,
                     no_asks=_no_asks_map,
@@ -761,7 +806,14 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                         )
                         break
 
-                    _can, _why = risk_manager.can_place_order(_o.stake_usd)
+                    # Zone anti-correlation check (entry guard only, not an exit/stop)
+                    _z_ok, _z_why = risk_manager.can_place_tail_zone(group.city)
+                    if not _z_ok:
+                        logger.warning(f"[tail_no] Zone block {group.city}: {_z_why}")
+                        continue
+
+                    # Portfolio + loss cap (equity-based)
+                    _can, _why = risk_manager.can_place_tail(_o.stake_usd, wallet_balance)
                     if not _can:
                         logger.warning(
                             f"[tail_no] Risk block {group.city} {_o.bin_label}: {_why}"
@@ -896,13 +948,23 @@ def run_tail_engine() -> None:
     notifier = get_notifier()
 
     try:
-        wallet = _get_wallet_balance()
-        if wallet < ss.min_order_notional_usd:
+        equity = _get_equity()
+        if equity < ss.min_order_notional_usd:
             logger.debug(
-                f"[tail] Wallet ${wallet:.2f} < min_order_notional "
+                f"[tail] Equity ${equity:.2f} < min_order_notional "
                 f"${ss.min_order_notional_usd:.2f} — skip"
             )
             return
+
+        tail_cap_usd = equity * settings.tail_deployed_pct
+        logger.info(
+            f"[risk] Equity caps: equity=${equity:.2f} | "
+            f"total={settings.total_deployed_pct:.0%}=${equity * settings.total_deployed_pct:.2f} "
+            f"tail={settings.tail_deployed_pct:.0%}=${tail_cap_usd:.2f} | "
+            f"per-token=${ss.tail_max_position_usd:.2f} | "
+            f"50/50 — оптимум при одной стратегии и недоказанном edge; "
+            f"пересмотр Kelly (winrate) после 30-50 сделок и первых убытков."
+        )
 
         # Capital already locked in open NO positions
         no_in_use: float = (
@@ -991,7 +1053,7 @@ def run_tail_engine() -> None:
                     consensus_temp=consensus_temp,
                     unit=group.unit or "F",
                     hours_to_close=hours_to_close,
-                    available_capital=wallet,
+                    available_capital=equity,
                     no_capital_in_use=no_in_use,
                     ss=ss,
                     no_asks=no_asks,
@@ -1001,7 +1063,14 @@ def run_tail_engine() -> None:
                     logger.debug(f"[tail] {group.city}: {reason}")
 
                 for o in scan.orders:
-                    can, why = risk_manager.can_place_order(o.stake_usd)
+                    # Zone anti-correlation check (entry guard only, not an exit/stop)
+                    z_ok, z_why = risk_manager.can_place_tail_zone(group.city)
+                    if not z_ok:
+                        logger.warning(f"[tail_no] Zone block {group.city}: {z_why}")
+                        continue
+
+                    # Portfolio + loss cap (equity-based)
+                    can, why = risk_manager.can_place_tail(o.stake_usd, equity)
                     if not can:
                         logger.warning(
                             f"[tail_no] Risk block {group.city} {o.bin_label}: {why}"

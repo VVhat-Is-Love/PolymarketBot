@@ -34,10 +34,14 @@ class RiskStatus:
     max_concurrent_bets: int
     daily_loss_limit_usd: float
     total_stop_loss_usd: float
-    # Deployed capital by strategy
+    # Deployed capital by strategy (caps computed from equity × pct)
     basket_deployed_usd: float = 0.0
     tail_deployed_usd: float = 0.0
     total_deployed_usd: float = 0.0
+    equity_usd: float = 0.0
+    total_deployed_pct: float = 0.0
+    tail_deployed_pct: float = 0.0
+    # Computed $-equivalents (equity × pct) — for display
     total_deployed_cap_usd: float = 0.0
     basket_max_usd: float = 0.0
     tail_max_usd: float = 0.0
@@ -77,6 +81,11 @@ class RiskManager:
         self._total_stop_loss_usd = settings.total_stop_loss_usd
         self._max_basket_legs_open = settings.max_basket_legs_open
         self._max_tail_positions = settings.max_tail_positions
+        # Equity-based cap fractions
+        self._total_deployed_pct = settings.total_deployed_pct
+        self._tail_deployed_pct = settings.tail_deployed_pct
+        self._max_tail_zone_positions = settings.max_tail_zone_positions
+        # Kept for settings load compatibility — no longer enforced
         self._total_deployed_cap_usd = settings.total_deployed_cap_usd
         self._basket_max_usd = settings.basket_max_usd
         self._tail_max_usd = settings.tail_max_usd
@@ -436,11 +445,12 @@ class RiskManager:
             self._paper_block_alerted = False
             return True, "ok"
 
-    def can_place_basket(self, notional: float, n_legs: int) -> tuple[bool, str]:
+    def can_place_basket(self, notional: float, n_legs: int, equity: float = 0.0) -> tuple[bool, str]:
         """
         Check if we can deploy `notional` USD across `n_legs` basket bins.
-        Checks: emergency stop, daily loss, total deployed cap, basket cap, leg slots.
+        Checks: emergency stop, daily loss, total deployed cap (equity-based), leg slots.
         Reserves the notional in-memory until release_basket_reservation() is called.
+        equity: current cash+MTM total, used to compute pct-based caps dynamically.
         """
         with self._lock:
             self._maybe_roll_day()
@@ -464,22 +474,15 @@ class RiskManager:
                 return False, reason
 
             deployed = self._get_deployed_by_strategy()
-            basket_deployed = (
-                deployed.get("basket_wide", 0.0) + deployed.get("basket_narrow", 0.0)
-            )
             total_deployed = sum(deployed.values()) + self._reserved_usd
 
-            if total_deployed + notional > self._total_deployed_cap_usd:
-                return False, (
-                    f"total_cap ${total_deployed + notional:.2f}"
-                    f">${self._total_deployed_cap_usd:.2f}"
-                )
-
-            if basket_deployed + notional > self._basket_max_usd:
-                return False, (
-                    f"basket_cap ${basket_deployed + notional:.2f}"
-                    f">${self._basket_max_usd:.2f}"
-                )
+            if equity > 0:
+                total_cap = equity * self._total_deployed_pct
+                if total_deployed + notional > total_cap:
+                    return False, (
+                        f"total_cap ${total_deployed + notional:.2f}"
+                        f">{self._total_deployed_pct:.0%}×equity=${total_cap:.2f}"
+                    )
 
             if self._basket_legs_open + n_legs > self._max_basket_legs_open:
                 return False, (
@@ -492,10 +495,13 @@ class RiskManager:
             self._basket_legs_open += n_legs
             return True, "ok"
 
-    def can_place_tail(self, notional: float) -> tuple[bool, str]:
+    def can_place_tail(self, notional: float, equity: float = 0.0) -> tuple[bool, str]:
         """
         Check if we can deploy `notional` USD in a tail NO position.
-        Checks: emergency stop, daily loss, total deployed cap, tail cap.
+        Equity-based caps: total deployed ≤ total_deployed_pct × equity,
+                           tail deployed  ≤ tail_deployed_pct  × equity.
+        Also checks: emergency stop, daily loss, total loss, concurrent bets, daily count.
+        equity: current cash+MTM total, used to compute pct-based caps dynamically.
         """
         with self._lock:
             self._maybe_roll_day()
@@ -518,23 +524,77 @@ class RiskManager:
                 self._trigger_total_stop(reason)
                 return False, reason
 
-            deployed = self._get_deployed_by_strategy()
-            tail_deployed = deployed.get("tail_no", 0.0)
-            total_deployed = sum(deployed.values()) + self._reserved_usd
-
-            if total_deployed + notional > self._total_deployed_cap_usd:
+            if len(self._open_bets) >= self._max_concurrent_bets:
                 return False, (
-                    f"total_cap ${total_deployed + notional:.2f}"
-                    f">${self._total_deployed_cap_usd:.2f}"
+                    f"Max concurrent bets reached "
+                    f"({len(self._open_bets)}/{self._max_concurrent_bets})"
                 )
 
-            if tail_deployed + notional > self._tail_max_usd:
+            if self._daily_bets_count >= self._max_daily_bets:
                 return False, (
-                    f"tail_cap ${tail_deployed + notional:.2f}"
-                    f">${self._tail_max_usd:.2f}"
+                    f"Daily bet count limit reached "
+                    f"({self._daily_bets_count}/{self._max_daily_bets})"
                 )
+
+            if equity > 0:
+                deployed = self._get_deployed_by_strategy()
+                tail_deployed = deployed.get("tail_no", 0.0)
+                total_deployed = sum(deployed.values()) + self._reserved_usd
+
+                total_cap = equity * self._total_deployed_pct
+                if total_deployed + notional > total_cap:
+                    return False, (
+                        f"total_cap ${total_deployed + notional:.2f}"
+                        f">{self._total_deployed_pct:.0%}×equity=${total_cap:.2f}"
+                    )
+
+                tail_cap = equity * self._tail_deployed_pct
+                if tail_deployed + notional > tail_cap:
+                    return False, (
+                        f"tail_cap ${tail_deployed + notional:.2f}"
+                        f">{self._tail_deployed_pct:.0%}×equity=${tail_cap:.2f}"
+                    )
 
             return True, "ok"
+
+    def can_place_tail_zone(self, city: str) -> tuple[bool, str]:
+        """
+        Anti-correlation entry guard: block if ≥ max_tail_zone_positions active
+        tail_no trades already exist for cities in the same weather zone as `city`.
+        Counts only ('pending','open','filled') rows — same statuses as deployed capital.
+        """
+        from src.config.cities import CITIES_WHITELIST
+        zone = CITIES_WHITELIST.get(city, {}).get("zone")
+        if not zone:
+            return True, "ok"  # unknown city — allow
+        zone_cities = [c for c, d in CITIES_WHITELIST.items() if d.get("zone") == zone]
+        try:
+            from sqlalchemy import select, func
+            from src.db.session import get_session
+            from src.db.models import LiveTrade
+            session = get_session()
+            try:
+                count = int(
+                    session.execute(
+                        select(func.count()).where(
+                            LiveTrade.strategy_name == "tail_no",
+                            LiveTrade.status.in_(["pending", "open", "filled"]),
+                            LiveTrade.city.in_(zone_cities),
+                        )
+                    ).scalar()
+                    or 0
+                )
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"RiskManager: zone check failed for {city}: {exc}")
+            return True, "ok"
+        if count >= self._max_tail_zone_positions:
+            return False, (
+                f"zone_cap: {zone} has {count}/{self._max_tail_zone_positions} "
+                f"active tail positions"
+            )
+        return True, "ok"
 
     def release_basket_reservation(self, notional: float, n_legs: int) -> None:
         """Release in-memory reservation after basket placement completes (success or failure)."""
@@ -712,7 +772,7 @@ class RiskManager:
                 f"total_loss=${self._total_loss:.2f}"
             )
 
-    def get_status(self) -> RiskStatus:
+    def get_status(self, equity: float = 0.0) -> RiskStatus:
         with self._lock:
             self._maybe_roll_day()
             self._load_live_stats()  # always show live DB values
@@ -722,6 +782,9 @@ class RiskManager:
             )
             tail_deployed = deployed.get("tail_no", 0.0)
             total_deployed = sum(deployed.values())
+            # Compute $-equivalents from equity for display (0 if equity unknown)
+            total_cap_usd = equity * self._total_deployed_pct if equity > 0 else 0.0
+            tail_cap_usd = equity * self._tail_deployed_pct if equity > 0 else 0.0
             return RiskStatus(
                 daily_pnl=self._daily_pnl,
                 daily_loss=self._daily_loss,
@@ -744,9 +807,12 @@ class RiskManager:
                 basket_deployed_usd=basket_deployed,
                 tail_deployed_usd=tail_deployed,
                 total_deployed_usd=total_deployed,
-                total_deployed_cap_usd=self._total_deployed_cap_usd,
-                basket_max_usd=self._basket_max_usd,
-                tail_max_usd=self._tail_max_usd,
+                equity_usd=equity,
+                total_deployed_pct=self._total_deployed_pct,
+                tail_deployed_pct=self._tail_deployed_pct,
+                total_deployed_cap_usd=total_cap_usd,
+                basket_max_usd=0.0,   # basket disabled
+                tail_max_usd=tail_cap_usd,
             )
 
     def set_emergency_stop(self, reason: str, stop_type: str = "manual") -> None:

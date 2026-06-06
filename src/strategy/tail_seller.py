@@ -177,11 +177,13 @@ def scan_tails(
     sigma = ss.tail_sigma_c * (9.0 / 5.0) if unit.upper() == "F" else ss.tail_sigma_c
     yes_probs = _bin_yes_probs(markets, consensus_temp, sigma)
 
-    portfolio_cap = available_capital * ss.tail_max_portfolio_pct
+    from src.config.settings import settings as _settings
+    portfolio_cap = available_capital * _settings.tail_deployed_pct
     budget_left = max(0.0, portfolio_cap - no_capital_in_use)
     if budget_left < ss.min_order_notional_usd:
         result.skipped.append(
             f"portfolio_cap_reached:in_use=${no_capital_in_use:.2f}/{portfolio_cap:.2f}"
+            f"({_settings.tail_deployed_pct:.0%} of equity)"
         )
         return result
 

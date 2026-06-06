@@ -767,17 +767,22 @@ async def cmd_start(update, context) -> None:
 @_admin_only
 async def cmd_risk(update, context) -> None:
     from src.risk.risk_manager import risk_manager
-    s = risk_manager.get_status()
+    from src.strategy.live_trader import _get_equity
+    equity = _get_equity()
+    s = risk_manager.get_status(equity=equity)
+    total_cap = s.total_deployed_cap_usd
+    tail_cap = s.tail_max_usd
+    eq_str = f"${equity:.2f}" if equity > 0 else "н/д"
     text = (
         f"⚠️ <b>Risk Limits</b>\n\n"
         f"💵 Макс. ставка:       ${s.max_single_bet_usd:.2f}  (/setstake)\n"
         f"📅 Макс. ставок/день:  {s.max_daily_bets}  (использовано: {s.daily_bets_count})\n"
         f"📉 Дневной лимит:      ${s.daily_loss_limit_usd:.2f}  (исп.: ${s.daily_loss:.2f})  (/setlimit daily)\n"
         f"💥 Общий стоп-лосс:    ${s.total_stop_loss_usd:.2f}  (исп.: ${s.total_loss:.2f})  (/setlimit total)\n\n"
-        f"💼 <b>Капитал в работе</b>\n"
-        f"  🧺 Basket: ${s.basket_deployed_usd:.2f} / ${s.basket_max_usd:.2f}\n"
-        f"  🎯 Tail:   ${s.tail_deployed_usd:.2f} / ${s.tail_max_usd:.2f}\n"
-        f"  📊 Итого:  ${s.total_deployed_usd:.2f} / ${s.total_deployed_cap_usd:.2f}\n"
+        f"💼 <b>Капитал в работе</b>  (equity {eq_str})\n"
+        f"  🎯 Tail:   ${s.tail_deployed_usd:.2f} / ${tail_cap:.2f}  ({s.tail_deployed_pct:.0%})\n"
+        f"  🧺 Basket: ${s.basket_deployed_usd:.2f}  (выключен)\n"
+        f"  📊 Итого:  ${s.total_deployed_usd:.2f} / ${total_cap:.2f}  ({s.total_deployed_pct:.0%})\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 

@@ -116,6 +116,7 @@ def _make_risk_manager(**kwargs):
         daily_loss_limit_usd=10.0, total_stop_loss_usd=20.0,
         max_basket_legs_open=12, max_tail_positions=3,
         total_deployed_cap_usd=40.0, basket_max_usd=26.0, tail_max_usd=18.0,
+        total_deployed_pct=0.50, tail_deployed_pct=0.50, max_tail_zone_positions=3,
     )
     defaults.update(kwargs)
 
@@ -128,9 +129,16 @@ def _make_risk_manager(**kwargs):
         rm._total_loss = 0.0
         rm._emergency_stop = False
         rm._emergency_stop_reason = ""
+        rm._emergency_stop_type = ""
         rm._open_bets = {}
         rm._reserved_usd = 0.0
         rm._basket_legs_open = 0
+        rm._tail_token_reserved = {}
+        rm._paper_daily_loss = 0.0
+        rm._paper_total_loss = 0.0
+        rm._paper_bankroll_usd = 100.0
+        rm._paper_total_stop_loss_usd = 20.0
+        rm._paper_daily_loss_limit_usd = 10.0
         rm._load_live_stats = lambda: None
         rm._persist_emergency_stop = lambda *a, **kw: None
         rm._get_deployed_by_strategy = lambda: {}
@@ -145,41 +153,46 @@ def test_can_place_basket_ok():
 
 
 def test_can_place_basket_total_cap_exceeded():
-    rm = _make_risk_manager(total_deployed_cap_usd=5.0)
-    ok, reason = rm.can_place_basket(10.0, 3)
+    # equity=$20, total_deployed_pct=0.50 → cap=$10; notional=$11 > $10 → blocked
+    rm = _make_risk_manager(total_deployed_pct=0.50)
+    ok, reason = rm.can_place_basket(11.0, 3, equity=20.0)
     assert ok is False
     assert "total_cap" in reason
 
 
 def test_can_place_basket_basket_cap_exceeded():
-    rm = _make_risk_manager(basket_max_usd=8.0)
-    ok, reason = rm.can_place_basket(10.0, 3)
+    # basket cap removed in equity model; leg-slots still enforced
+    # Test that total cap still works via equity parameter
+    rm = _make_risk_manager(total_deployed_pct=0.50)
+    ok, reason = rm.can_place_basket(0.5, 3, equity=0.8)   # 0.5 > 0.8×50%=0.4 → blocked
     assert ok is False
-    assert "basket_cap" in reason
+    assert "total_cap" in reason
 
 
 def test_can_place_tail_ok():
     rm = _make_risk_manager()
-    ok, reason = rm.can_place_tail(5.0)
+    ok, reason = rm.can_place_tail(5.0, equity=0.0)   # equity=0 → cap check skipped
     assert ok is True
 
 
 def test_can_place_tail_cap_exceeded():
-    rm = _make_risk_manager(tail_max_usd=3.0)
-    ok, reason = rm.can_place_tail(5.0)
+    # equity=$10, tail_deployed_pct=0.30 → cap=$3; notional=$5 > $3 → blocked
+    rm = _make_risk_manager(tail_deployed_pct=0.30)
+    ok, reason = rm.can_place_tail(5.0, equity=10.0)
     assert ok is False
     assert "tail_cap" in reason
 
 
 def test_basket_reserves_prevent_double_spend():
     """Two sequential can_place_basket calls should both see the reservation."""
-    rm = _make_risk_manager(total_deployed_cap_usd=30.0, basket_max_usd=20.0)
-    ok1, _ = rm.can_place_basket(18.0, 3)
+    # equity=$60, total_deployed_pct=0.50 → cap=$30
+    rm = _make_risk_manager(total_deployed_pct=0.50)
+    ok1, _ = rm.can_place_basket(18.0, 3, equity=60.0)
     assert ok1 is True
     assert rm._reserved_usd == pytest.approx(18.0)
 
-    ok2, reason2 = rm.can_place_basket(15.0, 3)
-    assert ok2 is False  # 18 + 15 = 33 > 30 total cap
+    ok2, reason2 = rm.can_place_basket(15.0, 3, equity=60.0)
+    assert ok2 is False  # reserved=18 + 15 = 33 > 30 total cap (60×50%)
     assert "total_cap" in reason2
 
 

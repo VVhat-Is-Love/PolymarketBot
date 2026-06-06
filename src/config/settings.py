@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     # Separate capital caps per strategy
     max_basket_legs_open: int = Field(default=12)
     max_tail_positions: int = Field(default=3)
+    # Equity-based caps (fraction of cash+MTM equity) — replace the absolute USD caps below
+    total_deployed_pct: float = Field(default=0.50)     # max total deployed / equity
+    tail_deployed_pct: float = Field(default=0.50)      # max tail_no deployed / equity
+    max_tail_zone_positions: int = Field(default=3)     # anti-correlation: max tail per weather zone
+    # Deprecated absolute caps — kept so existing .env lines don't break on load;
+    # no longer enforced in can_place_basket / can_place_tail.
     total_deployed_cap_usd: float = Field(default=40.0)
     basket_max_usd: float = Field(default=26.0)
     tail_max_usd: float = Field(default=18.0)

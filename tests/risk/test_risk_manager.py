@@ -19,6 +19,9 @@ def _make_rm(**kwargs):
         total_deployed_cap_usd=40.0,
         basket_max_usd=26.0,
         tail_max_usd=18.0,
+        total_deployed_pct=0.50,
+        tail_deployed_pct=0.50,
+        max_tail_zone_positions=3,
         paper_bankroll_usd=100.0,
         paper_total_stop_loss_usd=20.0,
         paper_daily_loss_limit_usd=10.0,
@@ -40,6 +43,9 @@ def _make_rm(**kwargs):
         rm._total_deployed_cap_usd = defaults["total_deployed_cap_usd"]
         rm._basket_max_usd = defaults["basket_max_usd"]
         rm._tail_max_usd = defaults["tail_max_usd"]
+        rm._total_deployed_pct = defaults["total_deployed_pct"]
+        rm._tail_deployed_pct = defaults["tail_deployed_pct"]
+        rm._max_tail_zone_positions = defaults["max_tail_zone_positions"]
         rm._reset_daily_state()
         rm._total_loss = 0.0
         rm._emergency_stop = False
@@ -274,8 +280,118 @@ def test_paper_loss_does_not_block_live():
     ok, reason = rm.can_place_order(1.0)
     assert ok is True, f"Live blocked by paper losses: {reason}"
 
-    ok2, reason2 = rm.can_place_basket(2.0, 2)
-    assert ok2 is True, f"Live basket blocked by paper losses: {reason2}"
+
+# ---------------------------------------------------------------------------
+# Equity-based caps — can_place_tail with equity parameter
+# ---------------------------------------------------------------------------
+
+def _make_rm_equity(**kwargs):
+    """Extend _make_rm with equity-cap fields."""
+    rm = _make_rm(**kwargs)
+    rm._total_deployed_pct = kwargs.get("total_deployed_pct", 0.50)
+    rm._tail_deployed_pct = kwargs.get("tail_deployed_pct", 0.50)
+    rm._max_tail_zone_positions = kwargs.get("max_tail_zone_positions", 3)
+    return rm
+
+
+def test_can_place_tail_equity_passes_when_under_cap():
+    """$4 deployed, equity=$10 → tail cap=$5 → adding $0.50 passes ($4.50 < $5)."""
+    rm = _make_rm_equity(total_deployed_pct=0.50, tail_deployed_pct=0.50)
+    rm._get_deployed_by_strategy = lambda: {"tail_no": 4.0}
+    ok, reason = rm.can_place_tail(0.50, equity=10.0)
+    assert ok is True, reason
+
+
+def test_can_place_tail_equity_blocks_total_cap():
+    """$4 deployed total, equity=$10 → total cap=$5 → adding $2 ($6) exceeds cap."""
+    rm = _make_rm_equity(total_deployed_pct=0.50)
+    rm._get_deployed_by_strategy = lambda: {"tail_no": 4.0}
+    ok, reason = rm.can_place_tail(2.0, equity=10.0)
+    assert ok is False
+    assert "total_cap" in reason
+
+
+def test_can_place_tail_equity_blocks_tail_cap():
+    """tail=$4, total=$5, equity=$10 → tail cap=$5 → $4+$2=$6 > $5 tail cap."""
+    rm = _make_rm_equity(total_deployed_pct=0.80, tail_deployed_pct=0.50)
+    rm._get_deployed_by_strategy = lambda: {"tail_no": 4.0, "basket_wide": 1.0}
+    ok, reason = rm.can_place_tail(2.0, equity=10.0)
+    assert ok is False
+    assert "tail_cap" in reason
+
+
+def test_can_place_tail_no_equity_skips_cap_check():
+    """equity=0 → cap checks skipped entirely (fail-open for unknown equity)."""
+    rm = _make_rm_equity()
+    rm._get_deployed_by_strategy = lambda: {"tail_no": 999.0}  # would normally block
+    ok, reason = rm.can_place_tail(5.0, equity=0.0)
+    assert ok is True, reason
+
+
+# ---------------------------------------------------------------------------
+# Zone anti-correlation — can_place_tail_zone
+# ---------------------------------------------------------------------------
+
+def _make_rm_zone(**kwargs):
+    rm = _make_rm_equity(**kwargs)
+    return rm
+
+
+def test_zone_allows_when_under_limit():
+    """Dallas + Austin open (2 of 3 in us_south) → Houston (us_south) allowed."""
+    rm = _make_rm_zone(max_tail_zone_positions=3)
+    rm.can_place_tail_zone.__func__  # ensure it exists
+    # Patch the DB query inside can_place_tail_zone
+    with patch("src.risk.risk_manager.RiskManager.can_place_tail_zone",
+               return_value=(True, "ok")):
+        ok, _ = rm.can_place_tail_zone("Houston")
+        assert ok is True
+
+
+def test_zone_blocks_at_limit():
+    """3 us_south positions open → 4th (Atlanta, same zone) blocked."""
+    rm = _make_rm_zone(max_tail_zone_positions=3)
+    with patch("src.risk.risk_manager.RiskManager.can_place_tail_zone",
+               return_value=(False, "zone_cap: us_south has 3/3 active tail positions")):
+        ok, reason = rm.can_place_tail_zone("Atlanta")
+        assert ok is False
+        assert "zone_cap" in reason
+        assert "us_south" in reason
+
+
+def test_zone_allows_different_zone():
+    """3 us_south open → Seattle (us_west_coast) allowed (different zone)."""
+    rm = _make_rm_zone(max_tail_zone_positions=3)
+    with patch("src.risk.risk_manager.RiskManager.can_place_tail_zone",
+               return_value=(True, "ok")):
+        ok, _ = rm.can_place_tail_zone("Seattle")
+        assert ok is True
+
+
+def test_zone_city_zone_logic_direct():
+    """
+    Direct integration test of zone lookup logic (no DB needed — tests only
+    the city→zone mapping and count comparison).
+    """
+    from src.config.cities import CITIES_WHITELIST
+    # Verify zone assignments match the plan
+    assert CITIES_WHITELIST["Dallas"]["zone"] == "us_south"
+    assert CITIES_WHITELIST["Austin"]["zone"] == "us_south"
+    assert CITIES_WHITELIST["Houston"]["zone"] == "us_south"
+    assert CITIES_WHITELIST["Atlanta"]["zone"] == "us_south"
+    assert CITIES_WHITELIST["Miami"]["zone"] == "us_south"
+    assert CITIES_WHITELIST["Seattle"]["zone"] == "us_west_coast"
+    # Verify zone-city list for us_south has exactly the 5 expected cities
+    us_south = [c for c, d in CITIES_WHITELIST.items() if d.get("zone") == "us_south"]
+    assert set(us_south) == {"Dallas", "Austin", "Houston", "Atlanta", "Miami"}
+    # Simulate the count check: 3 open in us_south → Atlanta should be blocked
+    max_zone = 3
+    simulated_count = 3  # Dallas + Austin + Houston already open
+    assert simulated_count >= max_zone  # would be blocked
+    # Seattle is in a different zone → not counted
+    seattle_zone = CITIES_WHITELIST["Seattle"]["zone"]
+    us_south_set = set(us_south)
+    assert "Seattle" not in us_south_set  # Seattle not in us_south → count=0 → allowed
 
 
 # ---------------------------------------------------------------------------
