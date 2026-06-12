@@ -304,6 +304,34 @@ def _entry_price(ask_price: float, settings) -> float:
     return ask_price  # 'mid' mode: passive limit
 
 
+def _log_no_depth(city: str, bin_label: str, token_no: str) -> None:
+    """
+    Log NO-ask book depth for tail capacity analysis.
+    Emits one [tail_depth] INFO line per candidate, never blocks placement.
+    """
+    from src.market.clob_client import get_no_book_depth
+    try:
+        depth = get_no_book_depth(token_no)
+        if not depth:
+            logger.info(
+                f"[tail_depth] {city} {bin_label}: book unavailable "
+                f"(token={token_no[:12]}…)"
+            )
+            return
+        levels: list[tuple[float, float]] = depth.get("ask_levels") or []
+        depth_to_90 = sum(s for p, s in levels if p <= 0.90)
+        spread = depth.get("spread")
+        level_strs = [f"{p:.3f}×{s:.1f}" for p, s in levels[:6]]
+        logger.info(
+            f"[tail_depth] {city} {bin_label} | "
+            f"no_ask_levels=[{', '.join(level_strs)}] | "
+            f"depth_to_0.90={depth_to_90:.1f}sh | "
+            f"spread={f'{spread:.3f}' if spread is not None else 'N/A'}"
+        )
+    except Exception as exc:
+        logger.debug(f"[tail_depth] {city} {bin_label}: depth log failed: {exc}")
+
+
 def _place_basket_orders(
     session: Session,
     group: MarketGroup,
@@ -806,6 +834,12 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
                         )
                         break
 
+                    # Depth log: NO book capacity before risk gates (pure monitoring)
+                    _mkt_d = next((m for m in markets if m.market_id == _o.market_id), None)
+                    _tok_d = (_mkt_d.token_id_no if _mkt_d else None)
+                    if _tok_d:
+                        _log_no_depth(group.city, _o.bin_label, _tok_d)
+
                     # Zone anti-correlation check (entry guard only, not an exit/stop)
                     _z_ok, _z_why = risk_manager.can_place_tail_zone(group.city)
                     if not _z_ok:
@@ -1063,6 +1097,12 @@ def run_tail_engine() -> None:
                     logger.debug(f"[tail] {group.city}: {reason}")
 
                 for o in scan.orders:
+                    # Depth log: NO book capacity before risk gates (pure monitoring)
+                    _mkt_d = next((m for m in markets if m.market_id == o.market_id), None)
+                    _tok_d = (_mkt_d.token_id_no if _mkt_d else None)
+                    if _tok_d:
+                        _log_no_depth(group.city, o.bin_label, _tok_d)
+
                     # Zone anti-correlation check (entry guard only, not an exit/stop)
                     z_ok, z_why = risk_manager.can_place_tail_zone(group.city)
                     if not z_ok:

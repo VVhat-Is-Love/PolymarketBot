@@ -116,6 +116,7 @@ def _parse_book_response(
         "price_no": (1.0 - best_bid) if best_bid is not None else None,
         "no_liquidity": best_ask is None,
         "asset_id": asset_id,
+        "ask_levels": sorted(real_asks, key=lambda t: t[0]),  # [(price, size)] cheapest first
     }
 
 
@@ -433,3 +434,24 @@ def get_yes_ask_prices(
         result.setdefault(tid, None)
 
     return result
+
+
+def get_no_book_depth(token_id: str) -> dict | None:
+    """
+    Full order-book snapshot for one NO token, including all real ask levels.
+
+    Returns a dict with:
+      ask_levels : [(price, size), ...] sorted cheapest-first (stubs ≥ 0.97 excluded)
+      best_ask   : cheapest ask price (or None if no real asks)
+      best_bid   : highest bid price (or None)
+      spread     : best_ask − best_bid (or None)
+    Returns None when the book is unavailable or the call fails.
+    Used for depth/capacity logging only — never gates order placement.
+    """
+    try:
+        return _get_single_book(token_id)
+    except BookUnavailable:
+        return None
+    except Exception as exc:
+        logger.debug(f"[clob] depth fetch failed {token_id[:16]}…: {exc}")
+        return None
