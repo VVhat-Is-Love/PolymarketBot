@@ -20,6 +20,10 @@ MIN_VOLUME = 2_000.0
 _MIN_TTL = timedelta(hours=1)  # ignore events resolving within the next hour
 
 _WEATHER_KEYWORDS = ("highest temperature", "lowest temperature", "precipitation")
+# Hard-excluded: "lowest temperature" markets are never traded. Exit logic is
+# built for highest-temperature bins (peak-day window, P(YES) model). Traded
+# once (Miami 72-73, −$2.78) and lost. Analogous to basket hard-disable.
+_EXCLUDED_WEATHER_KEYWORDS = ("lowest temperature",)
 
 
 def _is_event_active(event: dict) -> bool:
@@ -70,7 +74,7 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
     # G4-23 diagnostic: per-stage discovery funnel so a 0-result cycle is
     # attributable in one line — distinguishes "endpoint returned nothing"
     # from "keyword/city/metric filter cut everything" (e.g. Polymarket retitled).
-    funnel = {"keyword": 0, "volume": 0, "city": 0, "metric": 0, "date": 0}
+    funnel = {"keyword": 0, "lowest_temp": 0, "volume": 0, "city": 0, "metric": 0, "date": 0}
 
     for event in active_events:
         title: str = event.get("title") or ""
@@ -79,6 +83,11 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
         # 1. Only temperature / precipitation events
         if not any(kw in title_lower for kw in _WEATHER_KEYWORDS):
             funnel["keyword"] += 1
+            continue
+
+        # 1b. Hard-exclude lowest-temperature events — only highest is traded.
+        if any(kw in title_lower for kw in _EXCLUDED_WEATHER_KEYWORDS):
+            funnel["lowest_temp"] += 1
             continue
 
         # 2. Volume filter at event level
@@ -173,7 +182,8 @@ def discover_and_save_weather_markets(gamma: GammaClient) -> int:
     logger.info(
         f"Discovery funnel: fetch_status={fetch_status} cause={cause} | "
         f"{len(active_events)} active → "
-        f"−{funnel['keyword']} non-weather title → −{funnel['volume']} low-vol → "
+        f"−{funnel['keyword']} non-weather title → −{funnel['lowest_temp']} lowest-temp → "
+        f"−{funnel['volume']} low-vol → "
         f"−{funnel['city']} city-miss → −{funnel['metric']} metric-miss → "
         f"−{funnel['date']} date-miss → {saved_groups} groups kept"
     )
