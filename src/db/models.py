@@ -246,6 +246,27 @@ class LiveTrade(Base):
     )
 
 
+class CalibrationLog(Base):
+    """Per-bin snapshot: model P(NO) vs market price. Written every snapshot cycle.
+    Pure logging — never read by trading logic. Use for model↔market calibration."""
+    __tablename__ = "calibration_log"
+    __table_args__ = (
+        Index("ix_cal_city_date", "city", "forecast_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
+    city: Mapped[str] = mapped_column(String(64))
+    forecast_date: Mapped[date] = mapped_column(Date)
+    bin_label: Mapped[str] = mapped_column(String(64))
+    model_p_no: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # market_no_ask = 1 - price_yes (Gamma mid); we don't store the NO-book ask separately.
+    market_no_ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_yes_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    models_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class ChecklistEvaluation(Base):
     __tablename__ = "checklist_evaluations"
 

@@ -4,14 +4,14 @@ import time
 from datetime import datetime, date, timedelta
 import schedule
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, func as sqlfunc
 
 from src.market.gamma_client import GammaClient
 from src.market.markets import discover_and_save_weather_markets
 from src.data.open_meteo import fetch_and_save_all_cities
 from src.db.session import get_session
 from src.db.repository import MarketGroupRepository, MarketSnapshotRepository
-from src.db.models import MarketGroup, Market, MarketSnapshot, PaperTrade, DailySummary, LiveTrade
+from src.db.models import MarketGroup, Market, MarketSnapshot, PaperTrade, DailySummary, LiveTrade, CalibrationLog
 from src.strategy.paper_trader import run_paper_trade_engine, run_resolve_paper_trades
 from src.strategy.live_trader import run_live_trade_engine, run_tail_engine
 from src.notifications.telegram import get_notifier
@@ -115,6 +115,121 @@ def _job_snapshot_markets() -> None:
                 logger.error(f"Snapshot failed for group {group.group_id}: {e}")
 
         logger.info(f"Market snapshots: {saved} saved via Gamma API")
+        _job_calibration_log()
+    finally:
+        session.close()
+
+
+def _job_calibration_log() -> None:
+    """Write one CalibrationLog row per active bin: model P(NO) vs market price.
+
+    Called from _job_snapshot_markets() so prices are always fresh.
+    Uses Gaussian P from tail_seller with tail_sigma_c (same model as live engine).
+    Pure logging — zero trading side-effects.
+    """
+    import statistics as _stats
+    from src.db.models import WeatherSnapshot as WSnap
+    from src.strategy.tail_seller import _bin_yes_probs
+    from src.strategy.config import StrategySettings as _StrategyCfg
+
+    ss = _StrategyCfg()
+    session = get_session()
+    try:
+        now = datetime.utcnow()
+        groups: list[MarketGroup] = list(
+            session.execute(
+                select(MarketGroup).where(MarketGroup.is_active == True)  # noqa: E712
+            ).scalars().all()
+        )
+
+        cal_rows: list[CalibrationLog] = []
+        for group in groups:
+            # Latest forecast per model source for this city/date.
+            wx_rows = session.execute(
+                select(WSnap)
+                .where(
+                    WSnap.city == group.city,
+                    WSnap.forecast_date == group.resolution_date,
+                    WSnap.temp_forecast_max.is_not(None),
+                )
+                .order_by(WSnap.snapshot_time.desc())
+                .limit(9)  # 3 models × 3 recent cycles max
+            ).scalars().all()
+
+            # One temp per model source (newest first → first seen = latest).
+            seen_sources: set[str] = set()
+            temps: list[float] = []
+            for wx in wx_rows:
+                if wx.source not in seen_sources:
+                    seen_sources.add(wx.source)
+                    temps.append(float(wx.temp_forecast_max))
+
+            if not temps:
+                continue  # no forecast data for this group yet
+
+            consensus_temp = _stats.mean(temps)
+            models_count = len(temps)
+
+            markets: list[Market] = list(
+                session.execute(
+                    select(Market).where(
+                        Market.group_id == group.group_id,
+                        Market.is_active == True,  # noqa: E712
+                    )
+                ).scalars().all()
+            )
+            if not markets:
+                continue
+
+            # Gaussian sigma in the market's native unit (°F → convert).
+            unit = (group.unit or "F").upper()
+            sigma = ss.tail_sigma_c * (9.0 / 5.0) if unit == "F" else ss.tail_sigma_c
+            p_yes_map = _bin_yes_probs(markets, consensus_temp, sigma)
+
+            # Latest MarketSnapshot per market (single subquery per group).
+            market_ids = [m.market_id for m in markets]
+            latest_subq = (
+                select(
+                    MarketSnapshot.market_id,
+                    sqlfunc.max(MarketSnapshot.snapshot_time).label("latest"),
+                )
+                .where(MarketSnapshot.market_id.in_(market_ids))
+                .group_by(MarketSnapshot.market_id)
+                .subquery()
+            )
+            snap_rows = session.execute(
+                select(MarketSnapshot).join(
+                    latest_subq,
+                    (MarketSnapshot.market_id == latest_subq.c.market_id)
+                    & (MarketSnapshot.snapshot_time == latest_subq.c.latest),
+                )
+            ).scalars().all()
+            snap_by_market: dict[str, MarketSnapshot] = {
+                s.market_id: s for s in snap_rows
+            }
+
+            for m in markets:
+                p_yes = p_yes_map.get(m.market_id)
+                snap = snap_by_market.get(m.market_id)
+                cal_rows.append(CalibrationLog(
+                    timestamp=now,
+                    city=group.city,
+                    forecast_date=group.resolution_date,
+                    bin_label=m.bin_label or "",
+                    model_p_no=(1.0 - p_yes) if p_yes is not None else None,
+                    market_no_ask=snap.price_no if snap else None,
+                    market_yes_price=snap.price_yes if snap else None,
+                    volume_usd=m.volume,
+                    models_count=models_count,
+                ))
+
+        if cal_rows:
+            session.add_all(cal_rows)
+            session.commit()
+        logger.info(f"[calibration] {len(cal_rows)} rows logged ({len(groups)} active groups)")
+    except Exception as exc:
+        logger.error(f"[calibration] job failed: {exc}")
+        session.rollback()
     finally:
         session.close()
 
