@@ -375,6 +375,7 @@ def get_real_polymarket_positions() -> list[dict]:
             "redeemable": bool(p.get("redeemable", False)),
             "end_date": p.get("endDate", ""),
             "condition_id": p.get("conditionId", ""),
+            "asset": str(p.get("asset", "")),   # token id — for bid-valuation (get_equity_bid)
         })
     return positions
 
@@ -423,3 +424,85 @@ def get_portfolio_breakdown() -> dict:
 
     result["total"] = result["cash_balance"] + result["positions_value"]
     return result
+
+
+def get_equity_bid() -> dict:
+    """
+    Equity valued conservatively at BID for the drawdown emergency stop.
+
+    Same underlying source as get_portfolio_breakdown (Polymarket cash + open
+    positions), but each LIVE position is marked at its best BID (realizable
+    value) instead of the data-api curPrice/mark. A thin-book mid spike therefore
+    cannot inflate equity — or the 30-day HWM derived from it — and false-trip or
+    false-clear the stop. Redeemable (won) positions are valued at currentValue
+    (≈ $1/share redemption, not biddable). Falls back to mark when a book is
+    unavailable for a token.
+
+    Returns {cash, positions_value_bid, total_bid, ok}.
+    ok=False ⇒ a balance OR positions fetch failed → caller MUST defer (never move
+    HWM / drawdown on a partial/failed read; that is what makes the stop robust).
+    NOTE: this is intentionally separate from get_portfolio_breakdown so the
+    equity-caps path (which uses mark) is left untouched.
+    """
+    import requests
+    from src.config.settings import settings
+
+    out = {"cash": 0.0, "positions_value_bid": 0.0, "total_bid": 0.0, "ok": False}
+    if not settings.proxy_wallet_address:
+        return out
+
+    # 1. Free USDC inside the exchange (same source as get_portfolio_breakdown)
+    try:
+        from src.blockchain.polymarket_auth import get_clob_client
+        from src.blockchain.balance import get_polymarket_cash_balance
+        out["cash"] = get_polymarket_cash_balance(get_clob_client())
+    except Exception as exc:
+        logger.warning(f"[stats] equity_bid cash fetch failed: {exc} — defer")
+        return out  # ok stays False
+
+    # 2. Open positions (checked fetch so ok is honest — empty[] from an outage
+    #    must NOT be read as 'no positions', which would understate equity and
+    #    falsely trip the drawdown stop).
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": settings.proxy_wallet_address, "sizeThreshold": 0.1, "limit": 100},
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json() or []
+    except Exception as exc:
+        logger.warning(f"[stats] equity_bid positions fetch failed: {exc} — defer")
+        return out  # ok stays False
+
+    from src.market.clob_client import get_book_snapshot
+    pv = 0.0
+    for p in raw:
+        try:
+            size = float(p.get("size", 0))
+            cur = float(p.get("curPrice", 0))
+            cur_value = float(p.get("currentValue", 0))
+        except (TypeError, ValueError):
+            continue
+        redeemable = bool(p.get("redeemable", False))
+        if not (cur > 0.01 or redeemable):
+            continue  # lost / dust
+        if redeemable:
+            pv += cur_value           # won → redemption value, not a book bid
+            continue
+        token = str(p.get("asset") or "")
+        bid = None
+        if token:
+            try:
+                snap = get_book_snapshot(token)
+                if snap:
+                    bid = snap.get("best_bid")
+            except Exception:
+                bid = None
+        pv += size * bid if bid else cur_value   # bid if live book, else fall back to mark
+
+    out["positions_value_bid"] = pv
+    out["total_bid"] = out["cash"] + pv
+    out["ok"] = True
+    return out

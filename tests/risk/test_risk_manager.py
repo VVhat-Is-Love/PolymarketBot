@@ -103,13 +103,103 @@ def test_daily_loss_limit_blocks():
     assert "Daily loss limit" in reason
 
 
-def test_total_stop_loss_triggers_emergency_stop():
+def test_gross_loss_no_longer_triggers_stop():
+    """RETIRED: the gross-loss total stop (Σ|losses| ignoring wins) must NOT stop
+    trading. It bricked a net-positive account. Drawdown-from-equity replaces it."""
     rm = _make_rm(total_stop_loss_usd=20.0)
-    rm._total_loss = 20.0
+    rm._total_loss = 50.0   # huge cumulative gross losses
     ok, reason = rm.can_place_order(1.0)
-    assert ok is False
+    assert ok is True
+    assert reason == "ok"
+    assert rm._emergency_stop is False
+
+
+# ---------------------------------------------------------------------------
+# Drawdown-from-equity emergency stop
+# ---------------------------------------------------------------------------
+
+def _prep_dd(rm, hwm):
+    """Stub HWM + persistence so evaluate_drawdown_stop runs pure in-memory."""
+    rm._drawdown_soft_pct = 0.08
+    rm._drawdown_hard_stop_pct = 0.15
+    rm._dd_size_multiplier = 1.0
+    rm._dd_last = 0.0
+    rm._update_equity_hwm = lambda eq: hwm
+    rm._persist_emergency_stop = lambda *a, **k: None
+
+
+def _run_dd(rm, equity):
+    with patch("src.telegram.stats.get_equity_bid",
+               return_value={"ok": True, "total_bid": equity}), \
+         patch("src.config.settings.settings") as st, \
+         patch("src.notifications.telegram.get_notifier"):
+        st.trading_mode = "live"
+        rm.evaluate_drawdown_stop()
+
+
+def test_drawdown_hard_stop_triggers_and_auto_clears():
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    # equity 80 → dd=20% ≥ 15% → hard stop
+    _run_dd(rm, 80.0)
     assert rm._emergency_stop is True
-    assert "Total stop-loss" in reason
+    assert rm._emergency_stop_type == "drawdown"
+    assert rm._dd_size_multiplier == 0.5     # 20% ≥ soft 8% → halved sizing
+    # equity recovers to 95 → dd=5% < soft 8% → auto-clear
+    _run_dd(rm, 95.0)
+    assert rm._emergency_stop is False
+    assert rm._dd_size_multiplier == 1.0
+
+
+def test_drawdown_soft_only_no_stop():
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    # equity 90 → dd=10% (≥ soft 8%, < hard 15%) → halve sizing, NO stop
+    _run_dd(rm, 90.0)
+    assert rm._emergency_stop is False
+    assert rm._dd_size_multiplier == 0.5
+
+
+def test_drawdown_ignores_gross_loss_history():
+    """Acceptance #4: historical realized losses never enter dd — only equity vs peak."""
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    rm._total_loss = 999.0          # huge retired basket losses
+    _run_dd(rm, 100.0)              # equity at HWM → dd=0%
+    assert rm._emergency_stop is False
+    assert rm._dd_last == pytest.approx(0.0)
+
+
+def test_drawdown_defers_on_unavailable_equity():
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    with patch("src.telegram.stats.get_equity_bid", return_value={"ok": False}), \
+         patch("src.config.settings.settings") as st:
+        st.trading_mode = "live"
+        rm.evaluate_drawdown_stop()
+    assert rm._emergency_stop is False    # no change on bad data
+
+
+def test_drawdown_clears_stale_total_loss_stop():
+    """A bot bricked by the OLD total_loss stop must un-brick once dd is healthy."""
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    rm._emergency_stop = True
+    rm._emergency_stop_type = "total_loss"
+    rm._emergency_stop_reason = "legacy gross-loss stop"
+    _run_dd(rm, 98.0)              # dd=2% < soft → clear
+    assert rm._emergency_stop is False
+
+
+def test_drawdown_does_not_clear_manual_stop():
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    rm._emergency_stop = True
+    rm._emergency_stop_type = "manual"
+    rm._emergency_stop_reason = "operator halt"
+    _run_dd(rm, 100.0)            # healthy, but manual must persist
+    assert rm._emergency_stop is True
+    assert rm._emergency_stop_type == "manual"
 
 
 def test_max_concurrent_bets_blocks():

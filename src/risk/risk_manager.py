@@ -67,6 +67,9 @@ class RiskManager:
         self._basket_legs_open: int = 0
         # G4-20: per-token_id in-run reservations for tail aggregate cap
         self._tail_token_reserved: dict[str, float] = {}
+        # Drawdown stop state (set each cycle by evaluate_drawdown_stop)
+        self._dd_last: float = 0.0
+        self._dd_size_multiplier: float = 1.0   # 1.0 normal, 0.5 when dd ≥ soft
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -78,7 +81,11 @@ class RiskManager:
         self._max_daily_bets = settings.max_daily_bets
         self._max_concurrent_bets = settings.max_concurrent_bets
         self._daily_loss_limit_usd = settings.daily_loss_limit_usd
-        self._total_stop_loss_usd = settings.total_stop_loss_usd
+        self._total_stop_loss_usd = settings.total_stop_loss_usd  # retired (no trigger)
+        # Drawdown-from-equity stop (replaces the gross-loss total stop)
+        self._drawdown_soft_pct = settings.drawdown_soft_pct
+        self._drawdown_hard_stop_pct = settings.drawdown_hard_stop_pct
+        self._drawdown_hwm_window_days = settings.drawdown_hwm_window_days
         self._max_basket_legs_open = settings.max_basket_legs_open
         self._max_tail_positions = settings.max_tail_positions
         # Equity-based cap fractions
@@ -338,22 +345,10 @@ class RiskManager:
         except Exception as exc:
             logger.warning(f"RiskManager: _log_loss_breakdown failed: {exc}")
 
-    def _trigger_total_stop(self, reason: str) -> None:
-        """Edge-triggered: fires once on 0→1 transition; skips alert if already stopped."""
-        if self._emergency_stop:
-            return
-        self._log_loss_breakdown("total_loss", self._total_loss)
-        self._emergency_stop = True
-        self._emergency_stop_reason = reason
-        self._emergency_stop_type = "total_loss"
-        self._persist_emergency_stop(True, reason, "total_loss")
-        try:
-            from src.config.settings import settings
-            if settings.trading_mode.lower() == "live":
-                from src.notifications.telegram import get_notifier
-                get_notifier().send(f"🛑 TOTAL STOP-LOSS: {reason}")
-        except Exception:
-            pass
+    # _trigger_total_stop REMOVED (G-section 10b): the gross-loss total stop is
+    # retired, not kept as a secondary trigger — it summed Σ|losses| ignoring wins,
+    # was monotonic and never reset, and re-armed after /reset_stop, bricking a
+    # net-positive account. Replaced by evaluate_drawdown_stop (drawdown-from-equity).
 
     def _trigger_daily_loss_stop(self, reason: str) -> None:
         """Edge-triggered: activate daily-loss emergency stop (auto-cleared next trading day)."""
@@ -371,6 +366,172 @@ class RiskManager:
                 get_notifier().send(f"⚠️ DAILY LOSS LIMIT: {reason}")
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Drawdown-from-equity emergency stop  (replaces gross-loss total stop)
+    # ------------------------------------------------------------------
+
+    def evaluate_drawdown_stop(self) -> None:
+        """
+        Drawdown-from-equity emergency stop. Runs EVERY cycle regardless of stop
+        state so a recovered equity lifts the stop automatically — the retired
+        gross-loss stop could never un-stop (monotonic Σ|losses|, recomputed from
+        the same DB rows, so it re-armed a cycle after /reset_stop and bricked the
+        bot while the account was net-positive).
+
+            equity_now = cash + Σ(position × BID)      (stats.get_equity_bid, realizable)
+            HWM_30d    = max equity over a rolling 30-day window (per-cycle samples)
+            dd         = (HWM_30d − equity_now) / HWM_30d
+
+            dd ≥ drawdown_soft_pct       → position sizes ×0.5 (soft, via
+                                           position_size_multiplier())
+            dd ≥ drawdown_hard_stop_pct  → emergency stop (hard)
+            dd <  drawdown_soft_pct      → drawdown/total_loss stop auto-cleared
+                                           (hysteresis band soft..hard holds state)
+
+        Drawdown reads ONLY current equity vs its own peak — historical realized
+        losses (e.g. the retired basket_narrow trades) never enter the metric.
+        Live mode only. Defers (no HWM/dd change) when equity-by-bid is unavailable.
+        """
+        from src.config.settings import settings
+        if settings.trading_mode.lower() != "live":
+            return
+
+        from src.telegram.stats import get_equity_bid
+        snap = get_equity_bid()
+        if not snap.get("ok"):
+            logger.warning("[risk] drawdown: equity (bid) unavailable — defer, no status change")
+            return
+
+        equity = float(snap.get("total_bid", 0.0))
+        hwm = self._update_equity_hwm(equity)          # persists sample, returns HWM_30d
+        dd = (hwm - equity) / hwm if hwm > 0 else 0.0
+
+        with self._lock:
+            self._dd_last = dd
+            self._dd_size_multiplier = 0.5 if dd >= self._drawdown_soft_pct else 1.0
+            mult = self._dd_size_multiplier
+
+        logger.info(
+            f"[risk] drawdown: HWM_30d=${hwm:.2f} equity=${equity:.2f} "
+            f"dd={dd * 100:.1f}% (soft≥{self._drawdown_soft_pct * 100:.0f}% "
+            f"hard≥{self._drawdown_hard_stop_pct * 100:.0f}% size×{mult:g})"
+        )
+
+        if dd >= self._drawdown_hard_stop_pct:
+            self._trigger_drawdown_stop(
+                f"Drawdown {dd * 100:.1f}% ≥ {self._drawdown_hard_stop_pct * 100:.0f}% "
+                f"(HWM_30d=${hwm:.2f} → equity=${equity:.2f})"
+            )
+        elif dd < self._drawdown_soft_pct:
+            self._maybe_clear_drawdown_stop(dd)
+
+    def _trigger_drawdown_stop(self, reason: str) -> None:
+        """Edge-triggered drawdown stop; auto-cleared by evaluate_drawdown_stop on recovery."""
+        with self._lock:
+            if self._emergency_stop and self._emergency_stop_type == "drawdown":
+                return  # already drawdown-stopped — no re-alert
+            self._emergency_stop = True
+            self._emergency_stop_reason = reason
+            self._emergency_stop_type = "drawdown"
+        self._persist_emergency_stop(True, reason, "drawdown")
+        logger.warning(f"[risk] DRAWDOWN STOP armed: {reason}")
+        try:
+            from src.config.settings import settings
+            if settings.trading_mode.lower() == "live":
+                from src.notifications.telegram import get_notifier
+                get_notifier().send(f"🛑 DRAWDOWN STOP: {reason}")
+        except Exception:
+            pass
+
+    def _maybe_clear_drawdown_stop(self, dd: float) -> None:
+        """
+        Lift a drawdown- or retired total_loss-stop once equity is back under the
+        soft threshold (hysteresis). Manual and daily_loss stops are left untouched
+        — those have their own lifecycle (/reset_stop, new trading day).
+        """
+        with self._lock:
+            if not self._emergency_stop:
+                return
+            if self._emergency_stop_type not in ("drawdown", "total_loss"):
+                return
+            prev_type = self._emergency_stop_type
+            self._emergency_stop = False
+            self._emergency_stop_reason = ""
+            self._emergency_stop_type = ""
+        self._persist_emergency_stop(False, "", "")
+        logger.info(
+            f"[risk] drawdown recovered (dd={dd * 100:.1f}% < "
+            f"{self._drawdown_soft_pct * 100:.0f}%) — {prev_type} stop cleared"
+        )
+        try:
+            from src.config.settings import settings
+            if settings.trading_mode.lower() == "live":
+                from src.notifications.telegram import get_notifier
+                get_notifier().send(
+                    f"✅ Drawdown восстановлен (dd={dd * 100:.1f}%) — стоп снят, торговля возобновлена"
+                )
+        except Exception:
+            pass
+
+    def _update_equity_hwm(self, equity: float) -> float:
+        """
+        Persist today's equity peak, prune to the rolling 30-day window, and return
+        HWM_30d = max(equity_now, daily peaks in window). Stored in bot_state as
+        {date_iso: max_equity} — bounded at ≤ window+1 entries. On any DB error the
+        current equity is returned as HWM (dd=0 → fail-safe, never a false stop).
+        """
+        import json
+        from src.db.session import get_session
+        from src.db.models import BotState
+
+        today = date.today()
+        cutoff = today - timedelta(days=self._drawdown_hwm_window_days)
+        hwm = equity
+        try:
+            session = get_session()
+            try:
+                row = session.get(BotState, "equity_hwm_30d")
+                data: dict[str, float] = {}
+                if row and row.value:
+                    try:
+                        data = dict(json.loads(row.value))
+                    except Exception:
+                        data = {}
+
+                pruned: dict[str, float] = {}
+                for d_str, v in data.items():
+                    try:
+                        if date.fromisoformat(d_str) >= cutoff:
+                            pruned[d_str] = float(v)
+                    except (ValueError, TypeError):
+                        continue
+
+                tkey = today.isoformat()
+                pruned[tkey] = max(float(pruned.get(tkey, 0.0)), equity)
+                hwm = max([equity, *pruned.values()])
+
+                session.merge(BotState(
+                    key="equity_hwm_30d",
+                    value=json.dumps(pruned),
+                    updated_at=datetime.utcnow(),
+                ))
+                session.commit()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"[risk] HWM update failed: {exc} — using equity as HWM (dd=0)")
+        return hwm
+
+    def position_size_multiplier(self) -> float:
+        """
+        Drawdown soft-sizing factor: 1.0 normally, 0.5 once dd ≥ drawdown_soft_pct.
+        Set by evaluate_drawdown_stop each cycle. Exposed for the entry engine to
+        scale stake; NOT yet wired into run_tail_engine (that is an entry-path
+        touch the current task's ЗАПРЕТ excludes — wire on request).
+        """
+        with self._lock:
+            return getattr(self, "_dd_size_multiplier", 1.0)
 
     def is_emergency_stopped(self) -> bool:
         """Check DB directly — safe to call at startup before _load_live_stats."""
@@ -465,13 +626,8 @@ class RiskManager:
                 )
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
-            if self._total_loss >= self._total_stop_loss_usd:
-                reason = (
-                    f"Total loss ${self._total_loss:.2f} >= "
-                    f"TOTAL_STOP_LOSS ${self._total_stop_loss_usd:.2f}"
-                )
-                self._trigger_total_stop(reason)
-                return False, reason
+            # Gross-loss total stop RETIRED — replaced by drawdown-from-equity stop
+            # (evaluate_drawdown_stop). It set _emergency_stop above when armed.
 
             deployed = self._get_deployed_by_strategy()
             total_deployed = sum(deployed.values()) + self._reserved_usd
@@ -516,13 +672,8 @@ class RiskManager:
                 )
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
-            if self._total_loss >= self._total_stop_loss_usd:
-                reason = (
-                    f"Total loss ${self._total_loss:.2f} >= "
-                    f"TOTAL_STOP_LOSS ${self._total_stop_loss_usd:.2f}"
-                )
-                self._trigger_total_stop(reason)
-                return False, reason
+            # Gross-loss total stop RETIRED — drawdown stop (evaluate_drawdown_stop)
+            # owns the hard cut now and already set _emergency_stop above when armed.
 
             if len(self._open_bets) >= self._max_concurrent_bets:
                 return False, (
@@ -718,14 +869,10 @@ class RiskManager:
                 )
                 return False, f"Daily loss limit reached: ${self._daily_loss:.2f}"
 
-            # 4. Total stop-loss → triggers persistent emergency stop (edge-triggered alert)
-            if self._total_loss >= self._total_stop_loss_usd:
-                reason = (
-                    f"Total loss ${self._total_loss:.2f} >= "
-                    f"TOTAL_STOP_LOSS_USD ${self._total_stop_loss_usd:.2f}"
-                )
-                self._trigger_total_stop(reason)
-                return False, f"Total stop-loss triggered: {reason}"
+            # 4. Total stop-loss RETIRED — the gross-loss metric (Σ|losses| ignoring
+            #    wins, monotonic, never reset) bricked a net-positive account. The
+            #    drawdown-from-equity stop (evaluate_drawdown_stop) replaces it and
+            #    sets _emergency_stop (caught at check 1) when dd ≥ hard threshold.
 
             # 5. Concurrent open bets
             if len(self._open_bets) >= self._max_concurrent_bets:

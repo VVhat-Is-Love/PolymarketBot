@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     max_daily_bets: int = Field(default=10)
     max_concurrent_bets: int = Field(default=15)   # legacy; separate caps used below
     daily_loss_limit_usd: float = Field(default=10.0)
+    # Drawdown-from-equity emergency stop (replaces the retired gross-loss total stop).
+    #   metric = (HWM_30d − equity_now) / HWM_30d, equity valued at BID (realizable).
+    #   dd ≥ soft → position sizes ×0.5 ; dd ≥ hard → emergency stop (auto-clears on recovery).
+    drawdown_soft_pct: float = Field(default=0.08)
+    drawdown_hard_stop_pct: float = Field(default=0.15)
+    drawdown_hwm_window_days: int = Field(default=30)
+    # Deprecated: gross-loss total stop. Kept for .env load-compat; NO LONGER triggers
+    # a stop (it summed Σ|losses| ignoring wins → bricked a net-positive account).
     total_stop_loss_usd: float = Field(default=20.0)
     order_timeout_minutes: int = Field(default=5)
     kelly_fraction: float = Field(default=0.25)

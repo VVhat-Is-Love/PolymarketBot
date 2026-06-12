@@ -174,6 +174,21 @@ def _job_live_trade_engine() -> None:
         logger.error(f"Live trade engine job failed: {e}")
 
 
+def _job_drawdown_guard() -> None:
+    """Drawdown-from-equity emergency stop. Runs EVERY cycle regardless of stop
+    state (unlike _job_live_trade_engine, which self-skips when stopped) so a
+    recovered equity lifts the stop automatically — the retired gross-loss stop
+    could never un-stop and bricked the net-positive account. Live mode only."""
+    from src.config.settings import settings
+    if settings.trading_mode.lower() != "live":
+        return
+    try:
+        from src.risk.risk_manager import risk_manager
+        risk_manager.evaluate_drawdown_stop()
+    except Exception as e:
+        logger.error(f"Drawdown guard job failed: {e}")
+
+
 def _job_tail_early_exit() -> None:
     """A2: tz-aware tail exit — take_profit (any time) / hard_floor + time_gate
     (post local peak). Ticks every 5 min; normal positions self-throttle to 10."""
@@ -1797,6 +1812,7 @@ def setup_scheduler() -> None:
     schedule.every(60).minutes.do(_job_fetch_open_meteo)
     schedule.every(15).minutes.do(_job_paper_trade_engine)
     schedule.every(15).minutes.do(_job_live_trade_engine)   # runtime emergency_stop check inside
+    schedule.every(5).minutes.do(_job_drawdown_guard)       # drawdown stop — always runs (lifts stop on recovery)
     # G4-30: tail-exit is NOT registered here — it runs on its own thread
     # (start_tail_exit_thread) so the blocking run_pending() loop can't starve it.
     schedule.every(10).minutes.do(_job_auto_redeem)          # G4-17: redeem stuck wins on-chain
@@ -1816,6 +1832,7 @@ def setup_scheduler() -> None:
         f"Scheduler ready [{mode}]: discover=30 min | snapshots=10 min | "
         "open-meteo=60 min | deactivate=60 min | "
         "paper-trade=15 min | live-trade=15 min (always registered, runtime-gated) | "
+        "drawdown-guard=5 min (always runs, lifts stop on recovery) | "
         "resolve-paper=60 min | resolve-live=30 min | expire-pending=30 min | "
         "tail-exit=dedicated thread (hot 5 min / normal 10 min, decoupled) | "
         "summary=60 min | daily=00:05 UTC"
@@ -1978,6 +1995,8 @@ def run_initial_jobs() -> None:
     _job_auto_redeem()         # G4-17: redeem stuck wins (no bid / market closed)
     _job_audit_activity()      # G4-19: repair phantom/win-as-loss vs /activity
     _job_resolve_live_trades()
+    _job_drawdown_guard()       # evaluate drawdown BEFORE live engine — lifts a stale
+                                # gross-loss/drawdown stop so a healthy account un-bricks
     _job_paper_trade_engine()
     _job_live_trade_engine()
     _job_paper_trade_summary()

@@ -122,16 +122,19 @@ class TestStopTypeTracking:
         rm._persist_emergency_stop = MagicMock()
         return rm
 
-    def test_total_stop_sets_type_total_loss(self):
+    def test_gross_loss_no_longer_stops(self):
+        """RETIRED gross-loss total stop: a large _total_loss must NOT block trading
+        or set a stop type. The drawdown-from-equity stop (type='drawdown') replaces
+        it — its type-tracking is covered in tests/risk/test_risk_manager.py."""
         rm = self._make_rm_instance()
         rm._total_loss = 25.0
         with patch("src.config.settings.settings") as mock_s:
             mock_s.trading_mode = "live"
             with patch("src.notifications.telegram.get_notifier"):
                 ok, _ = rm.can_place_order(1.0)
-        assert ok is False
-        assert rm._emergency_stop_type == "total_loss"
-        rm._persist_emergency_stop.assert_called_with(True, mock_s.trading_mode and ANY, "total_loss")
+        assert ok is True
+        assert rm._emergency_stop is False
+        rm._persist_emergency_stop.assert_not_called()
 
     def test_daily_loss_stop_sets_type_daily_loss(self):
         rm = self._make_rm_instance()
