@@ -522,3 +522,78 @@ def test_paper_block_alert_edge_triggered_once():
         rm.can_run_paper()
         rm.can_run_paper()
     assert notifier.send.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed gate behaviour on DB/network errors
+# ---------------------------------------------------------------------------
+
+class TestFailClosed:
+    """Gates must deny on DB error, not silently allow (fail-open = worse than no gate)."""
+
+    def test_zone_gate_fail_closed_on_db_error(self):
+        """DB error inside can_place_tail_zone → (False, 'zone gate fail-closed: DB error')."""
+        rm = _make_rm_zone(max_tail_zone_positions=3)
+        # Dallas has zone "us_south" → zone lookup succeeds, but DB query blows up.
+        with patch("src.db.session.get_session", side_effect=RuntimeError("DB down")):
+            ok, reason = rm.can_place_tail_zone("Dallas")
+        assert ok is False
+        assert "fail-closed" in reason
+        assert "DB error" in reason
+
+    def test_zone_gate_normal_path_not_broken(self):
+        """Normal DB path (count=0) still allows a new position."""
+        rm = _make_rm_zone(max_tail_zone_positions=3)
+        mock_session = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        mock_session.execute.return_value.scalar.return_value = 0
+        with patch("src.db.session.get_session", return_value=mock_session):
+            ok, reason = rm.can_place_tail_zone("Dallas")
+        assert ok is True
+        assert reason == "ok"
+
+    def test_zone_gate_normal_path_blocks_at_limit(self):
+        """Normal DB path (count=3, limit=3) blocks."""
+        rm = _make_rm_zone(max_tail_zone_positions=3)
+        mock_session = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        mock_session.execute.return_value.scalar.return_value = 3
+        with patch("src.db.session.get_session", return_value=mock_session):
+            ok, reason = rm.can_place_tail_zone("Dallas")
+        assert ok is False
+        assert "zone_cap" in reason
+
+    def test_basket_equity_cap_fail_closed_on_db_error(self):
+        """_get_deployed_by_strategy returning None → can_place_basket denies."""
+        rm = _make_rm_equity()
+        rm._get_deployed_by_strategy = lambda: None   # simulate DB failure
+        ok, reason = rm.can_place_basket(2.0, n_legs=1, equity=100.0)
+        assert ok is False
+        assert "fail-closed" in reason
+
+    def test_basket_equity_cap_normal_path_passes(self):
+        """Normal DB path with $0 deployed → basket allowed."""
+        rm = _make_rm_equity(total_deployed_pct=0.50)
+        rm._get_deployed_by_strategy = lambda: {}   # no deployed capital
+        ok, reason = rm.can_place_basket(2.0, n_legs=1, equity=100.0)
+        assert ok is True, reason
+
+    def test_tail_equity_cap_fail_closed_on_db_error(self):
+        """_get_deployed_by_strategy returning None + equity>0 → can_place_tail denies."""
+        rm = _make_rm_equity()
+        rm._get_deployed_by_strategy = lambda: None   # simulate DB failure
+        ok, reason = rm.can_place_tail(1.0, equity=100.0)
+        assert ok is False
+        assert "fail-closed" in reason
+
+    def test_tail_equity_cap_db_error_ignored_when_equity_zero(self):
+        """equity=0 skips the cap block entirely — DB error irrelevant, trade allowed."""
+        rm = _make_rm_equity()
+        rm._get_deployed_by_strategy = lambda: None   # would fail if called
+        ok, reason = rm.can_place_tail(1.0, equity=0.0)
+        assert ok is True, reason
+
+    def test_tail_equity_cap_normal_path_passes(self):
+        """Normal DB path with $0 deployed → tail allowed."""
+        rm = _make_rm_equity(total_deployed_pct=0.50, tail_deployed_pct=0.50)
+        rm._get_deployed_by_strategy = lambda: {}
+        ok, reason = rm.can_place_tail(1.0, equity=100.0)
+        assert ok is True, reason

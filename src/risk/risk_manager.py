@@ -282,8 +282,9 @@ class RiskManager:
         except Exception as exc:
             logger.error(f"RiskManager: failed to persist emergency stop to DB: {exc}")
 
-    def _get_deployed_by_strategy(self) -> dict[str, float]:
-        """DB query: sum of stake_usd per strategy for non-resolved trades."""
+    def _get_deployed_by_strategy(self) -> "dict[str, float] | None":
+        """DB query: sum of stake_usd per strategy for non-resolved trades.
+        Returns None on DB error so callers can fail-closed rather than see $0 deployed."""
         try:
             from sqlalchemy import select, func
             from src.db.session import get_session
@@ -304,7 +305,7 @@ class RiskManager:
                 session.close()
         except Exception as exc:
             logger.warning(f"RiskManager: _get_deployed_by_strategy failed: {exc}")
-            return {}
+            return None
 
     def _log_loss_breakdown(self, stop_type: str, total_amount: float) -> None:
         """Query and log the individual trades that contributed to the triggering loss."""
@@ -630,6 +631,9 @@ class RiskManager:
             # (evaluate_drawdown_stop). It set _emergency_stop above when armed.
 
             deployed = self._get_deployed_by_strategy()
+            if deployed is None:
+                logger.warning("[risk] equity cap: DB unavailable (fail-closed) — denying basket")
+                return False, "equity_cap: DB error (fail-closed)"
             total_deployed = sum(deployed.values()) + self._reserved_usd
 
             if equity > 0:
@@ -689,6 +693,9 @@ class RiskManager:
 
             if equity > 0:
                 deployed = self._get_deployed_by_strategy()
+                if deployed is None:
+                    logger.warning("[risk] equity cap: DB unavailable (fail-closed) — denying tail")
+                    return False, "equity_cap: DB error (fail-closed)"
                 tail_deployed = deployed.get("tail_no", 0.0)
                 total_deployed = sum(deployed.values()) + self._reserved_usd
 
@@ -738,8 +745,8 @@ class RiskManager:
             finally:
                 session.close()
         except Exception as exc:
-            logger.warning(f"RiskManager: zone check failed for {city}: {exc}")
-            return True, "ok"
+            logger.warning(f"[risk] zone gate fail-closed: DB error for {city}: {exc}")
+            return False, "zone gate fail-closed: DB error"
         if count >= self._max_tail_zone_positions:
             return False, (
                 f"zone_cap: {zone} has {count}/{self._max_tail_zone_positions} "
@@ -923,7 +930,7 @@ class RiskManager:
         with self._lock:
             self._maybe_roll_day()
             self._load_live_stats()  # always show live DB values
-            deployed = self._get_deployed_by_strategy()
+            deployed = self._get_deployed_by_strategy() or {}  # display: {} on DB error
             basket_deployed = (
                 deployed.get("basket_wide", 0.0) + deployed.get("basket_narrow", 0.0)
             )
