@@ -1,5 +1,5 @@
 from pathlib import Path
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 
 from src.config.settings import settings
@@ -19,6 +19,16 @@ engine = create_engine(
     connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
     echo=False,
 )
+
+if "sqlite" in settings.database_url:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+        """WAL mode: readers never block writers; busy_timeout retries instead of
+        raising 'database is locked' immediately under the 3-thread scheduler."""
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
 
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
