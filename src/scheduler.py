@@ -2061,11 +2061,14 @@ def _tail_exit_loop(base_seconds: float) -> None:
     it calls the same _job_tail_early_exit(); no exit branch / decide_tail_exit
     logic is touched. Stop via _tail_exit_stop.set().
     """
+    from src.monitoring.heartbeat import write_heartbeat
     logger.info(
         f"[tail_exit] dedicated ticker started — base tick {base_seconds:.0f}s "
         f"(own thread, decoupled from scheduler)"
     )
+    write_heartbeat("tail_exit")  # initial heartbeat so watchdog doesn't false-alarm on startup
     while not _tail_exit_stop.wait(base_seconds):
+        write_heartbeat("tail_exit")
         try:
             _job_tail_early_exit()
         except Exception:
@@ -2118,11 +2121,13 @@ def run_initial_jobs() -> None:
 
 
 def run_forever() -> None:
+    from src.monitoring.heartbeat import write_heartbeat
     setup_scheduler()
     run_initial_jobs()
     # G4-30: tail-exit on its own thread so heavy jobs in this loop can't starve it.
     start_tail_exit_thread()
     logger.info("Entering scheduler loop — Ctrl+C / Shift+F5 to stop")
     while True:
+        write_heartbeat("scheduler")
         schedule.run_pending()
         time.sleep(30)

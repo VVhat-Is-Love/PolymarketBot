@@ -1059,6 +1059,13 @@ def run_telegram_bot() -> None:
             # Inline-button callbacks
             app.add_handler(CallbackQueryHandler(_callback_router))
 
+            async def _heartbeat_loop() -> None:
+                """Write telegram-thread heartbeat every 60 s for external watchdog."""
+                from src.monitoring.heartbeat import write_heartbeat
+                while True:
+                    write_heartbeat("telegram")
+                    await asyncio.sleep(60)
+
             async with app:
                 await app.start()
                 logger.info("[telegram_bot] Starting polling…")
@@ -1066,6 +1073,7 @@ def run_telegram_bot() -> None:
                 logger.info("[telegram_bot] Polling active — commands: "
                             "status, pnl, trades, trade, risk, stop, start, "
                             "setlimit, setstake, strategy, cancel")
+                asyncio.create_task(_heartbeat_loop())
                 await asyncio.Event().wait()
 
         try:
