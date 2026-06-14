@@ -1,0 +1,14 @@
+[Unit]
+Description=Polymarket Bot — daily SQLite backup
+After=network.target
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/polymarket-bot
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.scripts.backup_db
+StandardOutput=journal
+StandardError=journal
+# Backup dir must be writable by user bot.
+# Override backup dir at runtime if needed:
+#   ExecStart=... --backup-dir /mnt/nas/polymarket/backups
