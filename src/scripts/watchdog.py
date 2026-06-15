@@ -64,17 +64,50 @@ def _check_threads() -> list[str]:
     return stale
 
 
+def _check_matic() -> list[str]:
+    """Return alert lines if EOA MATIC gas balance is below threshold (empty = OK)."""
+    from src.config.settings import settings
+
+    wallet = settings.eoa_wallet_address
+    if not wallet:
+        logger.debug("eoa_wallet_address not configured — skipping MATIC check")
+        return []
+
+    threshold = settings.matic_alert_threshold
+    try:
+        from src.blockchain.balance import get_matic_balance
+        balance = get_matic_balance(wallet)
+        if balance < threshold:
+            logger.warning(
+                f"MATIC LOW — {balance:.4f} MATIC (threshold {threshold}) on {wallet[:10]}…"
+            )
+            return [
+                f"⛽ MATIC низкий: {balance:.4f} MATIC < {threshold} MATIC — "
+                f"редимы могут застрять в pending_redeem (EOA {wallet[:10]}…)"
+            ]
+        logger.info(f"MATIC: OK — {balance:.4f} MATIC (threshold {threshold})")
+    except Exception as exc:
+        logger.warning(f"MATIC balance check failed: {exc}")
+    return []
+
+
 def main() -> int:
     stale = _check_threads()
-    if not stale:
-        logger.info("All threads healthy")
+    matic_issues = _check_matic()
+
+    if not stale and not matic_issues:
+        logger.info("All checks OK")
         return 0
 
-    msg = (
-        "⚠️ watchdog: thread staleness detected\n\n"
-        + "\n".join(stale)
-        + f"\n\nChecked at {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
-    )
+    parts: list[str] = []
+    if stale:
+        parts.append(
+            "⚠️ watchdog: thread staleness detected\n\n"
+            + "\n".join(stale)
+        )
+    parts.extend(matic_issues)
+
+    msg = "\n\n".join(parts) + f"\n\nChecked at {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     try:
         from src.notifications.telegram import get_notifier
         get_notifier().send(msg)

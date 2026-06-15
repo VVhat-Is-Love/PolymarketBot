@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     # in simulation and is skipped without spending gas.
     auto_redeem_enabled: bool = Field(default=True)
     redeem_min_matic: float = Field(default=0.02)   # skip if gas balance below this
+    matic_alert_threshold: float = Field(default=0.10)  # alert when EOA gas below this (5× redeem_min_matic)
 
     # On-chain position import (G4-26): reconcile the DB from /activity as the
     # source of truth for position EXISTENCE. Classification (open vs
