@@ -18,11 +18,20 @@ REQUEST_DELAY = 0.3  # stay well within 500 req/10s limit for /events
 # DOWN — trip faster. Separate counters with separate thresholds.
 _HARD_FAILURE_THRESHOLD = 2   # connection error / 5xx → endpoint dead
 _TIMEOUT_THRESHOLD = 5        # consecutive read-timeouts → sustained slowness
-_COOLDOWN_MINUTES = 10
+# Exponential cooldown: 10→20→40→60 min per consecutive breaker open; resets on success.
+_COOLDOWN_MINUTES_BASE = 10
+_COOLDOWN_MINUTES_MAX = 60
+
+# Prices fetch: (connect=5s, read=30s) + 2 retries → ≤62s worst-case per group.
+# Connect failures fast-fail at 5s (not accumulated into read-timeout budget).
+_PRICES_CONNECT_TIMEOUT_S = 5
+_PRICES_READ_TIMEOUT_S = 30
+_PRICES_MAX_ATTEMPTS = 2      # was 4; with breaker this is enough signal
 
 # Discovery has a hard wall-clock budget so one slow page can't hang the whole
 # scheduler. Better to skip a cycle than block every other job behind it.
 _DISCOVERY_BUDGET_S = 90.0    # total time allowed for one get_all_weather_events
+_DISCOVERY_CONNECT_TIMEOUT_S = 3   # fast connect-fail for discovery pages
 _DISCOVERY_TIMEOUT_S = 20.0   # per-attempt HTTP read timeout for discovery pages
 _DISCOVERY_PAGE_RETRIES = 3   # in-cycle retries (with backoff) per page on timeout
 
@@ -37,6 +46,7 @@ class GammaClient:
         self._consec_hard: int = 0       # connection/5xx in a row
         self._consec_timeout: int = 0    # read-timeouts in a row
         self._circuit_open_until: datetime | None = None
+        self._open_count: int = 0        # consecutive opens; drives exponential cooldown
         # Reason the last fetch returned nothing, for funnel attribution:
         # "ok" | "breaker_open" | "timeout_budget" | "endpoint_error"
         self._last_fetch_status: str = "ok"
@@ -53,6 +63,8 @@ class GammaClient:
             self._circuit_open_until = None
             self._consec_hard = 0
             self._consec_timeout = 0
+            # _open_count deliberately NOT reset here — only a successful fetch
+            # proves Gamma recovered; expiry alone just means "try again".
             logger.info("Gamma circuit breaker: cooldown finished, resuming")
             return False
         return True
@@ -78,10 +90,16 @@ class GammaClient:
         return "other"
 
     def _open_circuit(self, reason: str) -> None:
-        self._circuit_open_until = datetime.now() + timedelta(minutes=_COOLDOWN_MINUTES)
+        self._open_count += 1
+        cooldown_min = min(
+            _COOLDOWN_MINUTES_BASE * (2 ** (self._open_count - 1)),
+            _COOLDOWN_MINUTES_MAX,
+        )
+        self._circuit_open_until = datetime.now() + timedelta(minutes=cooldown_min)
         logger.warning(
             f"Gamma circuit breaker OPEN ({reason}) — "
-            f"hard={self._consec_hard} timeout={self._consec_timeout}. "
+            f"hard={self._consec_hard} timeout={self._consec_timeout} "
+            f"open_count={self._open_count} cooldown={cooldown_min}min. "
             f"Pausing until {self._circuit_open_until:%H:%M:%S}"
         )
 
@@ -100,6 +118,12 @@ class GammaClient:
     def _record_success(self) -> None:
         self._consec_hard = 0
         self._consec_timeout = 0
+        if self._open_count:
+            logger.info(
+                f"Gamma circuit: consecutive-open counter reset "
+                f"({self._open_count} → 0) — Gamma recovered"
+            )
+            self._open_count = 0
 
     @staticmethod
     def _is_retryable(exc: BaseException) -> bool:
@@ -111,7 +135,7 @@ class GammaClient:
         return False  # 400/403/404 — not retryable
 
     @retry(
-        stop=stop_after_attempt(4),
+        stop=stop_after_attempt(_PRICES_MAX_ATTEMPTS),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception(_is_retryable.__func__),
         reraise=True,
@@ -119,7 +143,12 @@ class GammaClient:
     def _get(self, path: str, params: dict | None = None) -> list | dict:
         url = f"{GAMMA_BASE}{path}"
         try:
-            resp = self._session.get(url, params=params, timeout=60)  # G2-8: 30→60s
+            # (connect, read): connect-fail fast-fails at 5s; read capped at 30s.
+            # 2 retries + 2s backoff → ≤62s worst-case per call.
+            resp = self._session.get(
+                url, params=params,
+                timeout=(_PRICES_CONNECT_TIMEOUT_S, _PRICES_READ_TIMEOUT_S),
+            )
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 5))
                 logger.warning(f"Gamma 429 rate-limit — Retry-After: {retry_after}s")
@@ -156,7 +185,11 @@ class GammaClient:
         """Single-attempt GET (no tenacity) for budget-bounded discovery paging."""
         url = f"{GAMMA_BASE}{path}"
         try:
-            resp = self._session.get(url, params=params, timeout=timeout)
+            # connect=3s fast-fail; read=timeout (default 20s).
+            resp = self._session.get(
+                url, params=params,
+                timeout=(_DISCOVERY_CONNECT_TIMEOUT_S, timeout),
+            )
             resp.raise_for_status()
             return resp.json()
         finally:
