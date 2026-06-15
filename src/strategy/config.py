@@ -73,6 +73,22 @@ class StrategySettings(BaseSettings):
     tail_max_no_ask: float = Field(default=0.94)       # above = payoff too thin for 100% loss risk
     tail_slippage_buffer: float = Field(default=0.01)  # buffer added on top of approximated ask
     tail_min_model_no: float = Field(default=0.93)    # min P(NO) from Gaussian model for inline tail
+    # k·σ distance gate for tail NO entries (run_tail_engine, before placement).
+    # Near bin boundary must be ≥ k·σ from model consensus to qualify as a true tail.
+    # Prevents entries on bins adjacent to consensus that carry hidden realisation risk
+    # (e.g. Austin 94-95°F bin when consensus is 93°F — only 1°F / ~0.6σ away).
+    #
+    # tail_distance_sigma_f  — σ in °F (C-markets auto-convert).  Start rough at 1.7°F;
+    #                          refine with σ-backtest once ≥30 resolved tail trades.
+    # tail_k_sigma           — symmetric k (applies below consensus, and above if
+    #                          tail_k_sigma_above is 0).  Default 2.0 → gate = 3.4°F.
+    # tail_k_sigma_above     — k for bins ABOVE consensus.  0 = use tail_k_sigma.
+    #                          US high-temp is right-skewed → above-consensus tails
+    #                          are riskier; set > tail_k_sigma to tighten that side.
+    tail_distance_sigma_f: float = Field(default=1.7)   # σ in °F (≈ 0.94°C)
+    tail_k_sigma: float = Field(default=2.0)             # k below consensus
+    tail_k_sigma_above: float = Field(default=0.0)       # k above consensus; 0 = use tail_k_sigma
+
     # Early exit: when an open NO position's bid reaches this, SELL to lock ~98%
     # profit, free capital, and remove residual resolution risk (vs waiting for REDEEM).
     tail_early_exit_price: float = Field(default=0.985)

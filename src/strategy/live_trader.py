@@ -954,6 +954,38 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
 # Tail engine — Strategy C: BUY NO on longshot bins close to resolution
 # ---------------------------------------------------------------------------
 
+def _tail_ksigma_ok(
+    bin_lo: float,
+    bin_hi: float | None,
+    consensus_temp: float,
+    unit: str,
+    ss,
+) -> tuple[bool, float, float, float, float]:
+    """
+    k·σ distance gate: is the near bin boundary far enough from consensus?
+
+    Returns (ok, near_bound, distance, threshold, k_eff).
+    ok=True  → bin qualifies (distance ≥ k·σ), may proceed to risk gates.
+    ok=False → bin is too close to consensus, caller should SKIP.
+
+    near_bound: whichever bin edge is closest to consensus.
+    k_eff: the k actually used (tail_k_sigma_above if bin is above consensus
+           and tail_k_sigma_above > 0, else tail_k_sigma).
+    """
+    sigma_gate = (
+        ss.tail_distance_sigma_f if unit.upper() == "F"
+        else ss.tail_distance_sigma_f / 1.8
+    )
+    hi = float(bin_hi) if bin_hi is not None else bin_lo + 1.0
+    above = bin_lo >= consensus_temp
+    near = bin_lo if above else hi
+    dist = abs(near - consensus_temp)
+    k_above = getattr(ss, "tail_k_sigma_above", 0.0)
+    k_eff = k_above if (above and k_above > 0.0) else ss.tail_k_sigma
+    threshold = k_eff * sigma_gate
+    return dist >= threshold, near, dist, threshold, k_eff
+
+
 def run_tail_engine() -> None:
     """
     Scan all groups in the tail time window for +EV NO positions.
@@ -1102,6 +1134,25 @@ def run_tail_engine() -> None:
                     _tok_d = (_mkt_d.token_id_no if _mkt_d else None)
                     if _tok_d:
                         _log_no_depth(group.city, o.bin_label, _tok_d)
+
+                    # k·σ distance gate: near bin boundary ≥ k·σ from consensus
+                    if _mkt_d is not None and _mkt_d.bin_min is not None and consensus_temp is not None:
+                        _unit = (group.unit or "F").upper()
+                        _ok, _near, _dist, _thr, _k = _tail_ksigma_ok(
+                            float(_mkt_d.bin_min),
+                            float(_mkt_d.bin_max) if _mkt_d.bin_max is not None else None,
+                            consensus_temp,
+                            _unit,
+                            ss,
+                        )
+                        if not _ok:
+                            logger.info(
+                                f"[tail] {group.city} {o.bin_label}: SKIP k·sigma — "
+                                f"bin {_near:.0f}°{_unit} within {_k:.1f}σ of "
+                                f"consensus {consensus_temp:.1f}°{_unit} "
+                                f"(dist={_dist:.1f} < {_thr:.1f})"
+                            )
+                            continue
 
                     # Zone anti-correlation check (entry guard only, not an exit/stop)
                     z_ok, z_why = risk_manager.can_place_tail_zone(group.city)
