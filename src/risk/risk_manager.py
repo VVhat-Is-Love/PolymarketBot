@@ -70,6 +70,10 @@ class RiskManager:
         # Drawdown stop state (set each cycle by evaluate_drawdown_stop)
         self._dd_last: float = 0.0
         self._dd_size_multiplier: float = 1.0   # 1.0 normal, 0.5 when dd ≥ soft
+        # Set to True by clear_emergency_stop() when clearing a "drawdown" hard stop.
+        # Prevents evaluate_drawdown_stop from immediately re-arming the same event
+        # after /reset_stop.  Cleared when dd recovers below soft threshold.
+        self._drawdown_hard_reset: bool = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -425,13 +429,19 @@ class RiskManager:
                 f"(HWM_30d=${hwm:.2f} → equity=${equity:.2f})"
             )
         elif dd < self._drawdown_soft_pct:
+            # Natural recovery below soft threshold: clear the manual-reset guard
+            # so that a future drawdown event can arm the hard stop again.
+            with self._lock:
+                self._drawdown_hard_reset = False
             self._maybe_clear_drawdown_stop(dd)
 
     def _trigger_drawdown_stop(self, reason: str) -> None:
-        """Edge-triggered drawdown stop; auto-cleared by evaluate_drawdown_stop on recovery."""
+        """Edge-triggered drawdown stop; cleared only by /reset_stop (not auto-cleared)."""
         with self._lock:
             if self._emergency_stop and self._emergency_stop_type == "drawdown":
                 return  # already drawdown-stopped — no re-alert
+            if self._drawdown_hard_reset:
+                return  # operator manually cleared this drawdown event — don't re-arm
             self._emergency_stop = True
             self._emergency_stop_reason = reason
             self._emergency_stop_type = "drawdown"
@@ -447,14 +457,15 @@ class RiskManager:
 
     def _maybe_clear_drawdown_stop(self, dd: float) -> None:
         """
-        Lift a drawdown- or retired total_loss-stop once equity is back under the
-        soft threshold (hysteresis). Manual and daily_loss stops are left untouched
-        — those have their own lifecycle (/reset_stop, new trading day).
+        Lift a retired total_loss-stop once equity is back under the soft threshold.
+        Hard drawdown stops (type="drawdown") are NOT auto-cleared — they require
+        /reset_stop so the operator consciously reviews the situation first.
+        Manual and daily_loss stops are left untouched (own lifecycle).
         """
         with self._lock:
             if not self._emergency_stop:
                 return
-            if self._emergency_stop_type not in ("drawdown", "total_loss"):
+            if self._emergency_stop_type not in ("total_loss",):
                 return
             prev_type = self._emergency_stop_type
             self._emergency_stop = False
@@ -981,9 +992,14 @@ class RiskManager:
     def clear_emergency_stop(self) -> None:
         """Clear emergency stop — persisted to DB."""
         with self._lock:
+            was_drawdown = self._emergency_stop_type == "drawdown"
             self._emergency_stop = False
             self._emergency_stop_reason = ""
             self._emergency_stop_type = ""
+            if was_drawdown:
+                # Prevent evaluate_drawdown_stop from immediately re-arming while
+                # dd is still ≥ hard threshold.  Flag cleared on natural recovery.
+                self._drawdown_hard_reset = True
             logger.info("RiskManager: emergency stop cleared")
         self._persist_emergency_stop(False, "", "")
 
