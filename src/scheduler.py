@@ -19,7 +19,8 @@ from src.notifications.telegram import get_notifier
 _gamma = GammaClient()
 
 
-_discovery_zero_count: int = 0  # G2-8: consecutive zero-event discovery counter
+_discovery_zero_count: int = 0          # G2-8: consecutive zero-event discovery counter
+_discovery_last_alert: "datetime | None" = None  # throttle: ≤ 1 Gamma-0 alert per 6h
 
 # ── G4-30: tail-exit runs on its OWN thread, decoupled from the single-threaded
 # schedule.run_pending() loop. Heavy jobs (discover/snapshot/import) block that
@@ -32,12 +33,13 @@ _tail_exit_thread: "threading.Thread | None" = None
 
 
 def _job_discover_markets() -> None:
-    global _discovery_zero_count
+    global _discovery_zero_count, _discovery_last_alert
     logger.info("JOB: market discovery")
     try:
         saved = discover_and_save_weather_markets(_gamma)
         if saved > 0:
             _discovery_zero_count = 0
+            _discovery_last_alert = None  # reset throttle so next failure alerts promptly
             logger.info(f"Discovery added {saved} markets — triggering immediate snapshot")
             _job_snapshot_markets()
         else:
@@ -45,13 +47,18 @@ def _job_discover_markets() -> None:
             logger.warning(
                 f"[discovery] 0 new markets (cycle #{_discovery_zero_count})"
             )
-            # G2-8: alert owner if discovery returns 0 for two consecutive cycles
+            # G2-8: alert after 2+ consecutive zero cycles, throttled to ≤ once per 6h.
+            # Counter is NOT reset after alert — "12 cycles подряд" is more useful than
+            # re-firing every 2 cycles.
             if _discovery_zero_count >= 2:
-                _notifier_alert(
-                    f"⚠️ Gamma discovery: 0 рынков найдено {_discovery_zero_count} цикла подряд. "
-                    f"Gamma API может быть недоступен или изменился формат событий."
-                )
-                _discovery_zero_count = 0  # reset counter after alert
+                now = datetime.utcnow()
+                if (_discovery_last_alert is None
+                        or (now - _discovery_last_alert).total_seconds() >= 6 * 3600):
+                    _notifier_alert(
+                        f"⚠️ Gamma discovery: 0 рынков найдено {_discovery_zero_count} цикла подряд. "
+                        f"Gamma API может быть недоступен или изменился формат событий."
+                    )
+                    _discovery_last_alert = now
     except Exception as e:
         logger.error(f"Market discovery job failed: {e}")
 
@@ -1158,6 +1165,22 @@ def _job_reconcile_pnl() -> None:
             # ── Gate 1: REDEEM confirmed ────────────────────────────────────
             if has_redeem:
                 realized = pnl_map.get(token_id, 0.0)
+                # conditionId-race fallback: if the BUY event had empty conditionId
+                # when /activity was fetched, realized_pnl_by_token routes the
+                # REDEEM payout under "cond:{cid}" instead of the token key.
+                # Summing both keys is safe when routing is normal (cond key = 0.0).
+                if condition_id:
+                    realized += pnl_map.get(f"cond:{condition_id}", 0.0)
+                # Still 0 despite a confirmed on-chain payout → conditionId race
+                # not yet resolved by the API.  Defer: do NOT write pnl=0 and freeze.
+                # Next cycle will have the back-filled conditionId and route correctly.
+                if realized == 0.0 and redeem_payouts.get(condition_id or "", 0.0) > 0:
+                    logger.info(
+                        f"[reconcile_pnl] {city} {primary.bin_label}: "
+                        f"REDEEM confirmed (cid={condition_id[:8] if condition_id else '?'}…) "
+                        f"but PnL routing ambiguous — defer"
+                    )
+                    continue
                 source = "redeem"
                 ui_value = redeem_payouts.get(condition_id or "", None)
 
@@ -1336,6 +1359,11 @@ def _job_audit_activity() -> None:
             cid = primary.condition_id or ""
             has_redeem = cid in redeemed
             sold = any((t.status or "") == "sold" for t in trades)
+            # cond-fallback: add any payout still under the "cond:{cid}" key in
+            # case the conditionId race hadn't resolved when /activity was last
+            # fetched during reconcile (same logic as Gate 1 in reconcile_pnl).
+            if cid:
+                activity_pnl += pnl_map.get(f"cond:{cid}", 0.0)
 
             verdict = None
             # --- Repairs (unchanged): act on the two unambiguous classes ---
@@ -1358,6 +1386,23 @@ def _job_audit_activity() -> None:
                         t.reconciled_with_polymarket = True
                         t.status = "resolved"
                 verdict = f"FIX:win {activity_pnl:+.4f}"
+                fixes += 1
+            # Drift-zero: reconcile froze pnl=0 during a conditionId race;
+            # /activity has since back-filled conditionId so routing now works.
+            # Only repair rows that are already frozen (reconciled=True) — pending
+            # rows will be caught by reconcile_pnl on its next run with Fix A.
+            elif (filled and has_redeem
+                  and stored_pnl == 0.0 and activity_pnl > 0.0
+                  and primary.reconciled_with_polymarket):
+                primary.pnl_usd = round(activity_pnl, 4)
+                primary.status = "resolved"
+                primary.reconciled_with_polymarket = True
+                for t in trades:
+                    if t is not primary:
+                        t.pnl_usd = 0.0
+                        t.reconciled_with_polymarket = True
+                        t.status = "resolved"
+                verdict = f"FIX:drift-zero {activity_pnl:+.4f}"
                 fixes += 1
 
             # --- Three-way diagnostic verdict (G4-22): no silent OK on drift ---
