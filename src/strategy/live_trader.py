@@ -1267,6 +1267,8 @@ def run_tail_engine() -> None:
 # next cycle re-derives cadence). Keyed by trade id.
 _tail_last_eval: dict[str, datetime] = {}
 _tail_last_bid: dict[str, float] = {}
+_tail_gate_count: dict[str, int] = {}   # consecutive below-threshold polls per trade id (T1 debounce)
+_tail_sub_notional: set[str] = set()    # trade ids where hard_floor sweep < $1 min notional (T3)
 
 
 def decide_tail_exit(
@@ -1334,6 +1336,8 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
     hot_thr = getattr(ss, "tail_hot_bid_threshold", 0.65)
     hot_min = int(getattr(ss, "tail_poll_hot_minutes", 5))
     normal_min = int(getattr(ss, "tail_poll_normal_minutes", 10))
+    debounce_polls = int(getattr(ss, "tail_exit_debounce_polls", 3))
+    min_age_hours = float(getattr(ss, "tail_min_position_age_hours", 4.0))
     session = get_session()
     notifier = get_notifier()
     _resolved_cache: dict[str, bool] = {}
@@ -1416,15 +1420,61 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
                 continue
             _tail_last_bid[t.id] = best_bid
 
-            action = decide_tail_exit(
+            raw_action = decide_tail_exit(
                 best_bid, in_window,
                 take_profit=take_profit, hard_floor=hard_floor, time_gate=time_gate,
             )
-            logger.info(
-                f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
-                f"local_hour={lhour if lhour is not None else '?'} in_window={in_window} "
-                f"poll={'hot' if hot else 'normal'} → {action}"
-            )
+
+            # ── T1 guards: debounce + min-position-age for time_gate / hard_floor ──
+            # take_profit on a near-par bid is not a thin-book false-signal risk,
+            # and hard_floor already flagged as sub-notional goes straight to hold.
+            if raw_action == "hard_floor" and t.id in _tail_sub_notional:
+                # Already determined sweep notional < $1; no SELL possible — wait for resolve.
+                logger.debug(
+                    f"[tail_exit] {t.city} {t.market_id}: hard_floor sub-notional skip "
+                    f"(bid={best_bid:.3f})"
+                )
+                continue
+
+            action = raw_action
+            guard_reason = ""
+
+            if raw_action in ("time_gate", "hard_floor"):
+                # 1) Min-position-age: block exits for freshly-opened positions.
+                age_h: float | None = None
+                age_ref = t.filled_at or t.placed_at
+                if age_ref is not None:
+                    age_h = (now - age_ref.replace(tzinfo=None)).total_seconds() / 3600
+                    if age_h < min_age_hours:
+                        action = "hold"
+                        guard_reason = f"min-age {age_h:.1f}h < {min_age_hours}h"
+
+                # 2) Debounce: require N consecutive below-threshold polls.
+                if action != "hold":
+                    cnt = _tail_gate_count.get(t.id, 0) + 1
+                    _tail_gate_count[t.id] = cnt
+                    if cnt < debounce_polls:
+                        action = "hold"
+                        guard_reason = f"debounce {cnt}/{debounce_polls}"
+                    else:
+                        guard_reason = f"debounce {cnt}/{debounce_polls} confirmed"
+
+                logger.info(
+                    f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
+                    f"local_hour={lhour if lhour is not None else '?'} in_window={in_window} "
+                    f"poll={'hot' if hot else 'normal'} → {action}"
+                    + (f" [{raw_action} {guard_reason}]" if guard_reason else f" [{raw_action}]")
+                )
+            else:
+                # take_profit or natural hold: clear debounce counter (bid recovered).
+                _tail_gate_count.pop(t.id, None)
+                _tail_sub_notional.discard(t.id)
+                logger.info(
+                    f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
+                    f"local_hour={lhour if lhour is not None else '?'} in_window={in_window} "
+                    f"poll={'hot' if hot else 'normal'} → {action}"
+                )
+
             if action == "hold":
                 continue
 
@@ -1436,6 +1486,18 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
                 # actual fill may be BELOW best_bid — logged honestly here; the
                 # true VWAP is confirmed by reconcile from the /activity SELL.
                 exec_price = round(max(0.001, sweep_price), 4)
+                # T3: CLOB min notional is $1.00 — if sweep can't clear this,
+                # a SELL will always be SKIPPED; mark as sub-notional and wait
+                # for the market to resolve (auto_redeem handles it then).
+                if exec_price * shares < 1.0:
+                    logger.info(
+                        f"[tail_exit] HARD_FLOOR {t.city} {t.market_id}: "
+                        f"sweep notional ${exec_price * shares:.2f} < $1 min — "
+                        f"no SELL possible (bid={best_bid:.3f}), hold to auto_redeem"
+                    )
+                    _tail_sub_notional.add(t.id)
+                    _tail_gate_count.pop(t.id, None)
+                    continue
                 provisional = round(shares * best_bid - stake, 4)  # estimate from bid
                 logger.warning(
                     f"[tail_exit] HARD_FLOOR {t.city} {t.market_id}: market SELL "
@@ -1445,7 +1507,7 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
                 )
             else:
                 # take_profit / time_gate → limit SELL at the bid
-                exec_price = round(min(0.999, best_bid), 4)
+                exec_price = round(min(0.99, best_bid), 4)
                 provisional = round(shares * exec_price - stake, 4)
                 logger.info(
                     f"[tail_exit] {action.upper()} {t.city} {t.market_id} sell @ "
@@ -1469,6 +1531,8 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
                 session.commit()
                 _tail_last_eval.pop(t.id, None)
                 _tail_last_bid.pop(t.id, None)
+                _tail_gate_count.pop(t.id, None)
+                _tail_sub_notional.discard(t.id)
                 # Free deployed capital immediately
                 try:
                     risk_manager.record_bet_result(t.id, t.group_id or "", provisional)

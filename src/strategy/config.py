@@ -108,6 +108,12 @@ class StrategySettings(BaseSettings):
     tail_hot_bid_threshold: float = Field(default=0.65)
     tail_poll_hot_minutes: int = Field(default=5)
     tail_poll_normal_minutes: int = Field(default=10)
+    # Debounce: require this many consecutive below-threshold polls before
+    # time_gate / hard_floor fires (prevents false exits on thin-book bid spikes).
+    tail_exit_debounce_polls: int = Field(default=3)
+    # Min-position-age: block time_gate / hard_floor for positions younger than
+    # this many hours (fresh positions on thin books produce false signals).
+    tail_min_position_age_hours: float = Field(default=4.0)
 
 
 strategy_settings = StrategySettings()
