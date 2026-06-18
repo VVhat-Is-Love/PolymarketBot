@@ -428,25 +428,34 @@ class RiskManager:
                 f"Drawdown {dd * 100:.1f}% ≥ {self._drawdown_hard_stop_pct * 100:.0f}% "
                 f"(HWM_30d=${hwm:.2f} → equity=${equity:.2f})"
             )
-        elif dd < self._drawdown_soft_pct:
-            # Natural recovery below soft threshold: clear the manual-reset guard
-            # so that a future drawdown event can arm the hard stop again.
+        else:
+            # dd < hard threshold: clear the /reset_stop re-arm guard so a future
+            # breach triggers a fresh stop (not suppressed by the old clear).
+            # Clears on ANY de-escalation below hard, not just below soft — otherwise
+            # dd oscillating 15-20% after /reset_stop would block all future stops.
             with self._lock:
-                self._drawdown_hard_reset = False
-            self._maybe_clear_drawdown_stop(dd)
+                if self._drawdown_hard_reset:
+                    logger.info(
+                        f"[risk] dd {dd * 100:.1f}% < {self._drawdown_hard_stop_pct * 100:.0f}% "
+                        f"hard — drawdown_hard_reset cleared, next breach will re-arm"
+                    )
+                    self._drawdown_hard_reset = False
+            if dd < self._drawdown_soft_pct:
+                self._maybe_clear_drawdown_stop(dd)
 
     def _trigger_drawdown_stop(self, reason: str) -> None:
         """Edge-triggered drawdown stop; cleared only by /reset_stop (not auto-cleared)."""
         with self._lock:
             if self._emergency_stop and self._emergency_stop_type == "drawdown":
                 return  # already drawdown-stopped — no re-alert
-            if self._drawdown_hard_reset:
+            # getattr: guard against old in-memory singletons missing this attribute
+            if getattr(self, "_drawdown_hard_reset", False):
                 return  # operator manually cleared this drawdown event — don't re-arm
             self._emergency_stop = True
             self._emergency_stop_reason = reason
             self._emergency_stop_type = "drawdown"
+            logger.warning(f"RiskManager: EMERGENCY STOP SET [drawdown] — {reason}")
         self._persist_emergency_stop(True, reason, "drawdown")
-        logger.warning(f"[risk] DRAWDOWN STOP armed: {reason}")
         try:
             from src.config.settings import settings
             if settings.trading_mode.lower() == "live":

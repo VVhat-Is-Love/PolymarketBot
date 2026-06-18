@@ -60,6 +60,7 @@ def _make_rm(**kwargs):
         rm._reserved_usd = 0.0
         rm._basket_legs_open = 0
         rm._tail_token_reserved = {}
+        rm._drawdown_hard_reset = False  # FIX-1: attribute added in b3f4f74, must init here too
         # Disable DB sync so tests run against pure in-memory state
         rm._load_live_stats = lambda: None
         rm._get_deployed_by_strategy = lambda: {}
@@ -137,18 +138,47 @@ def _run_dd(rm, equity):
         rm.evaluate_drawdown_stop()
 
 
-def test_drawdown_hard_stop_triggers_and_auto_clears():
+def test_drawdown_hard_stop_triggers():
+    """dd≥15% arms EMERGENCY STOP SET [drawdown]; soft sizing also kicks in."""
     rm = _make_rm()
     _prep_dd(rm, hwm=100.0)
-    # equity 80 → dd=20% ≥ 15% → hard stop
+    # equity 80 → dd=20% ≥ hard 15% → stop
     _run_dd(rm, 80.0)
     assert rm._emergency_stop is True
     assert rm._emergency_stop_type == "drawdown"
     assert rm._dd_size_multiplier == 0.5     # 20% ≥ soft 8% → halved sizing
-    # equity recovers to 95 → dd=5% < soft 8% → auto-clear
-    _run_dd(rm, 95.0)
-    assert rm._emergency_stop is False
-    assert rm._dd_size_multiplier == 1.0
+
+
+def test_drawdown_hard_stop_not_auto_cleared():
+    """Drawdown stop requires /reset_stop — it must NOT auto-clear on dd recovery."""
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    _run_dd(rm, 80.0)   # dd=20% → stop armed
+    assert rm._emergency_stop is True
+    # Equity recovers above soft threshold → stop stays armed (requires /reset_stop)
+    _run_dd(rm, 95.0)   # dd=5% < soft 8%
+    assert rm._emergency_stop is True        # NOT auto-cleared
+    assert rm._emergency_stop_type == "drawdown"
+
+
+def test_drawdown_hard_reset_clears_below_hard():
+    """After /reset_stop at dd≥15%, if dd drops below 15%, flag clears → next breach re-arms."""
+    rm = _make_rm()
+    _prep_dd(rm, hwm=100.0)
+    _run_dd(rm, 80.0)   # dd=20% → stop armed
+    # Simulate /reset_stop
+    rm._emergency_stop = False
+    rm._emergency_stop_type = ""
+    rm._drawdown_hard_reset = True
+    # dd still at 20% → blocked by _drawdown_hard_reset
+    _run_dd(rm, 80.0)
+    assert rm._emergency_stop is False   # blocked — same event
+    # dd drops below hard threshold (14%) → reset guard clears
+    _run_dd(rm, 86.0)   # dd=14% < 15% hard
+    assert rm._drawdown_hard_reset is False   # guard cleared
+    # dd climbs back to 16% → new event, re-arms
+    _run_dd(rm, 84.0)   # dd=16% ≥ 15%
+    assert rm._emergency_stop is True
 
 
 def test_drawdown_soft_only_no_stop():
