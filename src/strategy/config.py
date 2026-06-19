@@ -78,16 +78,18 @@ class StrategySettings(BaseSettings):
     # Prevents entries on bins adjacent to consensus that carry hidden realisation risk
     # (e.g. Austin 94-95°F bin when consensus is 93°F — only 1°F / ~0.6σ away).
     #
-    # tail_distance_sigma_f  — σ in °F (C-markets auto-convert).  Start rough at 1.7°F;
-    #                          refine with σ-backtest once ≥30 resolved tail trades.
-    # tail_k_sigma           — symmetric k (applies below consensus, and above if
-    #                          tail_k_sigma_above is 0).  Default 2.0 → gate = 3.4°F.
-    # tail_k_sigma_above     — k for bins ABOVE consensus.  0 = use tail_k_sigma.
-    #                          US high-temp is right-skewed → above-consensus tails
-    #                          are riskier; set > tail_k_sigma to tighten that side.
-    tail_distance_sigma_f: float = Field(default=1.7)   # σ in °F (≈ 0.94°C)
-    tail_k_sigma: float = Field(default=2.0)             # k below consensus
-    tail_k_sigma_above: float = Field(default=0.0)       # k above consensus; 0 = use tail_k_sigma
+    # tail_distance_sigma_f  — σ in °F: honest forecast RMSE (≈ daily-max error).
+    #                          3.5°F ≈ real mid-season RMSE; do NOT tune down to
+    #                          "catch" specific trades — safety margin lives in k.
+    #                          Per-city calibration (σ_city) comes from offline
+    #                          archive backtest (Step 3).
+    # tail_k_sigma           — k for bins BELOW consensus (conservative direction).
+    # tail_k_sigma_above     — k for bins ABOVE consensus (heat-skew, riskier side).
+    #                          Asymmetric: above = 2.0 × 3.5 = 7.0°F defensive wall;
+    #                          below = 1.0 × 3.5 = 3.5°F — symmetric-ish to old gate.
+    tail_distance_sigma_f: float = Field(default=3.5)   # σ in °F — honest forecast RMSE
+    tail_k_sigma: float = Field(default=1.0)             # k below consensus → 3.5°F threshold
+    tail_k_sigma_above: float = Field(default=2.0)       # k above consensus → 7.0°F threshold
 
     # Early exit: when an open NO position's bid reaches this, SELL to lock ~98%
     # profit, free capital, and remove residual resolution risk (vs waiting for REDEEM).

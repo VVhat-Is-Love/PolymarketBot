@@ -1135,36 +1135,42 @@ def run_tail_engine() -> None:
                     if _tok_d:
                         _log_no_depth(group.city, o.bin_label, _tok_d)
 
-                    # k·σ distance gate: near bin boundary ≥ k·σ from consensus
+                    # k·σ distance gate: near bin boundary ≥ k·σ from consensus.
+                    # Fail-closed: missing market geometry or consensus → SKIP, never bypass.
                     _unit = (group.unit or "F").upper()
-                    if _mkt_d is None or _mkt_d.bin_min is None or consensus_temp is None:
-                        # Gate bypassed — log so we can see in live logs why it was skipped
+                    if _mkt_d is None or _mkt_d.bin_min is None:
                         logger.warning(
-                            f"[tail_ksigma] {group.city} {o.bin_label}: BYPASSED "
-                            f"(mkt_d={'ok' if _mkt_d else 'None'} "
-                            f"bin_min={'ok' if (_mkt_d and _mkt_d.bin_min is not None) else 'None'} "
-                            f"consensus={'ok' if consensus_temp is not None else 'None'})"
-                        )
-                    else:
-                        _ok, _near, _dist, _thr, _k = _tail_ksigma_ok(
-                            float(_mkt_d.bin_min),
-                            float(_mkt_d.bin_max) if _mkt_d.bin_max is not None else None,
-                            consensus_temp,
-                            _unit,
-                            ss,
-                        )
-                        _sigma_gate = _thr / _k if _k > 0 else 0.0
-                        _verdict = "PASS" if _ok else "SKIP"
-                        logger.info(
                             f"[tail_ksigma] {group.city} {o.bin_label}: "
-                            f"consensus={consensus_temp:.2f}°{_unit} "
-                            f"near_edge={_near:.2f}°{_unit} "
-                            f"dist={_dist:.2f}°{_unit} "
-                            f"sigma={_sigma_gate:.2f}°{_unit} "
-                            f"k={_k:.1f} verdict={_verdict}"
+                            f"SKIP (no market geometry — fail-closed)"
                         )
-                        if not _ok:
-                            continue
+                        continue
+                    if consensus_temp is None:
+                        logger.warning(
+                            f"[tail_ksigma] {group.city} {o.bin_label}: "
+                            f"SKIP (consensus=None — fail-closed, no forecast data)"
+                        )
+                        continue
+                    _ok, _near, _dist, _thr, _k = _tail_ksigma_ok(
+                        float(_mkt_d.bin_min),
+                        float(_mkt_d.bin_max) if _mkt_d.bin_max is not None else None,
+                        consensus_temp,
+                        _unit,
+                        ss,
+                    )
+                    _sigma_gate = _thr / _k if _k > 0 else 0.0
+                    _dir = "ABOVE" if _near >= consensus_temp else "BELOW"
+                    _verdict = "PASS" if _ok else "SKIP"
+                    logger.info(
+                        f"[tail_ksigma] {group.city} {o.bin_label}: "
+                        f"consensus={consensus_temp:.2f}°{_unit} "
+                        f"near_edge={_near:.2f}°{_unit} "
+                        f"dist={_dist:.2f}°{_unit} "
+                        f"dir={_dir} "
+                        f"sigma={_sigma_gate:.2f}°{_unit} "
+                        f"k={_k:.1f} verdict={_verdict}"
+                    )
+                    if not _ok:
+                        continue
 
                     # Zone anti-correlation check (entry guard only, not an exit/stop)
                     z_ok, z_why = risk_manager.can_place_tail_zone(group.city)
