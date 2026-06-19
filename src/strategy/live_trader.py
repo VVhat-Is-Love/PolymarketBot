@@ -1136,8 +1136,16 @@ def run_tail_engine() -> None:
                         _log_no_depth(group.city, o.bin_label, _tok_d)
 
                     # k·σ distance gate: near bin boundary ≥ k·σ from consensus
-                    if _mkt_d is not None and _mkt_d.bin_min is not None and consensus_temp is not None:
-                        _unit = (group.unit or "F").upper()
+                    _unit = (group.unit or "F").upper()
+                    if _mkt_d is None or _mkt_d.bin_min is None or consensus_temp is None:
+                        # Gate bypassed — log so we can see in live logs why it was skipped
+                        logger.warning(
+                            f"[tail_ksigma] {group.city} {o.bin_label}: BYPASSED "
+                            f"(mkt_d={'ok' if _mkt_d else 'None'} "
+                            f"bin_min={'ok' if (_mkt_d and _mkt_d.bin_min is not None) else 'None'} "
+                            f"consensus={'ok' if consensus_temp is not None else 'None'})"
+                        )
+                    else:
                         _ok, _near, _dist, _thr, _k = _tail_ksigma_ok(
                             float(_mkt_d.bin_min),
                             float(_mkt_d.bin_max) if _mkt_d.bin_max is not None else None,
@@ -1145,13 +1153,17 @@ def run_tail_engine() -> None:
                             _unit,
                             ss,
                         )
+                        _sigma_gate = _thr / _k if _k > 0 else 0.0
+                        _verdict = "PASS" if _ok else "SKIP"
+                        logger.info(
+                            f"[tail_ksigma] {group.city} {o.bin_label}: "
+                            f"consensus={consensus_temp:.2f}°{_unit} "
+                            f"near_edge={_near:.2f}°{_unit} "
+                            f"dist={_dist:.2f}°{_unit} "
+                            f"sigma={_sigma_gate:.2f}°{_unit} "
+                            f"k={_k:.1f} verdict={_verdict}"
+                        )
                         if not _ok:
-                            logger.info(
-                                f"[tail] {group.city} {o.bin_label}: SKIP k·sigma — "
-                                f"bin {_near:.0f}°{_unit} within {_k:.1f}σ of "
-                                f"consensus {consensus_temp:.1f}°{_unit} "
-                                f"(dist={_dist:.1f} < {_thr:.1f})"
-                            )
                             continue
 
                     # Zone anti-correlation check (entry guard only, not an exit/stop)
