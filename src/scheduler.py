@@ -165,6 +165,8 @@ def _job_calibration_log() -> None:
                     active_tail_keys.add((_city, _bin))
 
         cal_rows: list[CalibrationLog] = []
+        skipped_no_forecast = 0
+        skipped_no_markets = 0
         for group in groups:
             # Latest forecast per model source for this city/date.
             wx_rows = session.execute(
@@ -187,7 +189,12 @@ def _job_calibration_log() -> None:
                     temps.append(float(wx.temp_forecast_max))
 
             if not temps:
-                continue  # no forecast data for this group yet
+                logger.debug(
+                    f"[calibration] {group.city} {group.resolution_date}: "
+                    f"SKIP — no WeatherSnapshot rows (forecast not yet fetched)"
+                )
+                skipped_no_forecast += 1
+                continue
 
             consensus_temp = _stats.mean(temps)
             models_count = len(temps)
@@ -201,6 +208,11 @@ def _job_calibration_log() -> None:
                 ).scalars().all()
             )
             if not markets:
+                logger.debug(
+                    f"[calibration] {group.city} {group.resolution_date}: "
+                    f"SKIP — no active Market rows for group_id={group.group_id}"
+                )
+                skipped_no_markets += 1
                 continue
 
             # Gaussian sigma in the market's native unit (°F → convert).
@@ -248,6 +260,11 @@ def _job_calibration_log() -> None:
                     bin_far_boundary = far
                     bin_distance_sigma = abs(near - consensus_temp) / sigma
 
+                if m.bin_min is None:
+                    logger.debug(
+                        f"[calibration] {group.city} {m.bin_label}: "
+                        f"bin_min=None → bin_near_boundary/sigma NULL for this row"
+                    )
                 cal_rows.append(CalibrationLog(
                     timestamp=now,
                     city=group.city,
@@ -269,9 +286,15 @@ def _job_calibration_log() -> None:
         if cal_rows:
             session.add_all(cal_rows)
             session.commit()
-        logger.info(f"[calibration] {len(cal_rows)} rows logged ({len(groups)} active groups)")
+        logger.info(
+            f"[calibration] {len(cal_rows)} rows logged "
+            f"({len(groups)} active groups"
+            + (f", {skipped_no_forecast} skipped no-forecast" if skipped_no_forecast else "")
+            + (f", {skipped_no_markets} skipped no-markets" if skipped_no_markets else "")
+            + ")"
+        )
     except Exception as exc:
-        logger.error(f"[calibration] job failed: {exc}")
+        logger.error(f"[calibration] job failed: {exc}", exc_info=True)
         session.rollback()
     finally:
         session.close()
