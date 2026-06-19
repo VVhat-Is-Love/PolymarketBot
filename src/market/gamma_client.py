@@ -35,6 +35,12 @@ _DISCOVERY_CONNECT_TIMEOUT_S = 3   # fast connect-fail for discovery pages
 _DISCOVERY_TIMEOUT_S = 20.0   # per-attempt HTTP read timeout for discovery pages
 _DISCOVERY_PAGE_RETRIES = 3   # in-cycle retries (with backoff) per page on timeout
 
+# DISCOVERY-FIX: Gamma's ?q= keyword search stopped filtering server-side ~2026-06-19.
+# Switch to tag-based discovery via /events/keyset (cursor pagination, no offset 403).
+# tag_id is resolved dynamically via /tags/slug/{slug} so it doesn't need hardcoding.
+_WEATHER_TAG_SLUG = "daily-temperature"    # GET /tags/slug/daily-temperature → {"id": "103040", ...}
+_WEATHER_TAG_ID_FALLBACK = 103040          # "Daily Temperature" — verified 2026-06-19
+
 
 class GammaClient:
     def __init__(self) -> None:
@@ -337,36 +343,148 @@ class GammaClient:
                 return mid
         return None
 
-    def get_all_weather_events(self) -> list[dict]:
-        """
-        Fetch weather events via targeted keyword search to avoid the 403 that
-        Gamma returns when paginating beyond offset=900 on the full /events feed.
+    def _get_tag_id_by_slug(self, slug: str) -> int | None:
+        """Resolve a tag slug to its numeric id via /tags/slug/{slug}.
 
-        G4-24: bounded by a hard wall-clock budget so one slow page can't hang the
-        scheduler. last_fetch_status carries the reason a cycle came back short
-        ("ok" / "breaker_open" / "timeout_budget" / "endpoint_error").
+        Returns None on any failure — caller falls back to hardcoded _WEATHER_TAG_ID_FALLBACK.
         """
-        seen_ids: set = set()
+        try:
+            result = self._get_once(f"/tags/slug/{slug}", timeout=10.0)
+            if isinstance(result, dict) and result.get("id"):
+                return int(result["id"])
+            if isinstance(result, list) and result and result[0].get("id"):
+                return int(result[0]["id"])
+            logger.warning(f"[gamma] /tags/slug/{slug} returned unexpected shape: {result!r}")
+        except Exception as exc:
+            logger.warning(f"[gamma] tag slug lookup failed ({slug!r}): {exc}")
+        return None
+
+    def _fetch_keyset_page(
+        self, tag_id: int, after_cursor: str | None, deadline: float | None
+    ) -> tuple[list[dict], str | None] | None:
+        """Fetch one page from /events/keyset with in-cycle backoff.
+
+        Returns (events, next_cursor) on success.
+        Returns None when all retries are spent or a hard failure occurs — caller stops.
+        """
+        params: dict = {"closed": "false", "limit": 100, "tag_id": tag_id}
+        if after_cursor:
+            params["after_cursor"] = after_cursor
+
+        backoff = 2.0
+        last_kind = "timeout"
+        for attempt in range(1, _DISCOVERY_PAGE_RETRIES + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                last_kind = "timeout"
+                break
+            try:
+                result = self._get_once("/events/keyset", params=params)
+                if isinstance(result, dict):
+                    # /events/keyset returns {"events": [...], "next_cursor": "..."}
+                    # (different from /events which uses "data")
+                    data = result.get("events") or result.get("data") or []
+                    cursor = result.get("next_cursor")  # absent/None when feed exhausted
+                else:
+                    data = result or []
+                    cursor = None
+                return data, cursor
+            except Exception as e:
+                last_kind = self._classify(e)
+                logger.warning(
+                    f"Gamma /events/keyset tag_id={tag_id} "
+                    f"attempt {attempt}/{_DISCOVERY_PAGE_RETRIES} [{last_kind}]: {e}"
+                )
+                if last_kind == "hard":
+                    break
+                if attempt < _DISCOVERY_PAGE_RETRIES:
+                    remaining = (deadline - time.monotonic()) if deadline else backoff
+                    sleep_for = min(backoff, max(0.0, remaining))
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    backoff *= 2
+
+        self._last_fail_kind = last_kind
+        self._record_failure(last_kind)
+        return None
+
+    def _paginate_events_keyset(self, tag_id: int, deadline: float | None) -> list[dict]:
+        """Fetch all events for tag_id via cursor-based /events/keyset pagination.
+
+        Cursor pagination avoids the offset-403 limit and correctly handles
+        feed growth between pages (no duplicates from shifted offsets).
+        """
+        if self._is_circuit_open():
+            logger.debug("Gamma circuit open — skipping keyset fetch")
+            self._last_fetch_status = "breaker_open"
+            return []
+
         all_events: list[dict] = []
-        deadline = time.monotonic() + _DISCOVERY_BUDGET_S
-        statuses: list[str] = []
+        after_cursor: str | None = None
+        pages = 0
+        t0 = time.monotonic()
+        status = "ok"
+        self._last_fail_kind = ""
 
-        for keyword in ("temperature", "precipitation"):
-            page_events = self._paginate_events(deadline=deadline, q=keyword)
-            statuses.append(self._last_fetch_status)
-            new = [e for e in page_events if e.get("id") not in seen_ids]
-            for e in new:
-                seen_ids.add(e["id"])
-            all_events.extend(new)
-            logger.info(
-                f"Gamma keyword={keyword!r}: {len(page_events)} events ({len(new)} new) "
-                f"[status={self._last_fetch_status}]"
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    f"[gamma] keyset tag_id={tag_id}: time budget exhausted "
+                    f"after {pages} pages ({len(all_events)} events)"
+                )
+                status = "timeout_budget"
+                break
+
+            result = self._fetch_keyset_page(tag_id, after_cursor, deadline)
+            if result is None:
+                status = "endpoint_error" if self._last_fail_kind == "hard" else "timeout_budget"
+                break
+
+            page_data, next_cursor = result
+            all_events.extend(page_data)
+            pages += 1
+            logger.debug(
+                f"Gamma /events/keyset tag_id={tag_id} page {pages}: "
+                f"{len(page_data)} events (cursor={after_cursor!r})"
             )
+            self._record_success()
 
-        # Surface the worst reason (any non-ok) so discovery can attribute a 0-cycle.
-        final = next((s for s in statuses if s != "ok"), "ok")
-        self._last_fetch_status = final
+            if not next_cursor or not page_data:
+                break  # feed exhausted
+            after_cursor = next_cursor
+
+        elapsed = time.monotonic() - t0
         logger.info(
-            f"Gamma: {len(all_events)} unique weather events fetched (status={final})"
+            f"Gamma keyset tag_id={tag_id}: {len(all_events)} events "
+            f"in {pages} pages ({elapsed:.1f}s, status={status})"
         )
+        self._last_fetch_status = status
         return all_events
+
+    def get_all_weather_events(self) -> list[dict]:
+        """Fetch weather events via tag-based keyset pagination.
+
+        DISCOVERY-FIX: Gamma's ?q= keyword search stopped filtering server-side
+        ~2026-06-19, returning unrelated events for all queries. Replaced with
+        /events/keyset?tag_id=103040 (slug "temperature" = "Daily Temperature"),
+        which correctly returns Highest temperature in {city} events.
+
+        tag_id is resolved dynamically via /tags/slug/{slug} so no hardcoded
+        dependency. Falls back to _WEATHER_TAG_ID_FALLBACK on lookup failure.
+
+        G4-24: bounded by _DISCOVERY_BUDGET_S wall-clock budget. last_fetch_status
+        carries "ok" / "breaker_open" / "timeout_budget" / "endpoint_error".
+        """
+        deadline = time.monotonic() + _DISCOVERY_BUDGET_S
+
+        tag_id = self._get_tag_id_by_slug(_WEATHER_TAG_SLUG) or _WEATHER_TAG_ID_FALLBACK
+        logger.info(
+            f"[gamma] weather discovery via keyset: "
+            f"slug={_WEATHER_TAG_SLUG!r} tag_id={tag_id}"
+        )
+
+        events = self._paginate_events_keyset(tag_id=tag_id, deadline=deadline)
+        logger.info(
+            f"Gamma: {len(events)} weather events fetched "
+            f"(status={self._last_fetch_status})"
+        )
+        return events
