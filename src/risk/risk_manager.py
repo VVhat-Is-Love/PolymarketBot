@@ -1066,6 +1066,44 @@ class RiskManager:
             self._total_stop_loss_usd = value
             logger.info(f"RiskManager: total_stop_loss_usd → ${value:.2f}")
 
+    def reset_paper_stop(self) -> int:
+        """Reset virtual paper stop by marking all loss trades as voided_legacy.
+
+        Returns the number of trades voided. Persists across restarts because
+        voided trades are excluded from paper_total_loss in _load_live_stats().
+        """
+        with self._lock:
+            n_voided = 0
+            try:
+                from sqlalchemy import update as sa_update
+                from src.db.session import get_session
+                from src.db.models import PaperTrade
+
+                session = get_session()
+                try:
+                    result = session.execute(
+                        sa_update(PaperTrade)
+                        .where(
+                            PaperTrade.pnl_usd < 0,
+                            PaperTrade.status != "voided_legacy",
+                        )
+                        .values(status="voided_legacy")
+                    )
+                    session.commit()
+                    n_voided = result.rowcount or 0
+                    logger.info(
+                        f"[risk] reset_paper_stop: {n_voided} loss trade(s) voided from accounting"
+                    )
+                finally:
+                    session.close()
+            except Exception as exc:
+                logger.error(f"[risk] reset_paper_stop DB error: {exc}")
+
+            self._paper_total_loss = 0.0
+            self._paper_daily_loss = 0.0
+            self._paper_block_alerted = False
+            return n_voided
+
 
 # Module-level singleton — shared across scheduler and Telegram bot threads
 risk_manager = RiskManager()
