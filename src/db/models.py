@@ -265,6 +265,23 @@ class CalibrationLog(Base):
     market_yes_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     volume_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     models_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Distance of this bin's near boundary from consensus in σ units (at snapshot time).
+    # near boundary = bin_min if bin is above consensus, else bin_max.
+    bin_distance_sigma: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # True if bot had an active tail_no position on this bin at snapshot time.
+    bot_traded: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Raw σ-independent fields — stay valid even when sigma changes (e.g. INTERIM-ENTRY σ→3-4°F).
+    # With actual_temp_resolve: realized_error = actual_temp_resolve - consensus_temp
+    consensus_temp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bin_near_boundary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bin_far_boundary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sigma_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Resolution fields — populated by _job_calibration_resolve after the market settles.
+    # resolved_outcome: True = YES bin won (temp landed in this range), False = bin lost.
+    resolved_outcome: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Actual temperature in native unit (°F or °C) from Open-Meteo archive.
+    actual_temp_resolve: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class ChecklistEvaluation(Base):

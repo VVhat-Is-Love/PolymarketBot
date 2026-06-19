@@ -149,6 +149,21 @@ def _job_calibration_log() -> None:
             ).scalars().all()
         )
 
+        # Pre-load active tail_no positions for all cities in one query.
+        # Used to stamp bot_traded=True on bins where a position is currently open.
+        active_tail_keys: set[tuple[str, str]] = set()
+        if groups:
+            tail_rows = session.execute(
+                select(LiveTrade.city, LiveTrade.bin_label).where(
+                    LiveTrade.city.in_([g.city for g in groups]),
+                    LiveTrade.strategy_name == "tail_no",
+                    LiveTrade.status.in_(["open", "filled", "pending", "pending_redeem"]),
+                )
+            ).all()
+            for _city, _bin in tail_rows:
+                if _city and _bin:
+                    active_tail_keys.add((_city, _bin))
+
         cal_rows: list[CalibrationLog] = []
         for group in groups:
             # Latest forecast per model source for this city/date.
@@ -218,6 +233,21 @@ def _job_calibration_log() -> None:
             for m in markets:
                 p_yes = p_yes_map.get(m.market_id)
                 snap = snap_by_market.get(m.market_id)
+
+                # bin_distance_sigma: how many σ the near boundary is from consensus.
+                # near boundary = bin_min if bin is above consensus, else bin_max.
+                bin_distance_sigma = None
+                bin_near_boundary = None
+                bin_far_boundary = None
+                if m.bin_min is not None and sigma > 0:
+                    hi = float(m.bin_max) if m.bin_max is not None else float(m.bin_min) + 1.0
+                    above = float(m.bin_min) >= consensus_temp
+                    near = float(m.bin_min) if above else hi
+                    far = hi if above else float(m.bin_min)
+                    bin_near_boundary = near
+                    bin_far_boundary = far
+                    bin_distance_sigma = abs(near - consensus_temp) / sigma
+
                 cal_rows.append(CalibrationLog(
                     timestamp=now,
                     city=group.city,
@@ -228,6 +258,12 @@ def _job_calibration_log() -> None:
                     market_yes_price=snap.price_yes if snap else None,
                     volume_usd=m.volume,
                     models_count=models_count,
+                    bin_distance_sigma=bin_distance_sigma,
+                    bot_traded=(group.city, m.bin_label or "") in active_tail_keys,
+                    consensus_temp=consensus_temp,
+                    bin_near_boundary=bin_near_boundary,
+                    bin_far_boundary=bin_far_boundary,
+                    sigma_used=sigma,
                 ))
 
         if cal_rows:
@@ -236,6 +272,133 @@ def _job_calibration_log() -> None:
         logger.info(f"[calibration] {len(cal_rows)} rows logged ({len(groups)} active groups)")
     except Exception as exc:
         logger.error(f"[calibration] job failed: {exc}")
+        session.rollback()
+    finally:
+        session.close()
+
+
+def _job_calibration_resolve() -> None:
+    """Backfill CalibrationLog rows with resolution outcomes once the market settles.
+
+    For each (city, forecast_date) pair that has unresolved CalibrationLog rows and
+    whose market has resolved on Gamma, sets:
+      resolved_outcome  — True if this bin's YES market won (temp in that range)
+      resolved_at       — UTC timestamp of this backfill
+      actual_temp_resolve — actual temperature in native unit from Open-Meteo archive
+      bot_traded        — upgraded to True if any tail_no LiveTrade row exists for
+                          this group/bin (catches trades placed after the snapshot)
+
+    Pure logging backfill — no trading side-effects.
+    """
+    from src.config.cities import CITIES_WHITELIST
+    from src.data.open_meteo import fetch_actual_temperature
+
+    session = get_session()
+    try:
+        today = date.today()
+        # Find (city, forecast_date) pairs with rows still awaiting resolution.
+        unresolved_pairs = session.execute(
+            select(CalibrationLog.city, CalibrationLog.forecast_date)
+            .where(
+                CalibrationLog.resolved_at.is_(None),
+                CalibrationLog.forecast_date < today,
+            )
+            .distinct()
+        ).all()
+
+        if not unresolved_pairs:
+            return
+
+        logger.debug(f"[cal_resolve] Checking {len(unresolved_pairs)} (city, date) pairs")
+        updated = 0
+
+        # Cache actual temps per (city, date) — each Open-Meteo call costs ~200 ms.
+        temp_cache: dict[tuple[str, date], float | None] = {}
+
+        for city, forecast_date in unresolved_pairs:
+            # One market group per city+date (temperature events are unique per day).
+            group = session.execute(
+                select(MarketGroup).where(
+                    MarketGroup.city == city,
+                    MarketGroup.resolution_date == forecast_date,
+                ).limit(1)
+            ).scalar_one_or_none()
+            if group is None:
+                continue
+
+            if not _gamma.is_resolved_event(group.group_id):
+                continue
+
+            winning_mid = _gamma.winning_market_id(group.group_id)
+            if winning_mid is None:
+                # Gamma settled but winner not yet propagated — retry next cycle.
+                continue
+
+            # Map bin_label → resolved_outcome for every market in this group.
+            markets_in_group = session.execute(
+                select(Market).where(Market.group_id == group.group_id)
+            ).scalars().all()
+            outcome_by_label: dict[str, bool] = {
+                m.bin_label: (m.market_id == winning_mid)
+                for m in markets_in_group
+                if m.bin_label
+            }
+
+            # Actual temperature (Open-Meteo archive, cached per city+date).
+            cache_key = (city, forecast_date)
+            if cache_key not in temp_cache:
+                cfg = CITIES_WHITELIST.get(city, {})
+                lat, lon = cfg.get("lat"), cfg.get("lon")
+                actual_native: float | None = None
+                if lat is not None and lon is not None:
+                    actual_c = fetch_actual_temperature(
+                        lat, lon, forecast_date, group.metric or "high_temp"
+                    )
+                    if actual_c is not None:
+                        unit = (group.unit or "F").upper()
+                        actual_native = actual_c * 9 / 5 + 32 if unit == "F" else actual_c
+                temp_cache[cache_key] = actual_native
+            actual_temp = temp_cache[cache_key]
+
+            # Bins this group's tail_no trades covered (for upgrading bot_traded).
+            traded_bins: set[str] = set(
+                session.execute(
+                    select(LiveTrade.bin_label).where(
+                        LiveTrade.group_id == group.group_id,
+                        LiveTrade.strategy_name == "tail_no",
+                        LiveTrade.status.in_([
+                            "open", "filled", "pending", "pending_redeem",
+                            "resolved", "sold",
+                        ]),
+                    ).distinct()
+                ).scalars().all()
+            )
+            traded_bins.discard(None)  # type: ignore[arg-type]
+
+            # Stamp every unresolved row for this (city, forecast_date).
+            rows_to_update = session.execute(
+                select(CalibrationLog).where(
+                    CalibrationLog.city == city,
+                    CalibrationLog.forecast_date == forecast_date,
+                    CalibrationLog.resolved_at.is_(None),
+                )
+            ).scalars().all()
+
+            now = datetime.utcnow()
+            for row in rows_to_update:
+                row.resolved_outcome = outcome_by_label.get(row.bin_label)
+                row.resolved_at = now
+                row.actual_temp_resolve = actual_temp
+                if row.bin_label in traded_bins:
+                    row.bot_traded = True
+                updated += 1
+
+            session.commit()
+
+        if updated:
+            logger.info(f"[cal_resolve] Stamped {updated} CalibrationLog rows with outcomes")
+    except Exception as exc:
+        logger.error(f"[cal_resolve] Job failed: {exc}")
         session.rollback()
     finally:
         session.close()
@@ -1985,6 +2148,7 @@ def setup_scheduler() -> None:
     schedule.every(30).minutes.do(_job_audit_activity)      # G4-19: /activity audit + repair
     schedule.every(30).minutes.do(_job_expire_stale_pending)
     schedule.every(30).minutes.do(_job_resolve_live_trades)
+    schedule.every(30).minutes.do(_job_calibration_resolve)  # backfill CalibrationLog outcomes
     schedule.every().sunday.at("04:00").do(_job_cleanup_snapshots)
     schedule.every().day.at("00:05").do(_job_daily_summary)
     mode = settings.trading_mode.upper()
