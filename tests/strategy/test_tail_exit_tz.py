@@ -1,4 +1,4 @@
-"""A1/A2: local-city-time helpers + tz-aware tail-exit decision."""
+"""A1: local-city-time helpers; A2: tail-exit decision (FIX-2: take_profit only)."""
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -17,7 +17,6 @@ def _grp(offset):
 # ---------------------------------------------------------------------------
 
 def test_local_hour_applies_offset():
-    # Houston is UTC−5 (DST) / −6. −5h = −18000s.
     g = _grp(-18000)
     expected = (datetime.utcnow() + timedelta(seconds=-18000)).hour
     assert local_hour(g) == expected
@@ -27,44 +26,32 @@ def test_local_hour_applies_offset():
 def test_local_hour_none_when_offset_unknown():
     assert local_hour(_grp(None)) is None
     assert local_hour(None) is None
-    # local_now falls back to UTC (no crash) when offset is unknown
     assert abs((local_now(_grp(None)) - datetime.utcnow()).total_seconds()) < 2
 
 
 # ---------------------------------------------------------------------------
-# A2: decision branches in order (acceptance cases verbatim)
+# A2: FIX-2 — take_profit active; time_gate / hard_floor removed → hold
 # ---------------------------------------------------------------------------
 
-def test_take_profit_fires_any_time():
+def test_take_profit_fires_at_or_above_threshold():
+    """bid ≥ take_profit → take_profit regardless of in_window."""
     assert decide_tail_exit(0.99, in_window=False, take_profit=TP, hard_floor=HF, time_gate=TG) == "take_profit"
     assert decide_tail_exit(0.995, in_window=True, take_profit=TP, hard_floor=HF, time_gate=TG) == "take_profit"
+    assert decide_tail_exit(1.0, in_window=False, take_profit=TP, hard_floor=HF, time_gate=TG) == "take_profit"
 
 
-def test_mid_bid_before_window_holds():
-    # bid 0.50 before peak / outside window → hold (NOT exit)
-    assert decide_tail_exit(0.50, in_window=False, take_profit=TP, hard_floor=HF, time_gate=TG) == "hold"
-
-
-def test_mid_bid_after_peak_time_gate():
-    # bid 0.50 in window → time_gate SELL
-    assert decide_tail_exit(0.50, in_window=True, take_profit=TP, hard_floor=HF, time_gate=TG) == "time_gate"
-
-
-def test_low_bid_after_peak_hard_floor():
-    # bid 0.44 in window → hard_floor (checked before time_gate)
-    assert decide_tail_exit(0.44, in_window=True, take_profit=TP, hard_floor=HF, time_gate=TG) == "hard_floor"
-
-
-def test_low_bid_before_peak_holds_noise():
-    # bid 0.44 before peak → hold (intraday noise, Chicago 60¢→plus)
-    assert decide_tail_exit(0.44, in_window=False, take_profit=TP, hard_floor=HF, time_gate=TG) == "hold"
-
-
-def test_hard_floor_checked_before_time_gate():
-    # exactly at the floor in window → hard_floor, not time_gate
-    assert decide_tail_exit(0.45, in_window=True, take_profit=TP, hard_floor=HF, time_gate=TG) == "hard_floor"
-
-
-def test_high_but_sub_take_profit_in_window_holds():
-    # 0.80 in window: not ≤0.45, not <0.55 → hold (a healthy winner, wait for par)
-    assert decide_tail_exit(0.80, in_window=True, take_profit=TP, hard_floor=HF, time_gate=TG) == "hold"
+def test_below_take_profit_always_holds():
+    """FIX-2: time_gate and hard_floor branches removed — all other bids → hold."""
+    cases = [
+        (0.989, False),  # just below TP, pre-window
+        (0.989, True),   # just below TP, post-peak
+        (0.80, True),    # healthy mid-range
+        (0.50, True),    # former time_gate territory → now hold
+        (0.44, True),    # former hard_floor territory → now hold
+        (0.44, False),   # thin-book noise pre-window → hold
+        (0.45, True),    # former hard_floor exact boundary → hold
+        (0.01, True),    # near-zero bid → hold (no sub-notional SELL attempt)
+    ]
+    for bid, win in cases:
+        result = decide_tail_exit(bid, in_window=win, take_profit=TP, hard_floor=HF, time_gate=TG)
+        assert result == "hold", f"Expected hold for bid={bid} in_window={win}, got {result!r}"

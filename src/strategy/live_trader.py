@@ -1263,12 +1263,9 @@ def run_tail_engine() -> None:
 # Tail early exit — SELL a winning NO position to lock profit before REDEEM
 # ---------------------------------------------------------------------------
 
-# A2: adaptive-polling state (in-memory; resets on restart, which is fine — the
-# next cycle re-derives cadence). Keyed by trade id.
+# Adaptive-polling state (in-memory; resets on restart — next cycle re-derives).
 _tail_last_eval: dict[str, datetime] = {}
 _tail_last_bid: dict[str, float] = {}
-_tail_gate_count: dict[str, int] = {}   # consecutive below-threshold polls per trade id (T1 debounce)
-_tail_sub_notional: set[str] = set()    # trade ids where hard_floor sweep < $1 min notional (T3)
 
 
 def decide_tail_exit(
@@ -1276,47 +1273,36 @@ def decide_tail_exit(
     take_profit: float, hard_floor: float, time_gate: float,
 ) -> str:
     """
-    Pure tail-exit decision (no DB/network) — branches in CHECK ORDER:
+    FIX-2 (2026-06-18): only take_profit is active.
 
-      1. take_profit — ANY time: bid ≥ take_profit → grab near-par, wrap capital.
-      2. hard_floor  — post-peak ONLY: bid ≤ hard_floor → market-dump the loser.
-      3. time_gate   — post-peak ONLY: bid < time_gate → SELL the loser at bid.
-      else → hold (before the local peak a dip is intraday noise that recovers).
+    take_profit: bid ≥ take_profit → SELL immediately. At bid≥0.99 the position
+    has already won; selling frees the capital slot without meaningful residual risk
+    (and without waiting for market resolve, which can take hours).
 
-    `in_window` is True only when the city local hour is at/after the peak hour;
-    when local time is unknown it is False, so floor/time-gate never fire on UTC.
+    time_gate / hard_floor REMOVED: sold winning positions on thin-book bid spikes
+    that recovered (Ankara: +$0.93 winner sold at −$2.09). Asymmetry: misfiring
+    costs ~$3; not cutting a real loser costs ~$6. Net-negative in logged history.
+
+    # HOOK — future running-max-confirmed loss exit:
+    #   wire hard_floor / time_gate back here after σ-backtest + bias calibration
+    #   on the resolved CalibrationLog sample. Signature unchanged for easy diff.
     """
     if best_bid >= take_profit:
         return "take_profit"
-    if in_window and best_bid <= hard_floor:
-        return "hard_floor"
-    if in_window and best_bid < time_gate:
-        return "time_gate"
     return "hold"
 
 
 def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
     """
-    Manage open NO positions by SELLING on LIVE markets — A2: tz-aware, 3 branches.
+    Manage open NO positions — FIX-2: take_profit only, hold everything else.
 
-    A SELL is only possible while the order book is live. Once the market is
-    closed/resolved on Polymarket the shares convert to a redemption claim and the
-    book balance is 0 (SELL fails with balance:0) → route to auto_redeem instead.
+    Each tick:
+      - market RESOLVED   → status=pending_redeem → auto_redeem handles on-chain.
+      - bid ≥ take_profit → SELL @ min(0.99, bid), free the capital slot.
+      - otherwise         → hold; log bid for observability.
 
-    Per live position, in CHECK ORDER (see decide_tail_exit):
-      1. take_profit — ANY time: bid ≥ tail_take_profit_price → SELL @ bid.
-      2. hard_floor  — post local peak ONLY (local_hour ≥ tail_local_peak_hour):
-                       bid ≤ tail_hard_floor_price → market-dump (sweep), honest
-                       actual-fill logging.
-      3. time_gate   — post-peak ONLY: bid < tail_time_gate_price → SELL @ bid.
-      else → hold (pre-peak dips are intraday noise that recover).
-
-    Local time comes from MarketGroup.utc_offset_seconds (Open-Meteo, DST-aware);
-    unknown offset ⇒ not-in-window ⇒ only take_profit can fire (safe).
-
-    Adaptive polling: post-peak OR bid < tail_hot_bid_threshold ⇒ hot (5 min);
-    else normal (10 min). On a SELL the trade is marked 'sold'; reconcile finalizes
-    true PnL from the /activity SELL cash-flow.
+    time_gate / hard_floor removed (sold winners on thin-book noise, see FIX-2).
+    Adaptive polling kept (post-peak or low-bid → hot=5 min, else normal=10 min).
     """
     from src.config.settings import settings
     from src.risk.risk_manager import risk_manager
@@ -1329,15 +1315,10 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
         return
 
     take_profit = getattr(ss, "tail_take_profit_price", 0.99)
-    hard_floor = getattr(ss, "tail_hard_floor_price", 0.45)
-    time_gate = getattr(ss, "tail_time_gate_price", 0.55)
-    sweep_price = getattr(ss, "tail_hard_floor_sweep_price", 0.01)
     peak_hour = int(getattr(ss, "tail_local_peak_hour", 16))
     hot_thr = getattr(ss, "tail_hot_bid_threshold", 0.65)
     hot_min = int(getattr(ss, "tail_poll_hot_minutes", 5))
     normal_min = int(getattr(ss, "tail_poll_normal_minutes", 10))
-    debounce_polls = int(getattr(ss, "tail_exit_debounce_polls", 3))
-    min_age_hours = float(getattr(ss, "tail_min_position_age_hours", 4.0))
     session = get_session()
     notifier = get_notifier()
     _resolved_cache: dict[str, bool] = {}
@@ -1380,20 +1361,17 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
         for t in positions:
             grp = session.get(MarketGroup, t.group_id) if t.group_id else None
 
-            # ── Resolved market → redeem path, never SELL (avoids balance:0) ──
+            # Market resolved → hand off to auto_redeem
             if _market_resolved(t.group_id):
                 if t.status != "pending_redeem":
                     t.status = "pending_redeem"
                     session.commit()
                 logger.info(
-                    f"[tail_exit] {t.city} {t.market_id}: market RESOLVED — "
-                    f"route to auto_redeem (no SELL, shares in redemption)"
+                    f"[tail_exit] {t.city} {t.market_id}: RESOLVED → auto_redeem"
                 )
                 continue
 
-            # ── Adaptive polling: post-peak OR a soft bid is 'hot' (5 min); else
-            #    'normal' (10 min). The job ticks every 5 min; normal positions are
-            #    skipped on the off-tick so they effectively poll at 10 min. ──
+            # Adaptive polling
             lhour = local_hour(grp)
             in_window = lhour is not None and lhour >= peak_hour
             last_bid = _tail_last_bid.get(t.id)
@@ -1403,7 +1381,7 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
             last_eval = _tail_last_eval.get(t.id)
             if last_eval is not None and \
                     (now - last_eval) < timedelta(minutes=cadence) - timedelta(seconds=30):
-                continue  # not due this tick
+                continue
             _tail_last_eval[t.id] = now
 
             try:
@@ -1420,100 +1398,29 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
                 continue
             _tail_last_bid[t.id] = best_bid
 
-            raw_action = decide_tail_exit(
+            action = decide_tail_exit(
                 best_bid, in_window,
-                take_profit=take_profit, hard_floor=hard_floor, time_gate=time_gate,
+                take_profit=take_profit, hard_floor=0.0, time_gate=0.0,
             )
-
-            # ── T1 guards: debounce + min-position-age for time_gate / hard_floor ──
-            # take_profit on a near-par bid is not a thin-book false-signal risk,
-            # and hard_floor already flagged as sub-notional goes straight to hold.
-            if raw_action == "hard_floor" and t.id in _tail_sub_notional:
-                # Already determined sweep notional < $1; no SELL possible — wait for resolve.
-                logger.debug(
-                    f"[tail_exit] {t.city} {t.market_id}: hard_floor sub-notional skip "
-                    f"(bid={best_bid:.3f})"
-                )
-                continue
-
-            action = raw_action
-            guard_reason = ""
-
-            if raw_action in ("time_gate", "hard_floor"):
-                # 1) Min-position-age: block exits for freshly-opened positions.
-                age_h: float | None = None
-                age_ref = t.filled_at or t.placed_at
-                if age_ref is not None:
-                    age_h = (now - age_ref.replace(tzinfo=None)).total_seconds() / 3600
-                    if age_h < min_age_hours:
-                        action = "hold"
-                        guard_reason = f"min-age {age_h:.1f}h < {min_age_hours}h"
-
-                # 2) Debounce: require N consecutive below-threshold polls.
-                if action != "hold":
-                    cnt = _tail_gate_count.get(t.id, 0) + 1
-                    _tail_gate_count[t.id] = cnt
-                    if cnt < debounce_polls:
-                        action = "hold"
-                        guard_reason = f"debounce {cnt}/{debounce_polls}"
-                    else:
-                        guard_reason = f"debounce {cnt}/{debounce_polls} confirmed"
-
-                logger.info(
-                    f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
-                    f"local_hour={lhour if lhour is not None else '?'} in_window={in_window} "
-                    f"poll={'hot' if hot else 'normal'} → {action}"
-                    + (f" [{raw_action} {guard_reason}]" if guard_reason else f" [{raw_action}]")
-                )
-            else:
-                # take_profit or natural hold: clear debounce counter (bid recovered).
-                _tail_gate_count.pop(t.id, None)
-                _tail_sub_notional.discard(t.id)
-                logger.info(
-                    f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
-                    f"local_hour={lhour if lhour is not None else '?'} in_window={in_window} "
-                    f"poll={'hot' if hot else 'normal'} → {action}"
-                )
+            logger.info(
+                f"[tail_exit] {t.city} {t.market_id}: bid={best_bid:.3f} "
+                f"local_hour={lhour if lhour is not None else '?'} in_window={in_window} "
+                f"poll={'hot' if hot else 'normal'} → {action}"
+            )
 
             if action == "hold":
                 continue
 
+            # take_profit: SELL at bid, clamped to CLOB max 0.99 (T2)
             shares = t.size_shares or 0.0
             stake = t.stake_usd or 0.0
-
-            if action == "hard_floor":
-                # Market dump: sweep bids down to sweep_price. On a thin book the
-                # actual fill may be BELOW best_bid — logged honestly here; the
-                # true VWAP is confirmed by reconcile from the /activity SELL.
-                exec_price = round(max(0.001, sweep_price), 4)
-                # T3: CLOB min notional is $1.00 — if sweep can't clear this,
-                # a SELL will always be SKIPPED; mark as sub-notional and wait
-                # for the market to resolve (auto_redeem handles it then).
-                if exec_price * shares < 1.0:
-                    logger.info(
-                        f"[tail_exit] HARD_FLOOR {t.city} {t.market_id}: "
-                        f"sweep notional ${exec_price * shares:.2f} < $1 min — "
-                        f"no SELL possible (bid={best_bid:.3f}), hold to auto_redeem"
-                    )
-                    _tail_sub_notional.add(t.id)
-                    _tail_gate_count.pop(t.id, None)
-                    continue
-                provisional = round(shares * best_bid - stake, 4)  # estimate from bid
-                logger.warning(
-                    f"[tail_exit] HARD_FLOOR {t.city} {t.market_id}: market SELL "
-                    f"sweep≤{exec_price} (bid={best_bid:.3f} ≤ {hard_floor}, local_hour={lhour}); "
-                    f"ACTUAL fill may be < {best_bid:.3f} on a thin book — "
-                    f"reconcile confirms real price from /activity SELL"
-                )
-            else:
-                # take_profit / time_gate → limit SELL at the bid
-                exec_price = round(min(0.99, best_bid), 4)
-                provisional = round(shares * exec_price - stake, 4)
-                logger.info(
-                    f"[tail_exit] {action.upper()} {t.city} {t.market_id} sell @ "
-                    f"{exec_price:.4f} est_pnl=${provisional:+.4f} "
-                    f"(shares={shares:.2f} stake=${stake:.2f})"
-                )
+            exec_price = round(min(0.99, best_bid), 4)
+            provisional = round(shares * exec_price - stake, 4)
+            logger.info(
+                f"[tail_exit] TAKE_PROFIT {t.city} {t.market_id} sell @ "
+                f"{exec_price:.4f} est_pnl=${provisional:+.4f} "
+                f"(shares={shares:.2f} stake=${stake:.2f})"
+            )
 
             sell_oid = place_limit_order(
                 market_id=t.market_id,
@@ -1521,31 +1428,28 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
                 side="SELL",
                 price=exec_price,
                 size=shares,
-                skip_risk_check=True,   # closing a position never adds risk
+                skip_risk_check=True,
             )
 
             if sell_oid:
                 t.status = "sold"
-                t.pnl_usd = provisional         # provisional; reconcile confirms via SELL cashflow
+                t.pnl_usd = provisional
                 t.resolved_at = t.resolved_at or datetime.utcnow()
                 session.commit()
                 _tail_last_eval.pop(t.id, None)
                 _tail_last_bid.pop(t.id, None)
-                _tail_gate_count.pop(t.id, None)
-                _tail_sub_notional.discard(t.id)
-                # Free deployed capital immediately
                 try:
                     risk_manager.record_bet_result(t.id, t.group_id or "", provisional)
                 except Exception:
                     pass
                 notifier.send(
-                    f"💰 [tail_exit/{action}] {t.city} {t.bin_label} — продано @ "
+                    f"💰 [tail_exit/take_profit] {t.city} {t.bin_label} — продано @ "
                     f"{exec_price:.3f} | est PnL ${provisional:+.2f} (sell_order={sell_oid})"
                 )
             else:
                 logger.warning(
                     f"[tail_exit] SELL order failed {t.city} {t.market_id} "
-                    f"action={action} @ {exec_price:.4f}"
+                    f"take_profit @ {exec_price:.4f}"
                 )
 
     except Exception:
