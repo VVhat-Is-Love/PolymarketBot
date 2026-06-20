@@ -1061,8 +1061,13 @@ def run_tail_engine() -> None:
         )
 
         if not groups:
-            logger.debug("[tail] No groups in tail time window")
+            logger.info(
+                f"[tail] No groups in tail window "
+                f"({ss.tail_min_hours_to_close:.0f}–{ss.tail_max_hours_to_close:.0f}h)"
+            )
             return
+
+        logger.info(f"[tail] Evaluating {len(groups)} group(s) in tail window")
 
         for group in groups:
             try:
@@ -1125,6 +1130,11 @@ def run_tail_engine() -> None:
                     no_asks=no_asks,
                 )
 
+                logger.info(
+                    f"[tail] {group.city}: scan → "
+                    f"{len(scan.orders)} order(s), {len(scan.skipped)} skipped"
+                    + (f" [{scan.skipped[0]}]" if scan.skipped and not scan.orders else "")
+                )
                 for reason in scan.skipped:
                     logger.debug(f"[tail] {group.city}: {reason}")
 
