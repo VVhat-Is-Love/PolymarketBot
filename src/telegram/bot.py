@@ -532,16 +532,17 @@ async def cmd_setlimit(update, context) -> None:
     try:
         if len(context.args) < 2:
             await update.message.reply_text(
-                "❓ Используй: /setlimit [daily|bet|total] <value>\n"
-                "  daily — дневной лимит потерь\n"
-                "  bet   — макс. размер ставки\n"
-                "  total — общий стоп-лосс"
+                "❓ Используй: /setlimit [daily|bet|total|tail] <value>\n"
+                "  daily — дневной лимит потерь (live)\n"
+                "  bet   — макс. корзинная ставка (basket)\n"
+                "  total — общий стоп-лосс (устаревш.)\n"
+                "  tail  — макс. размер tail-ставки (per position)"
             )
             return
 
         limit_type = context.args[0].lower()
-        if limit_type not in ("daily", "bet", "total"):
-            await update.message.reply_text("❌ Тип: daily, bet или total")
+        if limit_type not in ("daily", "bet", "total", "tail"):
+            await update.message.reply_text("❌ Тип: daily, bet, total или tail")
             return
 
         try:
@@ -551,13 +552,15 @@ async def cmd_setlimit(update, context) -> None:
             return
 
         from src.risk.risk_manager import risk_manager
+        from src.strategy.config import strategy_settings
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         s = risk_manager.get_status()
         old_map = {
             "daily": (s.daily_loss_limit_usd, "Дневной лимит потерь"),
-            "bet":   (s.max_single_bet_usd, "Макс. ставка"),
+            "bet":   (s.max_single_bet_usd, "Макс. корзинная ставка"),
             "total": (s.total_stop_loss_usd, "Общий стоп-лосс"),
+            "tail":  (strategy_settings.tail_max_position_usd, "Макс. tail-ставка"),
         }
         old_val, label = old_map[limit_type]
 
@@ -736,8 +739,8 @@ async def cmd_help(update, context) -> None:
         "/reset_paper_stop — сбросить виртуальный paper-стоп\n"
         "/cancel &lt;id&gt; — отменить ордер (с подтверждением)\n\n"
         "<b>Настройки</b>\n"
-        "/setlimit [daily|bet|total] &lt;значение&gt; — обновить лимит\n"
-        "/setstake &lt;значение&gt; — обновить размер ставки\n"
+        "/setlimit [daily|bet|total|tail] &lt;значение&gt; — обновить лимит (tail = cap tail-ставки)\n"
+        "/setstake &lt;значение&gt; — обновить basket-ставку\n"
         "/strategy [list|on|off] [название] — включить/выключить стратегию\n\n"
         "/help — эта справка"
     )
@@ -923,6 +926,7 @@ async def cmd_start(update, context) -> None:
 async def cmd_risk(update, context) -> None:
     from src.risk.risk_manager import risk_manager
     from src.strategy.live_trader import _get_equity
+    from src.strategy.config import strategy_settings
     equity = _get_equity()
     s = risk_manager.get_status(equity=equity)
     total_cap = s.total_deployed_cap_usd
@@ -930,10 +934,11 @@ async def cmd_risk(update, context) -> None:
     eq_str = f"${equity:.2f}" if equity > 0 else "н/д"
     text = (
         f"⚠️ <b>Risk Limits</b>\n\n"
-        f"💵 Макс. ставка:       ${s.max_single_bet_usd:.2f}  (/setstake)\n"
+        f"💵 Basket ставка:      ${s.max_single_bet_usd:.2f}  (/setstake)\n"
+        f"🎯 Tail ставка (cap):  ${strategy_settings.tail_max_position_usd:.2f}  (/setlimit tail)\n"
         f"📅 Макс. ставок/день:  {s.max_daily_bets}  (использовано: {s.daily_bets_count})\n"
         f"📉 Дневной лимит:      ${s.daily_loss_limit_usd:.2f}  (исп.: ${s.daily_loss:.2f})  (/setlimit daily)\n"
-        f"💥 Общий стоп-лосс:    ${s.total_stop_loss_usd:.2f}  (исп.: ${s.total_loss:.2f})  (/setlimit total)\n\n"
+        f"💥 Стоп-лосс (total):  ${s.total_stop_loss_usd:.2f}  (/setlimit total)\n\n"
         f"💼 <b>Капитал в работе</b>  (equity {eq_str})\n"
         f"  🎯 Tail:   ${s.tail_deployed_usd:.2f} / ${tail_cap:.2f}  ({s.tail_deployed_pct:.0%})\n"
         f"  🧺 Basket: ${s.basket_deployed_usd:.2f}  (выключен)\n"
@@ -975,12 +980,18 @@ async def _callback_router(update, context) -> None:
                 label = "Дневной лимит потерь"
             elif limit_type == "bet":
                 risk_manager.set_max_single_bet(new_val)
-                label = "Макс. ставка"
+                label = "Макс. корзинная ставка"
+            elif limit_type == "tail":
+                risk_manager.set_tail_max_position_usd(new_val)
+                label = "Макс. tail-ставка"
             else:  # total
                 risk_manager.set_total_stop_loss(new_val)
                 label = "Общий стоп-лосс"
             logger.info(f"[telegram_bot] setlimit {limit_type}→${new_val:.2f} via callback")
-            await query.edit_message_text(f"✅ <b>{label}</b> обновлён: ${new_val:.2f}", parse_mode="HTML")
+            await query.edit_message_text(
+                f"✅ <b>{label}</b> обновлён: ${new_val:.2f} (сохранено в БД)",
+                parse_mode="HTML",
+            )
             return
 
         # ── setstake: ss:{value} ─────────────────────────────────────────

@@ -169,11 +169,23 @@ def redeem_position(
         try:
             proxy.functions.proxy(calls).call({"from": eoa_addr})
         except Exception as sim_exc:
-            logger.warning(
-                f"[redeem] {market_label}: preflight reverted "
-                f"(neg_risk={neg_risk}) — skip, no gas spent: "
-                f"{type(sim_exc).__name__}: {str(sim_exc)[:200]}"
-            )
+            exc_str = str(sim_exc)
+            # Known: neg_risk markets may revert with 0x3c10b94e (NegRiskAdapter
+            # custom error). Possible causes: condition not yet resolved on-chain,
+            # wrong conditionId format, or amounts mismatch.
+            if neg_risk and "0x3c10b94e" in exc_str:
+                logger.warning(
+                    f"[redeem] {market_label}: KNOWN neg_risk revert 0x3c10b94e "
+                    f"condition_id={condition_id[:16]}… shares={size_shares:.4f} "
+                    f"— market may not be settled on-chain yet, or conditionId mismatch. "
+                    f"Skipping (will retry next cycle)."
+                )
+            else:
+                logger.warning(
+                    f"[redeem] {market_label}: preflight reverted "
+                    f"(neg_risk={neg_risk}) — skip, no gas spent: "
+                    f"{type(sim_exc).__name__}: {exc_str[:300]}"
+                )
             return None
 
         # ── BROADCAST ──────────────────────────────────────────────────────

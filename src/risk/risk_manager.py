@@ -74,6 +74,8 @@ class RiskManager:
         # Prevents evaluate_drawdown_stop from immediately re-arming the same event
         # after /reset_stop.  Cleared when dd recovers below soft threshold.
         self._drawdown_hard_reset: bool = False
+        # Persisted runtime overrides loaded once on first DB access
+        self._persisted_settings_loaded: bool = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -105,6 +107,59 @@ class RiskManager:
         self._paper_total_stop_loss_usd = settings.paper_total_stop_loss_usd
         self._paper_daily_loss_limit_usd = settings.paper_daily_loss_limit_usd
 
+    def _persist_setting(self, key: str, value: str) -> None:
+        """Write a runtime config override to bot_state for restart persistence."""
+        try:
+            from src.db.session import get_session
+            from src.db.models import BotState
+            session = get_session()
+            try:
+                session.merge(BotState(key=key, value=value, updated_at=datetime.utcnow()))
+                session.commit()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"[risk] _persist_setting({key!r}) failed: {exc}")
+
+    def _load_persisted_settings(self) -> None:
+        """Load runtime config overrides from bot_state (written by Telegram setters)."""
+        try:
+            from src.db.session import get_session
+            from src.db.models import BotState
+            session = get_session()
+            try:
+                attrs = [
+                    ("cfg_daily_loss_limit_usd", "_daily_loss_limit_usd"),
+                    ("cfg_max_single_bet_usd",   "_max_single_bet_usd"),
+                    ("cfg_total_stop_loss_usd",  "_total_stop_loss_usd"),
+                ]
+                for db_key, attr in attrs:
+                    row = session.get(BotState, db_key)
+                    if row and row.value:
+                        try:
+                            setattr(self, attr, float(row.value))
+                            logger.info(
+                                f"[risk] restored {attr}=${getattr(self, attr):.2f} from bot_state"
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                # tail_max_position_usd lives in StrategySettings singleton
+                tail_row = session.get(BotState, "cfg_tail_max_position_usd")
+                if tail_row and tail_row.value:
+                    try:
+                        from src.strategy.config import strategy_settings
+                        strategy_settings.tail_max_position_usd = float(tail_row.value)
+                        logger.info(
+                            f"[risk] restored tail_max_position_usd="
+                            f"${strategy_settings.tail_max_position_usd:.2f} from bot_state"
+                        )
+                    except (ValueError, TypeError):
+                        pass
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning(f"[risk] _load_persisted_settings failed: {exc}")
+
     def _reset_daily_state(self) -> None:
         self._today = date.today()
         self._daily_pnl: float = 0.0
@@ -122,6 +177,10 @@ class RiskManager:
         Also loads emergency_stop from bot_state table.
         Safe to call inside self._lock; catches all errors.
         """
+        if not self._persisted_settings_loaded:
+            self._load_persisted_settings()
+            self._persisted_settings_loaded = True
+
         try:
             from sqlalchemy import select, func, or_
             from src.db.session import get_session
@@ -1055,16 +1114,26 @@ class RiskManager:
         with self._lock:
             self._daily_loss_limit_usd = value
             logger.info(f"RiskManager: daily_loss_limit_usd → ${value:.2f}")
+        self._persist_setting("cfg_daily_loss_limit_usd", str(value))
 
     def set_max_single_bet(self, value: float) -> None:
         with self._lock:
             self._max_single_bet_usd = value
             logger.info(f"RiskManager: max_single_bet_usd → ${value:.2f}")
+        self._persist_setting("cfg_max_single_bet_usd", str(value))
 
     def set_total_stop_loss(self, value: float) -> None:
         with self._lock:
             self._total_stop_loss_usd = value
             logger.info(f"RiskManager: total_stop_loss_usd → ${value:.2f}")
+        self._persist_setting("cfg_total_stop_loss_usd", str(value))
+
+    def set_tail_max_position_usd(self, value: float) -> None:
+        """Set the per-tail-position USD cap (in StrategySettings). Persisted across restarts."""
+        from src.strategy.config import strategy_settings
+        strategy_settings.tail_max_position_usd = value
+        logger.info(f"RiskManager: tail_max_position_usd → ${value:.2f}")
+        self._persist_setting("cfg_tail_max_position_usd", str(value))
 
     def reset_paper_stop(self) -> int:
         """Reset virtual paper stop by marking all loss trades as voided_legacy.
