@@ -968,18 +968,27 @@ def _tail_ksigma_ok(
     ok=True  → bin qualifies (distance ≥ k·σ), may proceed to risk gates.
     ok=False → bin is too close to consensus, caller should SKIP.
 
-    near_bound: whichever bin edge is closest to consensus.
+    near_bound: whichever bin edge is closest to consensus (in market unit).
     k_eff: the k actually used (tail_k_sigma_above if bin is above consensus
            and tail_k_sigma_above > 0, else tail_k_sigma).
+
+    UNIT NOTE: consensus_temp is always °C (Open-Meteo). bin_lo/bin_hi are in
+    the market's unit (°F for US, °C for others). We convert consensus to the
+    market unit before comparing so dist is in the same unit as sigma_gate.
     """
-    sigma_gate = (
-        ss.tail_distance_sigma_f if unit.upper() == "F"
-        else ss.tail_distance_sigma_f / 1.8
-    )
+    unit_up = unit.upper()
+    if unit_up == "F":
+        # Open-Meteo consensus in °C → convert to °F for comparison with bin boundaries
+        consensus_in_unit = consensus_temp * 9.0 / 5.0 + 32.0
+        sigma_gate = ss.tail_distance_sigma_f
+    else:
+        consensus_in_unit = consensus_temp  # already °C
+        sigma_gate = ss.tail_distance_sigma_f / 1.8  # °F σ → °C
+
     hi = float(bin_hi) if bin_hi is not None else bin_lo + 1.0
-    above = bin_lo >= consensus_temp
+    above = bin_lo >= consensus_in_unit
     near = bin_lo if above else hi
-    dist = abs(near - consensus_temp)
+    dist = abs(near - consensus_in_unit)
     k_above = getattr(ss, "tail_k_sigma_above", 0.0)
     k_eff = k_above if (above and k_above > 0.0) else ss.tail_k_sigma
     threshold = k_eff * sigma_gate
@@ -1168,11 +1177,17 @@ def run_tail_engine() -> None:
                         ss,
                     )
                     _sigma_gate = _thr / _k if _k > 0 else 0.0
-                    _dir = "ABOVE" if _near >= consensus_temp else "BELOW"
+                    # Convert consensus to market unit for dir label and log
+                    _consensus_u = (
+                        consensus_temp * 9.0 / 5.0 + 32.0 if _unit == "F"
+                        else consensus_temp
+                    )
+                    _dir = "ABOVE" if _near >= _consensus_u else "BELOW"
                     _verdict = "PASS" if _ok else "SKIP"
                     logger.info(
                         f"[tail_ksigma] {group.city} {o.bin_label}: "
-                        f"consensus={consensus_temp:.2f}°{_unit} "
+                        f"consensus={_consensus_u:.2f}°{_unit} "
+                        f"({consensus_temp:.2f}°C) "
                         f"near_edge={_near:.2f}°{_unit} "
                         f"dist={_dist:.2f}°{_unit} "
                         f"dir={_dir} "
