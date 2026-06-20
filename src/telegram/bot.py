@@ -737,6 +737,7 @@ async def cmd_help(update, context) -> None:
         "/stop [причина] — аварийная остановка (сохраняется)\n"
         "/reset_stop — снять аварийную остановку (с подтверждением)\n"
         "/reset_paper_stop — сбросить виртуальный paper-стоп\n"
+        "/rebaseline — сбросить HWM drawdown до текущей equity (dd=0)\n"
         "/cancel &lt;id&gt; — отменить ордер (с подтверждением)\n\n"
         "<b>Настройки</b>\n"
         "/setlimit [daily|bet|total|tail] &lt;значение&gt; — обновить лимит (tail = cap tail-ставки)\n"
@@ -948,6 +949,41 @@ async def cmd_risk(update, context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /rebaseline  — prune equity HWM to current equity (FIX-1b)
+# ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_rebaseline(update, context) -> None:
+    """Two-stage: reset drawdown HWM_30d to current equity so dd=0 on next cycle."""
+    from src.risk.risk_manager import risk_manager
+    from src.strategy.live_trader import _get_equity
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    equity = _get_equity()
+    s = risk_manager.get_status(equity=equity)
+    hwm_est = equity / (1.0 - s.total_deployed_pct) if s.total_deployed_pct < 1.0 else equity
+
+    eq_str = f"${equity:.2f}" if equity > 0 else "н/д"
+    stop_note = ""
+    if s.emergency_stop and s.emergency_stop_type == "drawdown":
+        stop_note = "\n⚠️ Активен drawdown-стоп — будет снят автоматически после rebaseline."
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 ДА, REBASELINE", callback_data=f"rb:confirm:{equity:.4f}"),
+        InlineKeyboardButton("❌ Отмена", callback_data="x"),
+    ]])
+    await update.message.reply_text(
+        f"⚠️ <b>Rebaseline HWM?</b>\n\n"
+        f"Текущая equity: <b>{eq_str}</b>\n"
+        f"Это установит HWM_30d = {eq_str} (dd=0).\n\n"
+        f"Все исторические пики за 30 дней будут удалены.\n"
+        f"Drawdown-стоп не сработает до следующего просадки от нового базиса.{stop_note}",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Inline-button callback router
 # ---------------------------------------------------------------------------
 
@@ -1043,6 +1079,29 @@ async def _callback_router(update, context) -> None:
                 "✅ Emergency stop снят (БД обновлена).\n"
                 "⚠️ Внимание: если bot был запущен с активным стопом, "
                 "live-job не был зарегистрирован — перезапустите бота для восстановления."
+            )
+            return
+
+        # ── rebaseline HWM: rb:confirm:{equity} ─────────────────────────
+        if data.startswith("rb:confirm:"):
+            try:
+                equity_val = float(data.split(":", 2)[2])
+            except (IndexError, ValueError):
+                await query.edit_message_text("❌ Ошибка: неверный формат данных")
+                return
+            from src.risk.risk_manager import risk_manager
+            risk_manager.rebaseline_hwm(equity_val)
+            # If there's an active drawdown stop, clear it; dd=0 next cycle won't re-arm
+            if risk_manager.is_emergency_stopped() and risk_manager.get_stop_type() == "drawdown":
+                risk_manager.clear_emergency_stop()
+                stop_cleared = "\n✅ Drawdown-стоп снят."
+            else:
+                stop_cleared = ""
+            logger.info(f"[telegram_bot] HWM rebaselined to ${equity_val:.2f} via callback")
+            await query.edit_message_text(
+                f"📊 HWM_30d сброшен до ${equity_val:.2f}.\n"
+                f"Drawdown = 0% на следующем цикле.{stop_cleared}\n"
+                f"Новая просадка считается от этого базиса."
             )
             return
 
@@ -1230,6 +1289,7 @@ def run_telegram_bot() -> None:
             app.add_handler(CommandHandler("stop",             cmd_stop))
             app.add_handler(CommandHandler("reset_stop",       cmd_reset_stop))
             app.add_handler(CommandHandler("reset_paper_stop", cmd_reset_paper_stop))
+            app.add_handler(CommandHandler("rebaseline",       cmd_rebaseline))
             app.add_handler(CommandHandler("start",            cmd_start))
             app.add_handler(CommandHandler("mode",             cmd_mode))
             app.add_handler(CommandHandler("setlimit",         cmd_setlimit))

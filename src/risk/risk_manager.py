@@ -603,6 +603,36 @@ class RiskManager:
             logger.warning(f"[risk] HWM update failed: {exc} — using equity as HWM (dd=0)")
         return hwm
 
+    def rebaseline_hwm(self, equity: float) -> None:
+        """Reset HWM_30d to current equity so dd=0 on the next cycle.
+
+        Drops all historical HWM samples and writes {today: equity} to
+        bot_state["equity_hwm_30d"]. evaluate_drawdown_stop() will see dd=0 and
+        auto-clear any active drawdown stop without needing /reset_stop.
+        Survives restarts because the new baseline is persisted to DB.
+        """
+        import json
+        today = date.today()
+        try:
+            from src.db.session import get_session
+            from src.db.models import BotState
+            session = get_session()
+            try:
+                session.merge(BotState(
+                    key="equity_hwm_30d",
+                    value=json.dumps({today.isoformat(): equity}),
+                    updated_at=datetime.utcnow(),
+                ))
+                session.commit()
+                logger.info(
+                    f"[risk] HWM rebaselined: all historical peaks dropped, "
+                    f"new baseline=${equity:.2f} (dd=0 on next cycle)"
+                )
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.error(f"[risk] rebaseline_hwm failed: {exc}")
+
     def position_size_multiplier(self) -> float:
         """
         Drawdown soft-sizing factor: 1.0 normally, 0.5 once dd ≥ drawdown_soft_pct.
