@@ -201,18 +201,26 @@ class RiskManager:
                 elif not self._emergency_stop:
                     pass  # keep in-memory flag if set locally this session
 
-                # -- Daily bet count: only confirmed-placed orders (DAILY-COUNT-FILLS-ONLY)
-                # Counts trades where the CLOB accepted the order (open/filled/sold/sell_pending).
-                # Excludes: pending (DB row created, order not yet sent), cancelled (FOK miss,
-                # stale-price cancel), not_filled (bot-side timeout cancel), expired (orphan).
-                # After T2 (FOK entry), every non-fill produces status="cancelled" — must NOT
-                # consume a daily slot or trading halts after the first wave of misses.
+                # -- Daily bet count: confirmed fills only (T-SIZE-AND-COUNT fix)
+                # Only statuses that represent a confirmed BUY fill consume a daily slot:
+                #   filled      — BUY confirmed by reconciler
+                #   sell_pending — T3 exit SELL placed (BUY was already confirmed)
+                #   sold        — position fully exited
+                # Excluded:
+                #   pending     — DB row created, order not yet sent to CLOB
+                #   open        — CLOB accepted the order, fill not yet confirmed
+                #   cancelled   — FOK miss / stale-price cancel (no fill occurred)
+                #   not_filled  — bot-side timeout cancel
+                # "open" is deliberately excluded: FOK orders that fill go pending→open→
+                # filled within one reconcile cycle (≤2 min); if FOK is cancelled the
+                # slot was never consumed. Counting "open" would burn slots on in-flight
+                # orders that may still be cancelled before fill confirmation.
                 self._daily_bets_count = int(
                     session.execute(
                         select(func.count()).select_from(LiveTrade).where(
                             LiveTrade.placed_at >= today_start,
                             LiveTrade.status.in_(
-                                ["open", "filled", "sell_pending", "sold"]
+                                ["filled", "sell_pending", "sold"]
                             ),
                         )
                     ).scalar() or 0

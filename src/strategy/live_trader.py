@@ -1257,14 +1257,35 @@ def run_tail_engine() -> None:
                         logger.warning(f"[tail_no] {group.city} {o.bin_label}: {_twhy}")
                         continue
 
+                    # T2: entry price = scan ask + 1 tick, capped at 0.99
+                    _entry_price = min(0.99, round(o.no_ask + 0.01, 4))
+
+                    # MIN-SHARES: CLOB minimum is 5 shares. If Kelly gives fewer,
+                    # auto-raise to exactly 5 shares and log a warning so the
+                    # operator knows the configured stake is below the floor.
+                    _shares = o.shares
+                    _stake = o.stake_usd
+                    _MIN_TAIL_SHARES = 5.0
+                    if _shares < _MIN_TAIL_SHARES:
+                        _shares = _MIN_TAIL_SHARES
+                        _stake = round(_MIN_TAIL_SHARES * _entry_price, 4)
+                        logger.warning(
+                            f"[tail_no] {group.city} {o.bin_label}: "
+                            f"${o.stake_usd:.2f} → {o.shares:.2f} shares "
+                            f"< min {_MIN_TAIL_SHARES:.0f} @ ask {o.no_ask:.3f}. "
+                            f"Auto-raised to {_MIN_TAIL_SHARES:.0f} shares "
+                            f"(${_stake:.2f}). Set /setlimit tail ≥ "
+                            f"${_MIN_TAIL_SHARES * _entry_price:.2f} to avoid this."
+                        )
+
                     trade = LiveTrade(
                         id=str(uuid.uuid4()),
                         group_id=group.group_id,
                         market_id=o.market_id,
                         bin_label=o.bin_label,
                         target_price=o.no_ask,
-                        size_shares=o.shares,
-                        stake_usd=o.stake_usd,
+                        size_shares=_shares,
+                        stake_usd=_stake,
                         basket_role="tail_no",
                         strategy_name="tail_no",
                         city=group.city,
@@ -1278,20 +1299,17 @@ def run_tail_engine() -> None:
 
                     notifier.send(
                         f"📤 [tail_no] NO-хвост: {group.city} {o.bin_label}\n"
-                        f"${o.stake_usd:.2f} @ {o.no_ask:.3f} | "
+                        f"${_stake:.2f} @ {o.no_ask:.3f} | "
                         f"P(NO)={o.p_model_no:.0%} edge={o.edge:+.1%} "
                         f"EV=${o.ev_usd:+.2f}"
                     )
 
-                    # T2: add 1-cent premium over scan-time ask to cross a book
-                    # that may have moved since the scan; cap at 0.99 (CLOB limit).
-                    _entry_price = min(0.99, round(o.no_ask + 0.01, 4))
                     order_id = place_limit_order(
                         market_id=o.market_id,
                         token_id=token_no,
                         side="BUY",
                         price=_entry_price,
-                        size=o.shares,
+                        size=_shares,
                         order_type="FOK",
                     )
 
@@ -1300,12 +1318,13 @@ def run_tail_engine() -> None:
                         trade.status = "open"
                         session.commit()
                         risk_manager.record_bet_placed(
-                            group.group_id, o.stake_usd, strategy="tail_no"
+                            group.group_id, _stake, strategy="tail_no"
                         )
-                        no_in_use += o.stake_usd
+                        no_in_use += _stake
                         logger.info(
                             f"[tail_no] ORDER PLACED: {group.city} {o.bin_label} "
-                            f"order_id={order_id} stake=${o.stake_usd:.2f} "
+                            f"order_id={order_id} shares={_shares:.2f} "
+                            f"stake=${_stake:.2f} "
                             f"P(NO)={o.p_model_no:.0%} edge={o.edge:+.1%}"
                         )
                         notifier.send(
