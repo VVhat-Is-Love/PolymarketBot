@@ -201,12 +201,19 @@ class RiskManager:
                 elif not self._emergency_stop:
                     pass  # keep in-memory flag if set locally this session
 
-                # -- Daily bet count (all live trades placed today) --
+                # -- Daily bet count: only confirmed-placed orders (DAILY-COUNT-FILLS-ONLY)
+                # Counts trades where the CLOB accepted the order (open/filled/sold/sell_pending).
+                # Excludes: pending (DB row created, order not yet sent), cancelled (FOK miss,
+                # stale-price cancel), not_filled (bot-side timeout cancel), expired (orphan).
+                # After T2 (FOK entry), every non-fill produces status="cancelled" — must NOT
+                # consume a daily slot or trading halts after the first wave of misses.
                 self._daily_bets_count = int(
                     session.execute(
                         select(func.count()).select_from(LiveTrade).where(
                             LiveTrade.placed_at >= today_start,
-                            LiveTrade.status != "not_filled",  # phantom isn't a bet
+                            LiveTrade.status.in_(
+                                ["open", "filled", "sell_pending", "sold"]
+                            ),
                         )
                     ).scalar() or 0
                 )
