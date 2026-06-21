@@ -162,12 +162,24 @@ def place_limit_order(
             return None
 
     def _place():
+        import math as _math
         client = _get_client()
         tick_size = client.get_tick_size(token_id)
+        # CLOB precision: taker (shares) ≤ 4 decimal places;
+        # maker (USDC = price × size) ≤ 2 decimal places for market orders.
+        # Round size down so maker_usdc is representable with 2dp:
+        #   maker_floor = floor(price * size * 100) / 100
+        #   size = round(maker_floor / price, 4)
+        # Uses round(..., 6) to suppress floating-point noise before floor.
+        _s = round(size, 4)
+        _maker_floor = _math.floor(round(price * _s, 6) * 100) / 100
+        _s_adj = round(_maker_floor / price, 4) if _maker_floor > 0 else _s
+        # Never drop below the CLOB minimum due to rounding
+        _final_size = max(_s_adj, _MIN_SHARES) if _s >= _MIN_SHARES else _s_adj
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
-            size=size,
+            size=_final_size,
             side=side,  # "BUY" or "SELL" — V2 accepts both string and Side enum
         )
         _ot = getattr(OrderType, order_type.upper(), OrderType.GTC)

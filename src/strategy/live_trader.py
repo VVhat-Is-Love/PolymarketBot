@@ -1206,21 +1206,21 @@ def run_tail_engine() -> None:
                     if not _ok:
                         continue
 
-                    # T2: cooldown — skip if this exact market had a cancel/not_filled
-                    # in the last 30 min (prevents a stale-price place→cancel loop).
-                    _recent_cancel = session.execute(
+                    # DEDUP: one live GTC order per market — don't re-place while
+                    # a pending/open order already exists for this market_id.
+                    # The reconciler holds the order for tail_order_timeout_minutes
+                    # (45 min), then cancels → next scan re-evaluates gate+price.
+                    _active = session.execute(
                         select(LiveTrade.id).where(
                             LiveTrade.market_id == o.market_id,
                             LiveTrade.strategy_name == "tail_no",
-                            LiveTrade.status.in_(["cancelled", "not_filled"]),
-                            LiveTrade.cancelled_at
-                            >= datetime.utcnow() - timedelta(minutes=30),
+                            LiveTrade.status.in_(["pending", "open"]),
                         )
                     ).first()
-                    if _recent_cancel:
-                        logger.info(
+                    if _active:
+                        logger.debug(
                             f"[tail_no] {group.city} {o.bin_label}: "
-                            f"skip — recent cancel within 30 min (cooldown)"
+                            f"skip — active GTC order exists (dedup)"
                         )
                         continue
 
@@ -1257,8 +1257,9 @@ def run_tail_engine() -> None:
                         logger.warning(f"[tail_no] {group.city} {o.bin_label}: {_twhy}")
                         continue
 
-                    # T2: entry price = scan ask + 1 tick, capped at 0.99
-                    _entry_price = min(0.99, round(o.no_ask + 0.01, 4))
+                    # GTC limit at scan-time ask (no premium — price is already the
+                    # current best offer; adding a tick would sweep past the band).
+                    _entry_price = o.no_ask
 
                     # MIN-SHARES: CLOB minimum is 5 shares. If Kelly gives fewer,
                     # auto-raise to exactly 5 shares and log a warning so the
@@ -1310,7 +1311,7 @@ def run_tail_engine() -> None:
                         side="BUY",
                         price=_entry_price,
                         size=_shares,
-                        order_type="FOK",
+                        # GTC: order rests on book until filled or TTL (45 min, see scheduler)
                     )
 
                     if order_id:

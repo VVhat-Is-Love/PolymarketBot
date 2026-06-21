@@ -1129,7 +1129,14 @@ def _job_reconcile_orders() -> None:
                     f"[reconcile] CANCELLED by exchange: {t.city or '?'} {t.bin_label}"
                 )
 
-            elif (now - placed_at) > timeout:
+            elif (now - placed_at) > (
+                # Tail GTC orders use a longer TTL (45 min) so a resting limit has
+                # time to fill on a thin book without being prematurely cancelled.
+                # All other strategies keep the default order_timeout_minutes.
+                timedelta(minutes=45)
+                if t.strategy_name == "tail_no"
+                else timeout
+            ):
                 # G4-32: activity_ok is True (cycle deferred otherwise) and there
                 # is no matching /activity BUY → the order genuinely never filled.
                 # Cancel ONLY now that non-fill is confirmed: cancelling before the
