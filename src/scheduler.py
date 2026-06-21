@@ -857,6 +857,120 @@ def _job_resolve_paper_trades() -> None:
         logger.error(f"Resolve paper trades job failed: {e}")
 
 
+def _reconcile_sell_pending(t, session, now, notifier,
+                             get_order_fill_info_fn, cancel_order_fn, risk_mgr) -> None:
+    """
+    T3: verify a sell_pending trade against the CLOB.
+    - filled    → mark "sold", record PnL
+    - cancelled → partial fill: reduce size_shares + reset to "open"; else reset to "open"
+    - open      → timeout (30 min) → cancel sell order, reset to "open"
+    - unknown   → skip this cycle
+    """
+    sell_oid = t.sell_order_id
+    if not sell_oid:
+        t.status = "open"
+        t.sell_order_id = None
+        session.commit()
+        return
+
+    try:
+        sell_status, size_matched = get_order_fill_info_fn(sell_oid)
+    except Exception as exc:
+        logger.warning(f"[reconcile] sell_pending check failed {sell_oid[:12]}…: {exc}")
+        return
+
+    shares_full = t.size_shares or 0.0
+    stake = t.stake_usd or 0.0
+    exec_price = t.filled_price or 0.99   # stored by take_profit at sell_pending transition
+    city_label = f"{t.city or '?'} {t.bin_label}"
+
+    if sell_status == "filled":
+        actual_pnl = round(shares_full * exec_price - stake, 4)
+        t.status = "sold"
+        t.pnl_usd = actual_pnl
+        t.resolved_at = t.resolved_at or now
+        session.commit()
+        logger.info(
+            f"[reconcile] SELL_FILLED: {city_label} "
+            f"shares={shares_full:.2f} @ {exec_price:.4f} pnl=${actual_pnl:+.4f}"
+        )
+        try:
+            risk_mgr.record_bet_result(t.id, t.group_id or "", actual_pnl)
+        except Exception:
+            pass
+        notifier.send(
+            f"💰 [tail_exit/take_profit] {city_label} — продано @ "
+            f"{exec_price:.3f} | PnL ${actual_pnl:+.2f}"
+        )
+
+    elif sell_status == "cancelled":
+        # CLOB cancelled the sell order — may be partial fill or no fill
+        _MIN_SHARES = 5.0
+        if size_matched > 0:
+            remaining = max(0.0, shares_full - size_matched)
+            prop = size_matched / shares_full if shares_full > 0 else 0.0
+            partial_pnl = round(size_matched * exec_price - prop * stake, 4)
+            if remaining < _MIN_SHARES:
+                # Too few shares left to trade — close out at partial fill
+                t.status = "sold"
+                t.pnl_usd = partial_pnl
+                t.resolved_at = now
+                session.commit()
+                logger.info(
+                    f"[reconcile] SELL_PARTIAL_CLOSED: {city_label} "
+                    f"matched={size_matched:.2f}/{shares_full:.2f} pnl=${partial_pnl:+.4f}"
+                )
+                try:
+                    risk_mgr.record_bet_result(t.id, t.group_id or "", partial_pnl)
+                except Exception:
+                    pass
+                notifier.send(
+                    f"💰 [tail_exit/partial] {city_label} — частично продано "
+                    f"{size_matched:.2f}/{shares_full:.2f} @ {exec_price:.3f} | "
+                    f"PnL ${partial_pnl:+.2f}"
+                )
+            else:
+                # Significant remainder — reduce position and re-open for exit retry
+                t.size_shares = remaining
+                t.stake_usd = round((1.0 - prop) * stake, 4)
+                t.status = "open"
+                t.sell_order_id = None
+                session.commit()
+                logger.info(
+                    f"[reconcile] SELL_PARTIAL_REOPEN: {city_label} "
+                    f"matched={size_matched:.2f}/{shares_full:.2f} remaining={remaining:.2f}"
+                )
+                notifier.send(
+                    f"⚠️ [tail_exit/partial] {city_label} — частично продано "
+                    f"{size_matched:.2f}/{shares_full:.2f}, остаток {remaining:.2f} открыт"
+                )
+        else:
+            # No fill — reset to open, take_profit will retry on next bid spike
+            t.status = "open"
+            t.sell_order_id = None
+            session.commit()
+            logger.info(
+                f"[reconcile] SELL_CANCELLED (no fill): {city_label} → reset to open"
+            )
+
+    elif sell_status == "open":
+        # Still resting — apply 30-min timeout from when sell was placed
+        sell_age = now - (t.sell_placed_at or t.placed_at or now)
+        if sell_age > timedelta(minutes=30):
+            try:
+                cancel_order_fn(sell_oid)
+            except Exception:
+                pass
+            t.status = "open"
+            t.sell_order_id = None
+            session.commit()
+            logger.warning(
+                f"[reconcile] SELL_TIMEOUT: {city_label} "
+                f"sell_order={sell_oid[:12]}… — cancelled, reset to open"
+            )
+    # sell_status == "unknown": skip this cycle, try again next reconcile
+
+
 def _job_reconcile_orders() -> None:
     """
     Non-blocking reconciliation: poll CLOB status for all open/pending orders.
@@ -871,9 +985,10 @@ def _job_reconcile_orders() -> None:
     """
     from datetime import timedelta
     from src.config.settings import settings
-    from src.market.order_executor import get_order_status, cancel_order
+    from src.market.order_executor import get_order_status, get_order_fill_info, cancel_order
     from src.market.polymarket_data import get_activity_checked, buy_shares_by_token
     from src.notifications.telegram import get_notifier
+    from src.risk.risk_manager import risk_manager
 
     notifier = get_notifier()
     session = get_session()
@@ -884,7 +999,7 @@ def _job_reconcile_orders() -> None:
         pending_open = list(
             session.execute(
                 select(LiveTrade).where(
-                    LiveTrade.status.in_(["open", "pending"]),
+                    LiveTrade.status.in_(["open", "pending", "sell_pending"]),
                     LiveTrade.order_id.isnot(None),
                 )
             ).scalars().all()
@@ -968,6 +1083,12 @@ def _job_reconcile_orders() -> None:
             logger.debug(f"[reconcile] Checking {len(pending_open)} open/pending orders")
 
         for t in pending_open:
+            # T3: sell_pending — verify SELL fill, handle partial exits
+            if t.status == "sell_pending":
+                _reconcile_sell_pending(t, session, now, notifier,
+                                        get_order_fill_info, cancel_order, risk_manager)
+                continue
+
             placed_at = t.placed_at or now
 
             # Fill is confirmed by /activity BUY, not by CLOB status

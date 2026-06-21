@@ -122,9 +122,11 @@ def place_limit_order(
     price: float,
     size: float,
     skip_risk_check: bool = False,
+    order_type: str = "GTC",
 ) -> str | None:
     """
-    Place a GTC limit order via CLOB V2.
+    Place a limit order via CLOB V2.
+    order_type: "GTC" (default) | "FOK" | "GTD" — maps to OrderType enum.
     Returns order_id on success, None on failure.
     skip_risk_check=True: caller already did a basket-level check (P1-7).
     """
@@ -168,10 +170,11 @@ def place_limit_order(
             size=size,
             side=side,  # "BUY" or "SELL" — V2 accepts both string and Side enum
         )
+        _ot = getattr(OrderType, order_type.upper(), OrderType.GTC)
         return client.create_and_post_order(
             order_args=order_args,
             options=PartialCreateOrderOptions(tick_size=tick_size),
-            order_type=OrderType.GTC,
+            order_type=_ot,
         )
 
     # G4-25: verify-aware placement. Never blindly retry an ambiguous error — a
@@ -287,6 +290,37 @@ def get_order_status(order_id: str) -> Literal["open", "filled", "cancelled", "u
         return status
     except Exception:
         return "unknown"
+
+
+def get_order_fill_info(order_id: str) -> tuple[str, float]:
+    """
+    Return (status, size_matched) for an order.
+    status: 'open' | 'filled' | 'cancelled' | 'unknown'
+    size_matched: how many shares actually filled (0.0 if none or unknown).
+    """
+    def _get():
+        client = _get_client()
+        return client.get_order(order_id)
+
+    try:
+        resp = _with_backoff(_get, module="order_executor", method="get_order_fill_info")
+        if isinstance(resp, dict):
+            raw = (resp.get("status") or resp.get("orderStatus") or "").upper()
+            matched = float(
+                resp.get("size_matched") or resp.get("matched_amount") or 0
+            )
+        else:
+            raw = str(getattr(resp, "status", "")).upper()
+            matched = float(getattr(resp, "size_matched", 0) or 0)
+
+        mapping = {
+            "OPEN": "open", "LIVE": "open",
+            "MATCHED": "filled", "FILLED": "filled",
+            "CANCELLED": "cancelled", "CANCELED": "cancelled",
+        }
+        return mapping.get(raw, "unknown"), matched
+    except Exception:
+        return "unknown", 0.0
 
 
 def get_open_orders() -> list[Order]:

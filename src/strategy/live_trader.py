@@ -954,6 +954,13 @@ def run_live_trade_engine(gamma: "GammaClient | None" = None) -> None:
 # Tail engine — Strategy C: BUY NO on longshot bins close to resolution
 # ---------------------------------------------------------------------------
 
+def _unit_from_label(label: str | None) -> str | None:
+    """Derive temperature unit from a Polymarket bin_label ('74-75°F' → 'F', '29-30°C' → 'C')."""
+    if not label:
+        return None
+    return "F" if "°F" in label else ("C" if "°C" in label else None)
+
+
 def _tail_ksigma_ok(
     bin_lo: float,
     bin_hi: float | None,
@@ -1156,7 +1163,9 @@ def run_tail_engine() -> None:
 
                     # k·σ distance gate: near bin boundary ≥ k·σ from consensus.
                     # Fail-closed: missing market geometry or consensus → SKIP, never bypass.
-                    _unit = (group.unit or "F").upper()
+                    # Derive unit from bin_label (ground truth); group.unit is unreliable
+                    # for some US cities where the DB stores "C" (T1-GATE-UNIT-DETECTION).
+                    _unit = _unit_from_label(o.bin_label) or (group.unit or "F").upper()
                     if _mkt_d is None or _mkt_d.bin_min is None:
                         logger.warning(
                             f"[tail_ksigma] {group.city} {o.bin_label}: "
@@ -1195,6 +1204,24 @@ def run_tail_engine() -> None:
                         f"k={_k:.1f} verdict={_verdict}"
                     )
                     if not _ok:
+                        continue
+
+                    # T2: cooldown — skip if this exact market had a cancel/not_filled
+                    # in the last 30 min (prevents a stale-price place→cancel loop).
+                    _recent_cancel = session.execute(
+                        select(LiveTrade.id).where(
+                            LiveTrade.market_id == o.market_id,
+                            LiveTrade.strategy_name == "tail_no",
+                            LiveTrade.status.in_(["cancelled", "not_filled"]),
+                            LiveTrade.cancelled_at
+                            >= datetime.utcnow() - timedelta(minutes=30),
+                        )
+                    ).first()
+                    if _recent_cancel:
+                        logger.info(
+                            f"[tail_no] {group.city} {o.bin_label}: "
+                            f"skip — recent cancel within 30 min (cooldown)"
+                        )
                         continue
 
                     # Zone anti-correlation check (entry guard only, not an exit/stop)
@@ -1256,12 +1283,16 @@ def run_tail_engine() -> None:
                         f"EV=${o.ev_usd:+.2f}"
                     )
 
+                    # T2: add 1-cent premium over scan-time ask to cross a book
+                    # that may have moved since the scan; cap at 0.99 (CLOB limit).
+                    _entry_price = min(0.99, round(o.no_ask + 0.01, 4))
                     order_id = place_limit_order(
                         market_id=o.market_id,
                         token_id=token_no,
                         side="BUY",
-                        price=o.no_ask,
+                        price=_entry_price,
                         size=o.shares,
+                        order_type="FOK",
                     )
 
                     if order_id:
@@ -1475,18 +1506,17 @@ def run_tail_early_exit(gamma: "GammaClient | None" = None) -> None:
             )
 
             if sell_oid:
-                t.status = "sold"
-                t.pnl_usd = provisional
-                t.resolved_at = t.resolved_at or datetime.utcnow()
+                # T3: mark sell_pending — reconciler verifies actual fill quantity
+                # and handles partial fills before marking "sold".
+                t.status = "sell_pending"
+                t.sell_order_id = sell_oid
+                t.sell_placed_at = datetime.utcnow()
+                t.filled_price = exec_price   # sell price (BUY price already in stake_usd)
                 session.commit()
                 _tail_last_eval.pop(t.id, None)
                 _tail_last_bid.pop(t.id, None)
-                try:
-                    risk_manager.record_bet_result(t.id, t.group_id or "", provisional)
-                except Exception:
-                    pass
                 notifier.send(
-                    f"💰 [tail_exit/take_profit] {t.city} {t.bin_label} — продано @ "
+                    f"📤 [tail_exit/take_profit] {t.city} {t.bin_label} — SELL размещён @ "
                     f"{exec_price:.3f} | est PnL ${provisional:+.2f} (sell_order={sell_oid})"
                 )
             else:

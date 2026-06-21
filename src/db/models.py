@@ -245,6 +245,12 @@ class LiveTrade(Base):
         Boolean, default=False, server_default="0"
     )
 
+    # T3: sell-side tracking — set when take_profit places a SELL order.
+    # status "sell_pending" means sell order is placed but not yet confirmed filled.
+    # Reconciler verifies actual fill qty and handles partial exits.
+    sell_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    sell_placed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
 
 class CalibrationLog(Base):
     """Per-bin snapshot: model P(NO) vs market price. Written every snapshot cycle.
