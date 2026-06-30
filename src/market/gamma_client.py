@@ -22,17 +22,17 @@ _TIMEOUT_THRESHOLD = 5        # consecutive read-timeouts → sustained slowness
 _COOLDOWN_MINUTES_BASE = 10
 _COOLDOWN_MINUTES_MAX = 60
 
-# Prices fetch: (connect=5s, read=30s) + 2 retries → ≤62s worst-case per group.
+# Prices fetch: (connect=5s, read=45s) + 2 retries → ≤92s worst-case per group.
 # Connect failures fast-fail at 5s (not accumulated into read-timeout budget).
 _PRICES_CONNECT_TIMEOUT_S = 5
-_PRICES_READ_TIMEOUT_S = 30
+_PRICES_READ_TIMEOUT_S = 45
 _PRICES_MAX_ATTEMPTS = 2      # was 4; with breaker this is enough signal
 
 # Discovery has a hard wall-clock budget so one slow page can't hang the whole
 # scheduler. Better to skip a cycle than block every other job behind it.
-_DISCOVERY_BUDGET_S = 90.0    # total time allowed for one get_all_weather_events
+_DISCOVERY_BUDGET_S = 180.0   # total time allowed for one get_all_weather_events (was 90)
 _DISCOVERY_CONNECT_TIMEOUT_S = 3   # fast connect-fail for discovery pages
-_DISCOVERY_TIMEOUT_S = 20.0   # per-attempt HTTP read timeout for discovery pages
+_DISCOVERY_TIMEOUT_S = 45.0   # per-attempt HTTP read timeout for discovery pages (was 20)
 _DISCOVERY_PAGE_RETRIES = 3   # in-cycle retries (with backoff) per page on timeout
 
 # DISCOVERY-FIX: Gamma's ?q= keyword search stopped filtering server-side ~2026-06-19.
@@ -459,6 +459,42 @@ class GammaClient:
         )
         self._last_fetch_status = status
         return all_events
+
+    def reset_circuit(self) -> None:
+        """Force-reset all circuit-breaker state. Use after IP/rate-limit fix."""
+        self._consec_hard = 0
+        self._consec_timeout = 0
+        self._circuit_open_until = None
+        self._open_count = 0
+        self._last_fetch_status = "ok"
+        self._last_fail_kind = ""
+        logger.info("Gamma circuit breaker: manually reset via reset_circuit()")
+
+    def probe(self, timeout_s: float = 15.0) -> tuple[bool, float, str]:
+        """Quick reachability test without touching breaker state.
+
+        Returns (ok, elapsed_s, detail).  Used by /gamma Telegram command.
+        """
+        t0 = time.monotonic()
+        try:
+            resp = self._session.get(
+                f"{GAMMA_BASE}/events/keyset",
+                params={"closed": "false", "limit": 5, "tag_id": _WEATHER_TAG_ID_FALLBACK},
+                timeout=(_DISCOVERY_CONNECT_TIMEOUT_S, timeout_s),
+            )
+            elapsed = time.monotonic() - t0
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                count = len(data.get("events") or data.get("data") or [])
+                cursor = data.get("next_cursor", "—")
+            else:
+                count = len(data) if isinstance(data, list) else 0
+                cursor = "—"
+            return True, elapsed, f"HTTP {resp.status_code}, {count} events, cursor={cursor!r}"
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            return False, elapsed, f"{type(exc).__name__}: {str(exc)[:150]}"
 
     def get_all_weather_events(self) -> list[dict]:
         """Fetch weather events via tag-based keyset pagination.

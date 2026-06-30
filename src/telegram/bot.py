@@ -15,6 +15,8 @@ Commands:
   /setstake <v>        — update MAX_SINGLE_BET_USD with confirmation
   /strategy [list|on|off] [name] — view/toggle strategies
   /cancel <id>         — cancel an open order with confirmation
+  /gamma               — Gamma API circuit-breaker status + live probe
+  /gamma_reset         — force-reset Gamma circuit breaker (after outage)
   /stop [reason]       — activate emergency stop (persisted to DB)
   /reset_stop          — clear emergency stop with two-stage confirmation
   /reset_paper_stop    — reset virtual paper stop (voids loss accounting)
@@ -743,6 +745,9 @@ async def cmd_help(update, context) -> None:
         "/setlimit [daily|bet|total|tail] &lt;значение&gt; — обновить лимит (tail = cap tail-ставки)\n"
         "/setstake &lt;значение&gt; — обновить basket-ставку\n"
         "/strategy [list|on|off] [название] — включить/выключить стратегию\n\n"
+        "<b>Диагностика</b>\n"
+        "/gamma — статус Gamma API + живой probe endpoint\n"
+        "/gamma_reset — сбросить circuit breaker Gamma вручную\n\n"
         "/help — эта справка"
     )
     await _reply(update, text, parse_mode="HTML")
@@ -946,6 +951,67 @@ async def cmd_risk(update, context) -> None:
         f"  📊 Итого:  ${s.total_deployed_usd:.2f} / ${total_cap:.2f}  ({s.total_deployed_pct:.0%})\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# /gamma  — Gamma API circuit-breaker status + live reachability probe
+# /gamma_reset  — force-reset circuit breaker without bot restart
+# ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_gamma(update, context) -> None:
+    """Show Gamma circuit-breaker state and probe the endpoint."""
+    import asyncio
+    from src.scheduler import get_gamma
+
+    g = get_gamma()
+    now = datetime.now()
+
+    if g._circuit_open_until and now < g._circuit_open_until:
+        remaining = int((g._circuit_open_until - now).total_seconds() // 60)
+        breaker_line = f"🔴 OPEN (ещё ~{remaining} мин, до {g._circuit_open_until:%H:%M:%S})"
+    else:
+        breaker_line = "🟢 CLOSED"
+
+    text = (
+        "🔌 <b>Gamma API — диагностика</b>\n\n"
+        f"Circuit: {breaker_line}\n"
+        f"open_count: {g._open_count}\n"
+        f"consec_timeout: {g._consec_timeout}\n"
+        f"consec_hard: {g._consec_hard}\n"
+        f"last_status: <code>{g._last_fetch_status}</code>\n"
+        f"last_fail_kind: <code>{g._last_fail_kind or '—'}</code>\n\n"
+        "⏳ Зондирую endpoint (<code>/events/keyset</code>)…"
+    )
+    msg = await update.message.reply_text(text, parse_mode="HTML")
+
+    loop = asyncio.get_event_loop()
+    ok, elapsed, detail = await loop.run_in_executor(None, lambda: g.probe(timeout_s=15.0))
+
+    probe_icon = "✅" if ok else "❌"
+    result_text = text.replace(
+        "⏳ Зондирую endpoint (<code>/events/keyset</code>)…",
+        f"{probe_icon} Probe: {elapsed:.1f}s — <code>{detail}</code>\n\n"
+        "/gamma_reset — сбросить брейкер вручную",
+    )
+    await msg.edit_text(result_text, parse_mode="HTML")
+
+
+@_admin_only
+async def cmd_gamma_reset(update, context) -> None:
+    """Force-reset Gamma circuit breaker (use after IP/rate-limit fix or Gamma recovery)."""
+    from src.scheduler import get_gamma
+
+    g = get_gamma()
+    prev = g._open_count
+    was_open = g._circuit_open_until is not None and datetime.now() < g._circuit_open_until
+    g.reset_circuit()
+    state = "OPEN" if was_open else "closed"
+    await update.message.reply_text(
+        f"✅ Gamma circuit breaker сброшен.\n"
+        f"Было: {state}, open_count={prev}\n"
+        f"Следующий цикл discovery попробует немедленно."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1296,6 +1362,8 @@ def run_telegram_bot() -> None:
             app.add_handler(CommandHandler("setstake",         cmd_setstake))
             app.add_handler(CommandHandler("strategy",         cmd_strategy))
             app.add_handler(CommandHandler("cancel",           cmd_cancel_trade))
+            app.add_handler(CommandHandler("gamma",            cmd_gamma))
+            app.add_handler(CommandHandler("gamma_reset",      cmd_gamma_reset))
 
             # Inline-button callbacks
             app.add_handler(CallbackQueryHandler(_callback_router))

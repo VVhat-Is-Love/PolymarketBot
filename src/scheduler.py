@@ -19,6 +19,11 @@ from src.notifications.telegram import get_notifier
 _gamma = GammaClient()
 
 
+def get_gamma() -> GammaClient:
+    """Expose the shared GammaClient singleton (used by Telegram /gamma command)."""
+    return _gamma
+
+
 _discovery_zero_count: int = 0          # G2-8: consecutive zero-event discovery counter
 _discovery_last_alert: "datetime | None" = None  # throttle: ≤ 1 Gamma-0 alert per 6h
 
