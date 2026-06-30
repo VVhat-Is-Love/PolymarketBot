@@ -282,11 +282,21 @@ class CalibrationLog(Base):
     bin_near_boundary: Mapped[float | None] = mapped_column(Float, nullable=True)
     bin_far_boundary: Mapped[float | None] = mapped_column(Float, nullable=True)
     sigma_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Gate fields — populated by _job_calibration_log at snapshot time.
+    # gate_verdict: "PASS" if bin cleared the k·σ distance gate, "SKIP" otherwise.
+    # gate_direction: "ABOVE" if bin is above consensus, "BELOW" if below.
+    # k_sigma_threshold: effective distance threshold in market unit (k_eff × sigma).
+    # sigma_spread: stdev of per-model consensus temps — proxy for forecast uncertainty.
+    gate_verdict: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    gate_direction: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    k_sigma_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sigma_spread: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Resolution fields — populated by _job_calibration_resolve after the market settles.
     # resolved_outcome: True = YES bin won (temp landed in this range), False = bin lost.
     resolved_outcome: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # Actual temperature in native unit (°F or °C) from Open-Meteo archive.
+    # Actual temperature in native unit (°F or °C) from Open-Meteo archive at ICAO coords.
+    # Note: Open-Meteo returns grid-interpolated data, not the raw station reading.
     actual_temp_resolve: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 

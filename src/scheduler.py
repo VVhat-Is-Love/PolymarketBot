@@ -137,12 +137,15 @@ def _job_calibration_log() -> None:
 
     Called from _job_snapshot_markets() so prices are always fresh.
     Uses Gaussian P from tail_seller with tail_sigma_c (same model as live engine).
+    Also runs the k·σ gate to record gate_verdict/direction/threshold so the strategist
+    can filter PASS vs SKIP without recomputing from raw fields.
     Pure logging — zero trading side-effects.
     """
     import statistics as _stats
     from src.db.models import WeatherSnapshot as WSnap
     from src.strategy.tail_seller import _bin_yes_probs
     from src.strategy.config import StrategySettings as _StrategyCfg
+    from src.strategy.live_trader import _tail_ksigma_ok, _unit_from_label
 
     ss = _StrategyCfg()
     session = get_session()
@@ -203,6 +206,7 @@ def _job_calibration_log() -> None:
 
             consensus_temp = _stats.mean(temps)
             models_count = len(temps)
+            sigma_spread = _stats.stdev(temps) if len(temps) > 1 else None
 
             markets: list[Market] = list(
                 session.execute(
@@ -219,11 +223,6 @@ def _job_calibration_log() -> None:
                 )
                 skipped_no_markets += 1
                 continue
-
-            # Gaussian sigma in the market's native unit (°F → convert).
-            unit = (group.unit or "F").upper()
-            sigma = ss.tail_sigma_c * (9.0 / 5.0) if unit == "F" else ss.tail_sigma_c
-            p_yes_map = _bin_yes_probs(markets, consensus_temp, sigma)
 
             # Latest MarketSnapshot per market (single subquery per group).
             market_ids = [m.market_id for m in markets]
@@ -248,28 +247,50 @@ def _job_calibration_log() -> None:
             }
 
             for m in markets:
+                # Unit from bin_label (ground truth) — group.unit is unreliable for
+                # US cities where the DB stores "C" (T1-GATE-UNIT-DETECTION fix).
+                unit = _unit_from_label(m.bin_label) or (group.unit or "F").upper()
+                sigma = ss.tail_sigma_c * (9.0 / 5.0) if unit == "F" else ss.tail_sigma_c
+
+                p_yes_map = _bin_yes_probs(markets, consensus_temp, sigma)
                 p_yes = p_yes_map.get(m.market_id)
                 snap = snap_by_market.get(m.market_id)
 
-                # bin_distance_sigma: how many σ the near boundary is from consensus.
-                # near boundary = bin_min if bin is above consensus, else bin_max.
+                # Geometry: bin boundaries and distance from consensus.
                 bin_distance_sigma = None
                 bin_near_boundary = None
                 bin_far_boundary = None
+                gate_verdict = None
+                gate_direction = None
+                k_sigma_threshold = None
+
                 if m.bin_min is not None and sigma > 0:
+                    consensus_in_unit = (
+                        consensus_temp * 9.0 / 5.0 + 32.0 if unit == "F"
+                        else consensus_temp
+                    )
                     hi = float(m.bin_max) if m.bin_max is not None else float(m.bin_min) + 1.0
-                    above = float(m.bin_min) >= consensus_temp
+                    above = float(m.bin_min) >= consensus_in_unit
                     near = float(m.bin_min) if above else hi
                     far = hi if above else float(m.bin_min)
                     bin_near_boundary = near
                     bin_far_boundary = far
-                    bin_distance_sigma = abs(near - consensus_temp) / sigma
+                    bin_distance_sigma = abs(near - consensus_in_unit) / sigma
 
-                if m.bin_min is None:
-                    logger.debug(
-                        f"[calibration] {group.city} {m.bin_label}: "
-                        f"bin_min=None → bin_near_boundary/sigma NULL for this row"
+                    # k·σ gate: same logic as live engine (T1 unit fix applied).
+                    _ok, _near, _dist, _thr, _k = _tail_ksigma_ok(
+                        float(m.bin_min), m.bin_max, consensus_temp, unit, ss
                     )
+                    gate_verdict = "PASS" if _ok else "SKIP"
+                    gate_direction = "ABOVE" if _near >= consensus_in_unit else "BELOW"
+                    k_sigma_threshold = _thr
+                else:
+                    if m.bin_min is None:
+                        logger.debug(
+                            f"[calibration] {group.city} {m.bin_label}: "
+                            f"bin_min=None → geometry/gate NULL for this row"
+                        )
+
                 cal_rows.append(CalibrationLog(
                     timestamp=now,
                     city=group.city,
@@ -286,6 +307,10 @@ def _job_calibration_log() -> None:
                     bin_near_boundary=bin_near_boundary,
                     bin_far_boundary=bin_far_boundary,
                     sigma_used=sigma,
+                    gate_verdict=gate_verdict,
+                    gate_direction=gate_direction,
+                    k_sigma_threshold=k_sigma_threshold,
+                    sigma_spread=sigma_spread,
                 ))
 
         if cal_rows:
