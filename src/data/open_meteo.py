@@ -60,7 +60,13 @@ def _parse_daily(response, model: str, city: str, days: int) -> list[WeatherSnap
 
 
 def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 3) -> list[WeatherSnapshot]:
-    """Fetch daily high/low from 3 global models for the given city."""
+    """Fetch daily high/low from 3 global models for the given city.
+
+    timezone="UTC" ensures forecast_date stored in DB equals the UTC calendar date,
+    matching Polymarket's resolution_date (which is always a UTC day). With "auto"
+    the start-of-day timestamp is midnight local time, shifting stored dates by ±1
+    for cities in UTC±N timezones.
+    """
     om = _build_client()
     snapshots: list[WeatherSnapshot] = []
 
@@ -73,7 +79,7 @@ def fetch_multi_model_forecast(city: str, lat: float, lon: float, days: int = 3)
                 "models": model,
                 "temperature_unit": "celsius",
                 "forecast_days": days,
-                "timezone": "auto",
+                "timezone": "UTC",   # was "auto" — see docstring
             }
             responses = om.weather_api(FORECAST_URL, params=params)
             
@@ -185,11 +191,50 @@ def _fetch_from_archive(
     return None
 
 
+def fetch_utc_offset_seconds(lat: float, lon: float) -> int | None:
+    """
+    One Open-Meteo call with timezone="auto" to read the location's CURRENT UTC
+    offset in seconds (DST-aware). Used to derive local city time for the
+    time-gate / hard-floor tail exits. No new dependency — the SDK response
+    exposes UtcOffsetSeconds() directly.
+    """
+    om = _build_client()
+    try:
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "temperature_2m_max",  # minimal payload; we only want the tz
+            "forecast_days": 1,
+            "timezone": "auto",
+        }
+        responses = om.weather_api(FORECAST_URL, params=params)
+        if not responses:
+            return None
+        return int(responses[0].UtcOffsetSeconds())
+    except Exception as e:
+        logger.debug(f"Open-Meteo utc_offset failed for ({lat},{lon}): {e}")
+        return None
+
+
 def fetch_and_save_all_cities() -> int:
     """Fetch multi-model forecasts for all cities in the whitelist and save to DB."""
+    from sqlalchemy import select, update
+    from src.db.models import MarketGroup
+
     session = get_session()
     repo = WeatherSnapshotRepository(session)
     saved = 0
+    no_data_cities: list[str] = []
+
+    # Only refresh the UTC offset for cities with active groups (the ones the
+    # exit logic actually evaluates) — avoids ~40 extra calls per cycle.
+    active_cities = {
+        c for (c,) in session.execute(
+            select(MarketGroup.city)
+            .where(MarketGroup.is_active.is_not(False))
+            .distinct()
+        ).all()
+    }
 
     for city, cfg in CITIES_WHITELIST.items():
         snaps = fetch_multi_model_forecast(city, cfg["lat"], cfg["lon"])
@@ -199,8 +244,38 @@ def fetch_and_save_all_cities() -> int:
 
         _log_city_forecast(city, cfg.get("unit", "F"), snaps)
 
+        if not snaps:
+            no_data_cities.append(city)
+
+        # G-A1: capture local UTC offset for active-group cities → drives local_now()
+        if city in active_cities:
+            offset = fetch_utc_offset_seconds(cfg["lat"], cfg["lon"])
+            if offset is not None:
+                session.execute(
+                    update(MarketGroup)
+                    .where(
+                        MarketGroup.city == city,
+                        MarketGroup.is_active.is_not(False),
+                    )
+                    .values(utc_offset_seconds=offset)
+                )
+                local_h = (datetime.utcnow() + timedelta(seconds=offset)).hour
+                logger.info(
+                    f"[tz] {city}: utc_offset={offset/3600:+.0f}h "
+                    f"local_hour={local_h:02d} (UTC {datetime.utcnow():%H:%M})"
+                )
+    session.commit()
+
     session.close()
     logger.info(f"Open-Meteo total snapshots saved: {saved}")
+
+    if no_data_cities:
+        logger.warning(
+            f"[open_meteo] No data from any model for {len(no_data_cities)} cities: "
+            f"{', '.join(no_data_cities[:10])}"
+            + (f" (+{len(no_data_cities)-10} more)" if len(no_data_cities) > 10 else "")
+        )
+
     return saved
 
 

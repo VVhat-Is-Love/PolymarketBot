@@ -65,7 +65,10 @@ def _get_latest_snapshots(
 
 
 def _get_forecasts_for_group(session: Session, group: MarketGroup) -> list[WeatherSnapshot]:
-    """Latest multi-model Open-Meteo forecasts for group's city + resolution_date."""
+    """
+    Latest multi-model Open-Meteo forecasts for group's city + resolution_date (UTC).
+    With timezone='UTC' in fetches, forecast_date == resolution_date always.
+    """
     rows = (
         session.execute(
             select(WeatherSnapshot).where(
@@ -247,7 +250,46 @@ def run_paper_trade_engine() -> None:
                 ).scalars().first()
 
                 if not existing:
-                    basket_json = build_basket_json(result.basket)
+                    # G2-7: realistic sizing mirroring live execution
+                    # Use best_ask + entry_tick as simulated entry price
+                    # Size by wallet balance × bankroll_fraction, capped at max_basket_cost_usd
+                    try:
+                        from src.strategy.live_trader import _get_wallet_balance
+                        paper_wallet = _get_wallet_balance()
+                    except Exception:
+                        paper_wallet = ss.strategy_virtual_stake_usd * 3  # fallback
+
+                    n_bins = len(result.basket)
+                    entry_tick = getattr(ss, "entry_tick", 0.01)
+                    raw_stake = paper_wallet * ss.bankroll_fraction_per_basket
+                    total_stake = max(
+                        ss.min_basket_stake_usd,
+                        min(ss.max_basket_cost_usd, raw_stake),
+                    )
+                    per_bin_stake = total_stake / n_bins if n_bins else total_stake
+
+                    # Build basket_json with realistic entry prices and shares
+                    import json as _json
+                    realistic_rows = []
+                    for item in result.basket:
+                        # Use market ask price + tick (or price_yes if no ask)
+                        snap = snapshots.get(item.market.market_id, {})
+                        ask = snap.get("best_ask") or item.price_yes or 0.01
+                        entry_price = min(0.99, ask + entry_tick)
+                        shares = round(per_bin_stake / entry_price, 4) if entry_price > 0 else 0.0
+                        actual_stake = round(shares * entry_price, 4)
+                        realistic_rows.append({
+                            "market_id": item.market.market_id,
+                            "bin_label": item.market.bin_label,
+                            "bin_min": item.market.bin_min,
+                            "bin_max": item.market.bin_max,
+                            "price_yes": item.price_yes,
+                            "entry_price": entry_price,
+                            "stake_usd": actual_stake,
+                            "shares": shares,
+                        })
+                    basket_json = _json.dumps(realistic_rows)
+                    total_paper_stake = sum(r["stake_usd"] for r in realistic_rows)
 
                     # Snapshot volumes at entry time
                     bin_volumes = {
@@ -280,7 +322,7 @@ def run_paper_trade_engine() -> None:
                         sum_of_prices=result.sum_of_prices,
                         estimated_edge=result.estimated_edge,
                         basket_json=basket_json,
-                        virtual_stake_usd=ss.strategy_virtual_stake_usd,
+                        virtual_stake_usd=round(total_paper_stake, 4),
                         status="open",
                         bin_volumes_json=json.dumps(bin_volumes),
                         consensus_offset=consensus_offset,

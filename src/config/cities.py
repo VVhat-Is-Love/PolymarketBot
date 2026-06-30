@@ -14,6 +14,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/nl/schiphol/EHAM',
         "wunderground": 'nl/schiphol/EHAM',
+        "zone": 'europe_west',
     },
     "Ankara": {
         "aliases": [],
@@ -25,6 +26,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/tr/%C3%A7ubuk/LTAC',
         "wunderground": 'tr/çubuk/LTAC',
+        "zone": 'europe_east',
     },
     "Atlanta": {
         "aliases": [],
@@ -36,6 +38,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/ga/atlanta/KATL',
         "wunderground": 'us/ga/atlanta/KATL',
+        "zone": 'us_south',
     },
     "Austin": {
         "aliases": [],
@@ -47,6 +50,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/tx/austin/KAUS',
         "wunderground": 'us/tx/austin/KAUS',
+        "zone": 'us_south',
     },
     "Beijing": {
         "aliases": [],
@@ -58,6 +62,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/beijing/ZBAA',
         "wunderground": 'cn/beijing/ZBAA',
+        "zone": 'china',
     },
     "Buenos Aires": {
         "aliases": [],
@@ -69,6 +74,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/ar/ezeiza/SAEZ',
         "wunderground": 'ar/ezeiza/SAEZ',
+        "zone": 'latin_america',
     },
     "Busan": {
         "aliases": [],
@@ -80,6 +86,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/kr/busan/RKPK',
         "wunderground": 'kr/busan/RKPK',
+        "zone": 'japan_korea',
     },
     "Cape Town": {
         "aliases": [],
@@ -91,6 +98,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/za/matroosfontein/FACT',
         "wunderground": 'za/matroosfontein/FACT',
+        "zone": 'africa',
     },
     "Chengdu": {
         "aliases": [],
@@ -102,6 +110,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/chengdu/ZUUU',
         "wunderground": 'cn/chengdu/ZUUU',
+        "zone": 'china',
     },
     "Chicago": {
         "aliases": [],
@@ -113,6 +122,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/il/chicago/KORD',
         "wunderground": 'us/il/chicago/KORD',
+        "zone": 'us_interior',
     },
     "Chongqing": {
         "aliases": [],
@@ -124,6 +134,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/chongqing/ZUCK',
         "wunderground": 'cn/chongqing/ZUCK',
+        "zone": 'china',
     },
     "Dallas": {
         "aliases": [],
@@ -135,6 +146,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/tx/dallas/KDAL',
         "wunderground": 'us/tx/dallas/KDAL',
+        "zone": 'us_south',
     },
     "Denver": {
         "aliases": [],
@@ -146,6 +158,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/co/aurora/KBKF',
         "wunderground": 'us/co/aurora/KBKF',
+        "zone": 'us_interior',
     },
     "Guangzhou": {
         "aliases": [],
@@ -157,6 +170,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/guangzhou/ZGGG',
         "wunderground": 'cn/guangzhou/ZGGG',
+        "zone": 'china',
     },
     "Helsinki": {
         "aliases": [],
@@ -168,6 +182,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/fi/vantaa/EFHK',
         "wunderground": 'fi/vantaa/EFHK',
+        "zone": 'europe_north',
     },
     "Hong Kong": {
         "aliases": ['HK'],
@@ -179,6 +194,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'hko',
         "resolution_url": 'https://www.weather.gov.hk/en/cis/climat.htm',
         "wunderground": None,
+        "zone": 'china',
     },
     "Houston": {
         "aliases": [],
@@ -190,6 +206,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/tx/houston/KHOU',
         "wunderground": 'us/tx/houston/KHOU',
+        "zone": 'us_south',
     },
     "Istanbul": {  # ⚠️  coords unverified — check station manually
         "aliases": [],
@@ -201,6 +218,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'nws',
         "resolution_url": 'https://www.weather.gov/wrh/timeseries?site=LTFM',
         "wunderground": None,
+        "zone": 'europe_east',
     },
     "Jeddah": {
         "aliases": [],
@@ -212,6 +230,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/sa/jeddah/OEJN',
         "wunderground": 'sa/jeddah/OEJN',
+        "zone": 'middle_east',
     },
     "Jinan": {
         "aliases": [],
@@ -223,6 +242,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/jinan/ZSJN',
         "wunderground": 'cn/jinan/ZSJN',
+        "zone": 'china',
     },
     "Karachi": {
         "aliases": [],
@@ -234,6 +254,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/pk/karachi/OPKC',
         "wunderground": 'pk/karachi/OPKC',
+        "zone": 'south_asia',
     },
     "Kuala Lumpur": {
         "aliases": [],
@@ -245,6 +266,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/my/sepang-district/WMKK',
         "wunderground": 'my/sepang-district/WMKK',
+        "zone": 'southeast_asia',
     },
     "London": {
         "aliases": [],
@@ -256,6 +278,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/gb/london/EGLC',
         "wunderground": 'gb/london/EGLC',
+        "zone": 'europe_west',
     },
     "Los Angeles": {
         "aliases": ['LA'],
@@ -267,6 +290,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/ca/los-angeles/KLAX',
         "wunderground": 'us/ca/los-angeles/KLAX',
+        "zone": 'us_west_coast',
     },
     "Lucknow": {
         "aliases": [],
@@ -278,6 +302,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/in/lucknow/VILK',
         "wunderground": 'in/lucknow/VILK',
+        "zone": 'south_asia',
     },
     "Madrid": {
         "aliases": [],
@@ -289,6 +314,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/es/madrid/LEMD',
         "wunderground": 'es/madrid/LEMD',
+        "zone": 'europe_west',
     },
     "Manila": {
         "aliases": [],
@@ -300,6 +326,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/ph/manila/RPLL',
         "wunderground": 'ph/manila/RPLL',
+        "zone": 'southeast_asia',
     },
     "Mexico City": {
         "aliases": [],
@@ -311,6 +338,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/mx/mexico-city/MMMX',
         "wunderground": 'mx/mexico-city/MMMX',
+        "zone": 'latin_america',
     },
     "Miami": {
         "aliases": [],
@@ -322,6 +350,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/fl/miami/KMIA',
         "wunderground": 'us/fl/miami/KMIA',
+        "zone": 'us_south',
     },
     "Milan": {
         "aliases": [],
@@ -333,6 +362,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/it/milan/LIMC',
         "wunderground": 'it/milan/LIMC',
+        "zone": 'europe_west',
     },
     "Moscow": {  # ⚠️  coords unverified — check station manually
         "aliases": [],
@@ -344,6 +374,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'nws',
         "resolution_url": 'https://www.weather.gov/wrh/timeseries?site=UUWW',
         "wunderground": None,
+        "zone": 'europe_east',
     },
     "Munich": {
         "aliases": [],
@@ -355,6 +386,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/de/munich/EDDM',
         "wunderground": 'de/munich/EDDM',
+        "zone": 'europe_west',
     },
     "New York": {
         "aliases": ['NYC'],
@@ -366,6 +398,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA',
         "wunderground": 'us/ny/new-york-city/KLGA',
+        "zone": 'us_northeast',
     },
     "Panama City": {
         "aliases": [],
@@ -377,6 +410,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/pa/panama-city/MPMG',
         "wunderground": 'pa/panama-city/MPMG',
+        "zone": 'latin_america',
     },
     "Paris": {
         "aliases": [],
@@ -388,6 +422,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/fr/bonneuil-en-france/LFPB',
         "wunderground": 'fr/bonneuil-en-france/LFPB',
+        "zone": 'europe_west',
     },
     "Qingdao": {
         "aliases": [],
@@ -399,6 +434,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/qingdao/ZSQD',
         "wunderground": 'cn/qingdao/ZSQD',
+        "zone": 'china',
     },
     "San Francisco": {
         "aliases": [],
@@ -410,6 +446,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/ca/san-francisco/KSFO',
         "wunderground": 'us/ca/san-francisco/KSFO',
+        "zone": 'us_west_coast',
     },
     "Sao Paulo": {
         "aliases": [],
@@ -421,6 +458,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/br/guarulhos/SBGR',
         "wunderground": 'br/guarulhos/SBGR',
+        "zone": 'latin_america',
     },
     "Seattle": {
         "aliases": [],
@@ -432,6 +470,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/us/wa/seatac/KSEA',
         "wunderground": 'us/wa/seatac/KSEA',
+        "zone": 'us_west_coast',
     },
     "Seoul": {
         "aliases": [],
@@ -443,6 +482,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/kr/incheon/RKSI',
         "wunderground": 'kr/incheon/RKSI',
+        "zone": 'japan_korea',
     },
     "Shanghai": {
         "aliases": [],
@@ -454,6 +494,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/shanghai/ZSPD',
         "wunderground": 'cn/shanghai/ZSPD',
+        "zone": 'china',
     },
     "Shenzhen": {
         "aliases": [],
@@ -465,6 +506,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/shenzhen/ZGSZ',
         "wunderground": 'cn/shenzhen/ZGSZ',
+        "zone": 'china',
     },
     "Singapore": {
         "aliases": [],
@@ -476,6 +518,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/sg/singapore/WSSS',
         "wunderground": 'sg/singapore/WSSS',
+        "zone": 'southeast_asia',
     },
     "Taipei": {
         "aliases": [],
@@ -487,6 +530,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/tw/taipei/RCSS',
         "wunderground": 'tw/taipei/RCSS',
+        "zone": 'japan_korea',
     },
     "Tel Aviv": {  # ⚠️  coords unverified — check station manually
         "aliases": [],
@@ -498,6 +542,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'nws',
         "resolution_url": 'https://www.weather.gov/wrh/timeseries?site=LLBG',
         "wunderground": None,
+        "zone": 'middle_east',
     },
     "Tokyo": {
         "aliases": [],
@@ -509,6 +554,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/jp/tokyo/RJTT',
         "wunderground": 'jp/tokyo/RJTT',
+        "zone": 'japan_korea',
     },
     "Toronto": {
         "aliases": [],
@@ -520,6 +566,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/ca/mississauga/CYYZ',
         "wunderground": 'ca/mississauga/CYYZ',
+        "zone": 'us_northeast',
     },
     "Warsaw": {
         "aliases": [],
@@ -531,6 +578,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/pl/warsaw/EPWA',
         "wunderground": 'pl/warsaw/EPWA',
+        "zone": 'europe_east',
     },
     "Wellington": {
         "aliases": [],
@@ -542,6 +590,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/nz/wellington/NZWN',
         "wunderground": 'nz/wellington/NZWN',
+        "zone": 'oceania',
     },
     "Wuhan": {
         "aliases": [],
@@ -553,6 +602,7 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/wuhan/ZHHH',
         "wunderground": 'cn/wuhan/ZHHH',
+        "zone": 'china',
     },
     "Zhengzhou": {
         "aliases": [],
@@ -564,5 +614,6 @@ CITIES_WHITELIST: dict[str, dict] = {
         "resolution_source": 'wunderground',
         "resolution_url": 'https://www.wunderground.com/history/daily/cn/zhengzhou/ZHCC',
         "wunderground": 'cn/zhengzhou/ZHCC',
+        "zone": 'china',
     },
 }

@@ -4,17 +4,23 @@ Responds only to user IDs listed in ADMIN_TELEGRAM_ID (comma-separated).
 Runs as a separate thread alongside the scheduler.
 
 Commands:
-  /status           — full dashboard: balance, PnL, positions, risk
-  /pnl [period]     — PnL breakdown (today|week|month|all)
-  /trades [filter]  — list positions (open|all|history|pending)
-  /trade <id>       — detailed trade card by ID prefix
-  /setlimit <t> <v> — update risk limit with confirmation (daily|bet|total)
-  /setstake <v>     — update MAX_SINGLE_BET_USD with confirmation
+  /status              — full dashboard: balance, PnL, positions, risk
+  /pnl [period]        — PnL breakdown (today|week|month|all)
+  /trades [filter]     — list positions (open|all|history|pending)
+  /trade <id>          — detailed trade card by ID prefix
+  /risk                — risk limits overview
+  /paper               — paper trading status, open trades, strategy info
+  /help                — list all commands
+  /setlimit <t> <v>    — update risk limit with confirmation (daily|bet|total)
+  /setstake <v>        — update MAX_SINGLE_BET_USD with confirmation
   /strategy [list|on|off] [name] — view/toggle strategies
-  /cancel <id>      — cancel an open order with confirmation
-  /stop [reason]    — activate emergency stop
-  /start            — clear emergency stop
-  /risk             — risk limits overview
+  /cancel <id>         — cancel an open order with confirmation
+  /gamma               — Gamma API circuit-breaker status + live probe
+  /gamma_reset         — force-reset Gamma circuit breaker (after outage)
+  /stop [reason]       — activate emergency stop (persisted to DB)
+  /reset_stop          — clear emergency stop with two-stage confirmation
+  /reset_paper_stop    — reset virtual paper stop (voids loss accounting)
+  /mode [paper|live]   — switch trading mode
 """
 from __future__ import annotations
 
@@ -528,16 +534,17 @@ async def cmd_setlimit(update, context) -> None:
     try:
         if len(context.args) < 2:
             await update.message.reply_text(
-                "❓ Используй: /setlimit [daily|bet|total] <value>\n"
-                "  daily — дневной лимит потерь\n"
-                "  bet   — макс. размер ставки\n"
-                "  total — общий стоп-лосс"
+                "❓ Используй: /setlimit [daily|bet|total|tail] <value>\n"
+                "  daily — дневной лимит потерь (live)\n"
+                "  bet   — макс. корзинная ставка (basket)\n"
+                "  total — общий стоп-лосс (устаревш.)\n"
+                "  tail  — макс. размер tail-ставки (per position)"
             )
             return
 
         limit_type = context.args[0].lower()
-        if limit_type not in ("daily", "bet", "total"):
-            await update.message.reply_text("❌ Тип: daily, bet или total")
+        if limit_type not in ("daily", "bet", "total", "tail"):
+            await update.message.reply_text("❌ Тип: daily, bet, total или tail")
             return
 
         try:
@@ -547,13 +554,15 @@ async def cmd_setlimit(update, context) -> None:
             return
 
         from src.risk.risk_manager import risk_manager
+        from src.strategy.config import strategy_settings
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         s = risk_manager.get_status()
         old_map = {
             "daily": (s.daily_loss_limit_usd, "Дневной лимит потерь"),
-            "bet":   (s.max_single_bet_usd, "Макс. ставка"),
+            "bet":   (s.max_single_bet_usd, "Макс. корзинная ставка"),
             "total": (s.total_stop_loss_usd, "Общий стоп-лосс"),
+            "tail":  (strategy_settings.tail_max_position_usd, "Макс. tail-ставка"),
         }
         old_val, label = old_map[limit_type]
 
@@ -711,8 +720,163 @@ async def cmd_cancel_trade(update, context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /help
+# ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_help(update, context) -> None:
+    text = (
+        "<b>Команды бота</b>\n\n"
+        "<b>Мониторинг</b>\n"
+        "/status — дашборд: баланс, PnL, позиции, риск\n"
+        "/pnl [today|week|month|all] — разбивка PnL по периоду\n"
+        "/trades [open|all|history|pending] — список позиций\n"
+        "/trade &lt;id&gt; — карточка сделки по ID\n"
+        "/risk — лимиты риска\n"
+        "/paper — статус paper-торговли\n\n"
+        "<b>Управление</b>\n"
+        "/mode [paper|live] — переключить режим торговли\n"
+        "/stop [причина] — аварийная остановка (сохраняется)\n"
+        "/reset_stop — снять аварийную остановку (с подтверждением)\n"
+        "/reset_paper_stop — сбросить виртуальный paper-стоп\n"
+        "/rebaseline — сбросить HWM drawdown до текущей equity (dd=0)\n"
+        "/cancel &lt;id&gt; — отменить ордер (с подтверждением)\n\n"
+        "<b>Настройки</b>\n"
+        "/setlimit [daily|bet|total|tail] &lt;значение&gt; — обновить лимит (tail = cap tail-ставки)\n"
+        "/setstake &lt;значение&gt; — обновить basket-ставку\n"
+        "/strategy [list|on|off] [название] — включить/выключить стратегию\n\n"
+        "<b>Диагностика</b>\n"
+        "/gamma — статус Gamma API + живой probe endpoint\n"
+        "/gamma_reset — сбросить circuit breaker Gamma вручную\n\n"
+        "/help — эта справка"
+    )
+    await _reply(update, text, parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
 # /stop, /start, /risk  (kept from original)
 # ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_paper(update, context) -> None:
+    """Show paper trading status: losses, limits, open trades, recent history."""
+    import json as _json
+    from sqlalchemy import select, func as sa_func
+    from src.db.session import get_session
+    from src.db.models import PaperTrade
+    from src.risk.risk_manager import risk_manager
+
+    s = risk_manager.get_status()
+    paper_ok, paper_reason = risk_manager.can_run_paper()
+
+    from src.config.settings import settings
+    mode = (settings.trading_mode or "paper").upper()
+
+    lines: list[str] = []
+    lines.append(f"<b>Paper Trading</b>  (режим: {mode})")
+    lines.append("")
+
+    stop_icon = "🟢 активен" if paper_ok else "🔴 ОСТАНОВЛЕН"
+    lines.append(f"Статус paper:  {stop_icon}")
+    if not paper_ok:
+        lines.append(f"Причина: {paper_reason}")
+
+    lines.append(
+        f"Убытки сегодня:  ${s.paper_daily_loss:.2f} / ${s.paper_daily_loss_limit_usd:.2f}"
+    )
+    lines.append(
+        f"Убытки итого:    ${s.paper_total_loss:.2f} / ${s.paper_total_stop_loss_usd:.2f}"
+    )
+    lines.append("")
+
+    # Strategy: paper uses basket_wide / basket_narrow
+    lines.append("<b>Стратегия paper:</b> basket_wide / basket_narrow")
+    lines.append("<i>(tail стратегия в paper-режиме не поддерживается — только live)</i>")
+    lines.append("")
+
+    session = get_session()
+    try:
+        # Open paper trades
+        open_trades = session.execute(
+            select(PaperTrade)
+            .where(PaperTrade.status == "open")
+            .order_by(PaperTrade.decision_time.desc())
+            .limit(10)
+        ).scalars().all()
+
+        if open_trades:
+            lines.append(f"<b>Открытые ({len(open_trades)}):</b>")
+            for t in open_trades:
+                city = t.city or "?"
+                strat = t.strategy_name or "basket"
+                stake = t.virtual_stake_usd or 0.0
+                ts = t.decision_time.strftime("%m-%d %H:%M") if t.decision_time else "?"
+                try:
+                    basket = _json.loads(t.basket_json or "[]")
+                    bins_str = ", ".join(b.get("bin_label", "?") for b in basket[:3])
+                    if len(basket) > 3:
+                        bins_str += f" +{len(basket) - 3}"
+                except Exception:
+                    bins_str = "?"
+                lines.append(f"  #{t.id}  {city}  [{strat}]  ${stake:.2f}  {bins_str}  ({ts})")
+        else:
+            lines.append("Открытых paper-сделок нет.")
+
+        lines.append("")
+
+        # Recent closed
+        recent = session.execute(
+            select(PaperTrade)
+            .where(PaperTrade.status != "open", PaperTrade.pnl_usd.isnot(None))
+            .order_by(PaperTrade.resolved_at.desc())
+            .limit(5)
+        ).scalars().all()
+
+        if recent:
+            lines.append("<b>Последние закрытые:</b>")
+            for t in recent:
+                city = t.city or "?"
+                pnl = t.pnl_usd or 0.0
+                icon = "✅" if pnl >= 0 else "❌"
+                ts = t.resolved_at.strftime("%m-%d") if t.resolved_at else "?"
+                lines.append(f"  {icon} #{t.id}  {city}  PnL: ${pnl:+.2f}  ({t.status}) {ts}")
+    finally:
+        session.close()
+
+    if not paper_ok:
+        lines.append("")
+        lines.append("Для сброса paper-стопа: /reset_paper_stop")
+
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+@_admin_only
+async def cmd_reset_paper_stop(update, context) -> None:
+    """Two-stage confirmation to reset virtual paper stop."""
+    from src.risk.risk_manager import risk_manager
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    paper_ok, paper_reason = risk_manager.can_run_paper()
+    if paper_ok:
+        await update.message.reply_text(
+            "📊 Paper стоп не активен — paper-торговля уже разрешена."
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 ДА, СБРОСИТЬ", callback_data="rps:confirm"),
+        InlineKeyboardButton("❌ Отмена", callback_data="x"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ <b>Сбросить виртуальный paper-стоп?</b>\n\n"
+        f"Причина блокировки: {paper_reason}\n\n"
+        "Все убыточные paper-сделки будут исключены из учёта.\n"
+        "Торговые данные в БД сохранятся (статус: voided_legacy).\n\n"
+        "Это действует только на виртуальный баланс.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
 
 @_admin_only
 async def cmd_stop(update, context) -> None:
@@ -720,33 +884,169 @@ async def cmd_stop(update, context) -> None:
     from src.risk.risk_manager import risk_manager
     risk_manager.set_emergency_stop(reason)
     await update.message.reply_text(
-        f"🛑 Emergency stop активирован.\nПричина: {reason}\n\nБот НЕ будет размещать новые ордера."
+        f"🛑 Emergency stop АКТИВИРОВАН (сохранён в БД).\n"
+        f"Причина: {reason}\n\n"
+        f"Бот НЕ будет размещать новые ордера даже после перезапуска.\n"
+        f"Для снятия: /reset_stop"
+    )
+
+
+@_admin_only
+async def cmd_reset_stop(update, context) -> None:
+    """Two-stage confirmation to clear persistent emergency stop."""
+    from src.risk.risk_manager import risk_manager
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    if not risk_manager.is_emergency_stopped() and not risk_manager.get_status().emergency_stop:
+        await update.message.reply_text("✅ Emergency stop не активен — торговля уже включена.")
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ДА, СНЯТЬ СТОП", callback_data="rs:confirm"),
+        InlineKeyboardButton("❌ Отмена", callback_data="x"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ <b>Подтвердите сброс Emergency Stop</b>\n\n"
+        "Это разрешит боту размещать новые ордера.\n"
+        "Убедитесь, что ситуация под контролем перед продолжением.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
     )
 
 
 @_admin_only
 async def cmd_start(update, context) -> None:
     from src.risk.risk_manager import risk_manager
-    if not risk_manager.get_status().emergency_stop:
-        await update.message.reply_text("✅ Emergency stop не активен — торговля уже запущена.")
+    if not risk_manager.get_status().emergency_stop and not risk_manager.is_emergency_stopped():
+        await update.message.reply_text(
+            "✅ Emergency stop не активен — торговля уже запущена.\n"
+            "Для явного сброса используй /reset_stop"
+        )
         return
-    risk_manager.clear_emergency_stop()
-    await update.message.reply_text("✅ Emergency stop снят. Торговля возобновлена.")
+    await update.message.reply_text(
+        "⚠️ Для сброса Emergency Stop используй /reset_stop (требует подтверждения)."
+    )
 
 
 @_admin_only
 async def cmd_risk(update, context) -> None:
     from src.risk.risk_manager import risk_manager
-    s = risk_manager.get_status()
+    from src.strategy.live_trader import _get_equity
+    from src.strategy.config import strategy_settings
+    equity = _get_equity()
+    s = risk_manager.get_status(equity=equity)
+    total_cap = s.total_deployed_cap_usd
+    tail_cap = s.tail_max_usd
+    eq_str = f"${equity:.2f}" if equity > 0 else "н/д"
     text = (
         f"⚠️ <b>Risk Limits</b>\n\n"
-        f"💵 Макс. ставка:       ${s.max_single_bet_usd:.2f}  (/setstake)\n"
+        f"💵 Basket ставка:      ${s.max_single_bet_usd:.2f}  (/setstake)\n"
+        f"🎯 Tail ставка (cap):  ${strategy_settings.tail_max_position_usd:.2f}  (/setlimit tail)\n"
         f"📅 Макс. ставок/день:  {s.max_daily_bets}  (использовано: {s.daily_bets_count})\n"
-        f"🔗 Макс. одновременно: {s.max_concurrent_bets}  (открыто: {s.concurrent_open_bets})\n"
         f"📉 Дневной лимит:      ${s.daily_loss_limit_usd:.2f}  (исп.: ${s.daily_loss:.2f})  (/setlimit daily)\n"
-        f"💥 Общий стоп-лосс:    ${s.total_stop_loss_usd:.2f}  (исп.: ${s.total_loss:.2f})  (/setlimit total)\n"
+        f"💥 Стоп-лосс (total):  ${s.total_stop_loss_usd:.2f}  (/setlimit total)\n\n"
+        f"💼 <b>Капитал в работе</b>  (equity {eq_str})\n"
+        f"  🎯 Tail:   ${s.tail_deployed_usd:.2f} / ${tail_cap:.2f}  ({s.tail_deployed_pct:.0%})\n"
+        f"  🧺 Basket: ${s.basket_deployed_usd:.2f}  (выключен)\n"
+        f"  📊 Итого:  ${s.total_deployed_usd:.2f} / ${total_cap:.2f}  ({s.total_deployed_pct:.0%})\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# /gamma  — Gamma API circuit-breaker status + live reachability probe
+# /gamma_reset  — force-reset circuit breaker without bot restart
+# ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_gamma(update, context) -> None:
+    """Show Gamma circuit-breaker state and probe the endpoint."""
+    import asyncio
+    from src.scheduler import get_gamma
+
+    g = get_gamma()
+    now = datetime.now()
+
+    if g._circuit_open_until and now < g._circuit_open_until:
+        remaining = int((g._circuit_open_until - now).total_seconds() // 60)
+        breaker_line = f"🔴 OPEN (ещё ~{remaining} мин, до {g._circuit_open_until:%H:%M:%S})"
+    else:
+        breaker_line = "🟢 CLOSED"
+
+    text = (
+        "🔌 <b>Gamma API — диагностика</b>\n\n"
+        f"Circuit: {breaker_line}\n"
+        f"open_count: {g._open_count}\n"
+        f"consec_timeout: {g._consec_timeout}\n"
+        f"consec_hard: {g._consec_hard}\n"
+        f"last_status: <code>{g._last_fetch_status}</code>\n"
+        f"last_fail_kind: <code>{g._last_fail_kind or '—'}</code>\n\n"
+        "⏳ Зондирую endpoint (<code>/events/keyset</code>)…"
+    )
+    msg = await update.message.reply_text(text, parse_mode="HTML")
+
+    loop = asyncio.get_event_loop()
+    ok, elapsed, detail = await loop.run_in_executor(None, lambda: g.probe(timeout_s=15.0))
+
+    probe_icon = "✅" if ok else "❌"
+    result_text = text.replace(
+        "⏳ Зондирую endpoint (<code>/events/keyset</code>)…",
+        f"{probe_icon} Probe: {elapsed:.1f}s — <code>{detail}</code>\n\n"
+        "/gamma_reset — сбросить брейкер вручную",
+    )
+    await msg.edit_text(result_text, parse_mode="HTML")
+
+
+@_admin_only
+async def cmd_gamma_reset(update, context) -> None:
+    """Force-reset Gamma circuit breaker (use after IP/rate-limit fix or Gamma recovery)."""
+    from src.scheduler import get_gamma
+
+    g = get_gamma()
+    prev = g._open_count
+    was_open = g._circuit_open_until is not None and datetime.now() < g._circuit_open_until
+    g.reset_circuit()
+    state = "OPEN" if was_open else "closed"
+    await update.message.reply_text(
+        f"✅ Gamma circuit breaker сброшен.\n"
+        f"Было: {state}, open_count={prev}\n"
+        f"Следующий цикл discovery попробует немедленно."
+    )
+
+
+# ---------------------------------------------------------------------------
+# /rebaseline  — prune equity HWM to current equity (FIX-1b)
+# ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_rebaseline(update, context) -> None:
+    """Two-stage: reset drawdown HWM_30d to current equity so dd=0 on next cycle."""
+    from src.risk.risk_manager import risk_manager
+    from src.strategy.live_trader import _get_equity
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    equity = _get_equity()
+    s = risk_manager.get_status(equity=equity)
+    hwm_est = equity / (1.0 - s.total_deployed_pct) if s.total_deployed_pct < 1.0 else equity
+
+    eq_str = f"${equity:.2f}" if equity > 0 else "н/д"
+    stop_note = ""
+    if s.emergency_stop and s.emergency_stop_type == "drawdown":
+        stop_note = "\n⚠️ Активен drawdown-стоп — будет снят автоматически после rebaseline."
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 ДА, REBASELINE", callback_data=f"rb:confirm:{equity:.4f}"),
+        InlineKeyboardButton("❌ Отмена", callback_data="x"),
+    ]])
+    await update.message.reply_text(
+        f"⚠️ <b>Rebaseline HWM?</b>\n\n"
+        f"Текущая equity: <b>{eq_str}</b>\n"
+        f"Это установит HWM_30d = {eq_str} (dd=0).\n\n"
+        f"Все исторические пики за 30 дней будут удалены.\n"
+        f"Drawdown-стоп не сработает до следующего просадки от нового базиса.{stop_note}",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -782,12 +1082,18 @@ async def _callback_router(update, context) -> None:
                 label = "Дневной лимит потерь"
             elif limit_type == "bet":
                 risk_manager.set_max_single_bet(new_val)
-                label = "Макс. ставка"
+                label = "Макс. корзинная ставка"
+            elif limit_type == "tail":
+                risk_manager.set_tail_max_position_usd(new_val)
+                label = "Макс. tail-ставка"
             else:  # total
                 risk_manager.set_total_stop_loss(new_val)
                 label = "Общий стоп-лосс"
             logger.info(f"[telegram_bot] setlimit {limit_type}→${new_val:.2f} via callback")
-            await query.edit_message_text(f"✅ <b>{label}</b> обновлён: ${new_val:.2f}", parse_mode="HTML")
+            await query.edit_message_text(
+                f"✅ <b>{label}</b> обновлён: ${new_val:.2f} (сохранено в БД)",
+                parse_mode="HTML",
+            )
             return
 
         # ── setstake: ss:{value} ─────────────────────────────────────────
@@ -813,6 +1119,67 @@ async def _callback_router(update, context) -> None:
             logger.info(f"[telegram_bot] strategy {full_name} {'on' if enabled else 'off'} via callback")
             await query.edit_message_text(
                 f"Стратегия <b>{full_name}</b> {state}", parse_mode="HTML"
+            )
+            return
+
+        # ── mode switch: mode:live:confirm ───────────────────────────────
+        if data == "mode:live:confirm":
+            _apply_mode_switch("live")
+            from src.config.settings import settings as _s
+            actual = _s.trading_mode.upper()
+            logger.info(f"[telegram_bot] Mode switched to {actual} via confirmation callback")
+            await query.edit_message_text(
+                f"✅ Режим переключён в <b>{actual}</b>.\n"
+                "⚠️ Бот размещает реальные ордера.\n"
+                "Для остановки: /mode paper или /stop",
+                parse_mode="HTML",
+            )
+            return
+
+        # ── reset_stop: rs:confirm ───────────────────────────────────────
+        if data == "rs:confirm":
+            from src.risk.risk_manager import risk_manager
+            risk_manager.clear_emergency_stop()
+            logger.info("[telegram_bot] Emergency stop cleared via /reset_stop callback")
+            await query.edit_message_text(
+                "✅ Emergency stop снят (БД обновлена).\n"
+                "⚠️ Внимание: если bot был запущен с активным стопом, "
+                "live-job не был зарегистрирован — перезапустите бота для восстановления."
+            )
+            return
+
+        # ── rebaseline HWM: rb:confirm:{equity} ─────────────────────────
+        if data.startswith("rb:confirm:"):
+            try:
+                equity_val = float(data.split(":", 2)[2])
+            except (IndexError, ValueError):
+                await query.edit_message_text("❌ Ошибка: неверный формат данных")
+                return
+            from src.risk.risk_manager import risk_manager
+            risk_manager.rebaseline_hwm(equity_val)
+            # If there's an active drawdown stop, clear it; dd=0 next cycle won't re-arm
+            if risk_manager.is_emergency_stopped() and risk_manager.get_stop_type() == "drawdown":
+                risk_manager.clear_emergency_stop()
+                stop_cleared = "\n✅ Drawdown-стоп снят."
+            else:
+                stop_cleared = ""
+            logger.info(f"[telegram_bot] HWM rebaselined to ${equity_val:.2f} via callback")
+            await query.edit_message_text(
+                f"📊 HWM_30d сброшен до ${equity_val:.2f}.\n"
+                f"Drawdown = 0% на следующем цикле.{stop_cleared}\n"
+                f"Новая просадка считается от этого базиса."
+            )
+            return
+
+        # ── reset_paper_stop: rps:confirm ────────────────────────────────
+        if data == "rps:confirm":
+            from src.risk.risk_manager import risk_manager
+            n = risk_manager.reset_paper_stop()
+            logger.info(f"[telegram_bot] Paper stop reset via callback: {n} trades voided")
+            await query.edit_message_text(
+                f"📊 Paper-стоп сброшен.\n"
+                f"Исключено из учёта: {n} убыточных сделок (статус: voided_legacy).\n"
+                f"Paper-торговля возобновлена."
             )
             return
 
@@ -860,6 +1227,86 @@ async def _callback_router(update, context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /mode [paper|live]  — switch trading mode with confirmation (G2-4)
+# ---------------------------------------------------------------------------
+
+@_admin_only
+async def cmd_mode(update, context) -> None:
+    """Show or switch trading mode. Switching to 'live' requires two-stage confirmation."""
+    from src.config.settings import settings
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    current = settings.trading_mode.lower()
+
+    if not context.args:
+        em = "💵 LIVE" if current == "live" else "📝 PAPER"
+        await update.message.reply_text(
+            f"Текущий режим: <b>{em}</b>\n\n"
+            f"Сменить: /mode paper | /mode live",
+            parse_mode="HTML",
+        )
+        return
+
+    target = context.args[0].lower()
+    if target not in ("paper", "live"):
+        await update.message.reply_text("❓ Используй: /mode paper | /mode live")
+        return
+
+    if target == current:
+        await update.message.reply_text(f"ℹ️ Уже в режиме {target.upper()}")
+        return
+
+    if target == "paper":
+        # Paper switch is safe — do immediately
+        _apply_mode_switch("paper")
+        actual = settings.trading_mode.upper()
+        logger.info(f"[telegram_bot] Mode switched to {actual} via /mode command")
+        await update.message.reply_text(
+            f"✅ Режим переключён в <b>{actual}</b> (симуляция).\n"
+            "Биржевые ордера размещаться не будут.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Live mode: two-stage confirmation
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ДА, ВКЛЮЧИТЬ LIVE", callback_data="mode:live:confirm"),
+        InlineKeyboardButton("❌ Отмена", callback_data="x"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ <b>Переключить в LIVE режим?</b>\n\n"
+        "Бот будет размещать реальные ордера на Polymarket.\n"
+        "Баланс: реальные деньги.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+def _apply_mode_switch(mode: str) -> None:
+    """Persist mode switch to bot_state DB and update settings in-process."""
+    from src.db.session import get_session
+    from src.db.models import BotState
+
+    session = get_session()
+    try:
+        state = session.get(BotState, "trading_mode")
+        if state:
+            state.value = mode
+        else:
+            session.add(BotState(key="trading_mode", value=mode))
+        session.commit()
+    except Exception as exc:
+        logger.error(f"[telegram_bot] Failed to persist mode switch: {exc}")
+        session.rollback()
+    finally:
+        session.close()
+
+    # Sync in-process settings so cmd_mode and schedulerjobs see the new mode immediately
+    from src.config.settings import settings
+    settings.trading_mode = mode
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -901,25 +1348,42 @@ def run_telegram_bot() -> None:
             app.add_handler(CommandHandler("trades",   cmd_trades))
             app.add_handler(CommandHandler("trade",    cmd_trade))
             app.add_handler(CommandHandler("risk",     cmd_risk))
+            app.add_handler(CommandHandler("paper",    cmd_paper))
+            app.add_handler(CommandHandler("help",     cmd_help))
 
             # Control commands
-            app.add_handler(CommandHandler("stop",     cmd_stop))
-            app.add_handler(CommandHandler("start",    cmd_start))
-            app.add_handler(CommandHandler("setlimit", cmd_setlimit))
-            app.add_handler(CommandHandler("setstake", cmd_setstake))
-            app.add_handler(CommandHandler("strategy", cmd_strategy))
-            app.add_handler(CommandHandler("cancel",   cmd_cancel_trade))
+            app.add_handler(CommandHandler("stop",             cmd_stop))
+            app.add_handler(CommandHandler("reset_stop",       cmd_reset_stop))
+            app.add_handler(CommandHandler("reset_paper_stop", cmd_reset_paper_stop))
+            app.add_handler(CommandHandler("rebaseline",       cmd_rebaseline))
+            app.add_handler(CommandHandler("start",            cmd_start))
+            app.add_handler(CommandHandler("mode",             cmd_mode))
+            app.add_handler(CommandHandler("setlimit",         cmd_setlimit))
+            app.add_handler(CommandHandler("setstake",         cmd_setstake))
+            app.add_handler(CommandHandler("strategy",         cmd_strategy))
+            app.add_handler(CommandHandler("cancel",           cmd_cancel_trade))
+            app.add_handler(CommandHandler("gamma",            cmd_gamma))
+            app.add_handler(CommandHandler("gamma_reset",      cmd_gamma_reset))
 
             # Inline-button callbacks
             app.add_handler(CallbackQueryHandler(_callback_router))
+
+            async def _heartbeat_loop() -> None:
+                """Write telegram-thread heartbeat every 60 s for external watchdog."""
+                from src.monitoring.heartbeat import write_heartbeat
+                while True:
+                    write_heartbeat("telegram")
+                    await asyncio.sleep(60)
 
             async with app:
                 await app.start()
                 logger.info("[telegram_bot] Starting polling…")
                 await app.updater.start_polling(drop_pending_updates=True)
                 logger.info("[telegram_bot] Polling active — commands: "
-                            "status, pnl, trades, trade, risk, stop, start, "
+                            "status, pnl, trades, trade, risk, paper, help, "
+                            "stop, reset_stop, reset_paper_stop, start, mode, "
                             "setlimit, setstake, strategy, cancel")
+                asyncio.create_task(_heartbeat_loop())
                 await asyncio.Event().wait()
 
         try:

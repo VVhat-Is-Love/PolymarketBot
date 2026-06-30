@@ -72,6 +72,61 @@ def _report_open_trades() -> None:
         session.close()
 
 
+def _bucket_executed(all_trades: list) -> tuple[list, list, list]:
+    """
+    Split executed trades into (closed, pending_redeem, open_filled).
+
+    • closed        = sold + resolved → outcome final, realized PnL is honest.
+    • pending_redeem = won, awaiting on-chain redemption → expected GAIN, never
+                       booked at −cost (that is the G4-23 win-as-loss bug).
+    • open_filled    = filled but market not resolved yet → still live.
+    """
+    closed = [t for t in all_trades if t.status in ("sold", "resolved")]
+    pending = [t for t in all_trades if t.status == "pending_redeem"]
+    open_filled = [t for t in all_trades if t.status == "filled"]
+    return closed, pending, open_filled
+
+
+def _pending_expected_gain(pending: list) -> float:
+    """Expected net gain for won-unredeemed legs: shares pay $1 each at redemption,
+    so gain ≈ shares − cost. Floored at 0 — a pending win is never shown negative."""
+    return round(
+        sum(max(0.0, (t.size_shares or 0.0) - (t.stake_usd or 0.0)) for t in pending), 2
+    )
+
+
+def _executed_realized_pnl(executed: list) -> tuple[float, str]:
+    """
+    Realized PnL for the executed trades, summed over the SAME set used for
+    'staked', from /activity (the source of truth) so the figure is recomputed
+    every startup and never freezes at a stale stored value.
+
+    realized_pnl_by_token already aggregates BUY−SELL+REDEEM per token, so we sum
+    once per unique token. With numerator and denominator from one set, a per-
+    position realized loss can never exceed its on-chain cost. Falls back to the
+    stored pnl_usd (same executed set) when /activity is unavailable.
+    """
+    from src.config.settings import settings
+    try:
+        if settings.proxy_wallet_address:
+            from src.market.polymarket_data import get_activity, realized_pnl_by_token
+            activity = get_activity(settings.proxy_wallet_address)
+            if activity:
+                pnl_by_token = realized_pnl_by_token(activity)
+                total, seen = 0.0, set()
+                for t in executed:
+                    tok = t.token_id
+                    if tok and tok not in seen:
+                        seen.add(tok)
+                        total += pnl_by_token.get(tok, 0.0)
+                    elif not tok:
+                        total += t.pnl_usd or 0.0  # legacy row w/o token → stored
+                return round(total, 2), "activity"
+    except Exception as exc:
+        logger.debug(f"[live_status] /activity PnL unavailable ({exc}) — using stored")
+    return round(sum(t.pnl_usd or 0.0 for t in executed), 2), "stored"
+
+
 def _report_live_status() -> None:
     import requests as _req
     from sqlalchemy import select
@@ -159,19 +214,42 @@ def _report_live_status() -> None:
             session.execute(select(LiveTrade)).scalars().all()
         )
         open_trades = [t for t in all_trades if t.status in ("pending", "open")]
-        filled = [t for t in all_trades if t.status == "filled"]
+        # G4-29b: realized PnL counts ONLY closed positions (sold + resolved).
+        # Won-but-unredeemed legs (pending_redeem) are NOT booked at −cost — that
+        # repeats the G4-23 win-as-loss bug (6 pending wins showed −$26). They go
+        # to a separate "ждёт redeem" bucket as an expected gain. Numerator and
+        # denominator of the realized line come from the SAME closed set.
+        closed, pending_redeem, open_filled = _bucket_executed(all_trades)
+        not_filled = [t for t in all_trades if t.status == "not_filled"]
         expired = [t for t in all_trades if t.status == "expired"]
         cancelled = [t for t in all_trades if t.status == "cancelled"]
-        total_pnl = sum(t.pnl_usd or 0.0 for t in all_trades)
-        total_staked = sum(t.stake_usd for t in filled)
+        executed_n = len(closed) + len(pending_redeem) + len(open_filled)
+
+        realized_pnl, pnl_source = _executed_realized_pnl(closed)
+        staked_closed = sum(t.stake_usd or 0.0 for t in closed)
+        pending_cost = sum(t.stake_usd or 0.0 for t in pending_redeem)
+        pending_expected = _pending_expected_gain(pending_redeem)
+        filled = closed + pending_redeem + open_filled  # for the listing below
 
         logger.info(
-            f"  ✅  DB сделки: открытых={len(open_trades)} | "
-            f"исполнено={len(filled)} | истекло={len(expired)} | отменено={len(cancelled)}"
+            f"  ✅  DB сделки: открытых={len(open_trades)} | исполнено={executed_n} | "
+            f"not_filled={len(not_filled)} | истекло={len(expired)} | отменено={len(cancelled)}"
         )
         logger.info(
-            f"       Поставлено (исполнено): ${total_staked:.2f} | PnL: ${total_pnl:+.2f}"
+            f"       Реализовано (закрытые {len(closed)}): PnL ${realized_pnl:+.2f} "
+            f"| поставлено ${staked_closed:.2f} (source={pnl_source})"
         )
+        if pending_redeem:
+            logger.info(
+                f"       Ждёт redeem: {len(pending_redeem)} поз. — в рынке "
+                f"${pending_cost:.2f}, ожидается ~+${pending_expected:.2f} "
+                f"(НЕ вычитается из PnL)"
+            )
+        if open_filled:
+            staked_open = sum(t.stake_usd or 0.0 for t in open_filled)
+            logger.info(
+                f"       Открыто (ждёт резолва): {len(open_filled)} поз. — ${staked_open:.2f}"
+            )
 
         if open_trades:
             logger.info("  --- Открытые позиции (DB) ---")
@@ -208,6 +286,9 @@ def main() -> None:
 
     from src.config.settings import settings
     logger.info(f"Trading mode: {settings.trading_mode.upper()}")
+
+    from src.telegram.strategy_flags import log_startup_flags
+    log_startup_flags()   # spells out "basket DISABLED" hard flag at startup
 
     if settings.trading_mode == "live":
         _report_live_status()

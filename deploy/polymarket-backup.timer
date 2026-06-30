@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily SQLite backup timer for Polymarket Bot
+
+[Timer]
+# 03:00 UTC — low-traffic window, bot is idle between daily snapshot jobs.
+OnCalendar=*-*-* 03:00:00 UTC
+# Re-run if the system was down at the scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -54,6 +54,49 @@ class TestParseCityFromTitle:
             "highest temp in CHICAGO on may 5", CITIES_WHITELIST
         ) == "Chicago"
 
+    # ── G4-14 regression: 'LA' alias must NOT match as a substring ──────────
+    # These titles previously returned "Los Angeles" because "la" is a
+    # substring of miLAn / daLLas / atLAnta / kuaLA / maniLA, routing real
+    # orders to the wrong market.
+    def test_milan_not_los_angeles(self):
+        assert parse_city_from_title(
+            "Will the highest temperature in Milan be 33°C on May 31?",
+            CITIES_WHITELIST,
+        ) == "Milan"
+
+    def test_dallas_not_los_angeles(self):
+        assert parse_city_from_title(
+            "Will the highest temperature in Dallas be 55°F or below?",
+            CITIES_WHITELIST,
+        ) == "Dallas"
+
+    def test_atlanta_not_los_angeles(self):
+        assert parse_city_from_title(
+            "Will the highest temperature in Atlanta be 59°F?",
+            CITIES_WHITELIST,
+        ) == "Atlanta"
+
+    def test_manila_not_los_angeles(self):
+        assert parse_city_from_title(
+            "Will the highest temperature in Manila be 30°C?",
+            CITIES_WHITELIST,
+        ) == "Manila"
+
+    def test_kuala_lumpur_not_los_angeles(self):
+        assert parse_city_from_title(
+            "Will the highest temperature in Kuala Lumpur be 26°C?",
+            CITIES_WHITELIST,
+        ) == "Kuala Lumpur"
+
+    def test_exact_name_beats_alias_substring(self):
+        # 'Milan' (exact whole word) must win over 'LA' alias even though
+        # whitelist iteration order is arbitrary.
+        for title, expect in [
+            ("highest temperature in milan", "Milan"),
+            ("highest temperature in la", "Los Angeles"),
+        ]:
+            assert parse_city_from_title(title, CITIES_WHITELIST) == expect
+
 
 # ---------------------------------------------------------------------------
 # parse_date_from_title

@@ -11,6 +11,17 @@ class Base(DeclarativeBase):
     pass
 
 
+class BotState(Base):
+    """Key-value store for persistent bot state (emergency stop, etc.)."""
+    __tablename__ = "bot_state"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 class MarketGroup(Base):
     __tablename__ = "market_groups"
 
@@ -22,6 +33,9 @@ class MarketGroup(Base):
     unit: Mapped[str | None] = mapped_column(String(1), nullable=True)  # 'F' | 'C'
     event_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # G-A1: city UTC offset (seconds, DST-aware) from Open-Meteo timezone="auto".
+    # Drives local_now(group) for the time-gate / hard-floor tail exits.
+    utc_offset_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     markets: Mapped[list["Market"]] = relationship("Market", back_populates="group")
@@ -217,6 +231,73 @@ class LiveTrade(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     actual_temp: Mapped[float | None] = mapped_column(Float, nullable=True)
     city: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Polymarket matching keys (G2-1: PnL reconciliation via Data API)
+    condition_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    token_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    basket_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    reconciled_with_polymarket: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
+    # G4-27: True once the "✅ Исполнен" alert has been sent, so reconcile's
+    # per-cycle re-verification of an already-filled position never re-announces.
+    fill_notified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
+
+    # T3: sell-side tracking — set when take_profit places a SELL order.
+    # status "sell_pending" means sell order is placed but not yet confirmed filled.
+    # Reconciler verifies actual fill qty and handles partial exits.
+    sell_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    sell_placed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CalibrationLog(Base):
+    """Per-bin snapshot: model P(NO) vs market price. Written every snapshot cycle.
+    Pure logging — never read by trading logic. Use for model↔market calibration."""
+    __tablename__ = "calibration_log"
+    __table_args__ = (
+        Index("ix_cal_city_date", "city", "forecast_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
+    city: Mapped[str] = mapped_column(String(64))
+    forecast_date: Mapped[date] = mapped_column(Date)
+    bin_label: Mapped[str] = mapped_column(String(64))
+    model_p_no: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # market_no_ask = 1 - price_yes (Gamma mid); we don't store the NO-book ask separately.
+    market_no_ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_yes_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    models_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Distance of this bin's near boundary from consensus in σ units (at snapshot time).
+    # near boundary = bin_min if bin is above consensus, else bin_max.
+    bin_distance_sigma: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # True if bot had an active tail_no position on this bin at snapshot time.
+    bot_traded: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Raw σ-independent fields — stay valid even when sigma changes (e.g. INTERIM-ENTRY σ→3-4°F).
+    # With actual_temp_resolve: realized_error = actual_temp_resolve - consensus_temp
+    consensus_temp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bin_near_boundary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bin_far_boundary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sigma_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Gate fields — populated by _job_calibration_log at snapshot time.
+    # gate_verdict: "PASS" if bin cleared the k·σ distance gate, "SKIP" otherwise.
+    # gate_direction: "ABOVE" if bin is above consensus, "BELOW" if below.
+    # k_sigma_threshold: effective distance threshold in market unit (k_eff × sigma).
+    # sigma_spread: stdev of per-model consensus temps — proxy for forecast uncertainty.
+    gate_verdict: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    gate_direction: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    k_sigma_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sigma_spread: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Resolution fields — populated by _job_calibration_resolve after the market settles.
+    # resolved_outcome: True = YES bin won (temp landed in this range), False = bin lost.
+    resolved_outcome: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Actual temperature in native unit (°F or °C) from Open-Meteo archive at ICAO coords.
+    # Note: Open-Meteo returns grid-interpolated data, not the raw station reading.
+    actual_temp_resolve: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class ChecklistEvaluation(Base):

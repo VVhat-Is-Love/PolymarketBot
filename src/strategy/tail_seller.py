@@ -39,6 +39,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from loguru import logger
+
 if TYPE_CHECKING:
     from src.db.models import Market
 
@@ -175,11 +177,13 @@ def scan_tails(
     sigma = ss.tail_sigma_c * (9.0 / 5.0) if unit.upper() == "F" else ss.tail_sigma_c
     yes_probs = _bin_yes_probs(markets, consensus_temp, sigma)
 
-    portfolio_cap = available_capital * ss.tail_max_portfolio_pct
+    from src.config.settings import settings as _settings
+    portfolio_cap = available_capital * _settings.tail_deployed_pct
     budget_left = max(0.0, portfolio_cap - no_capital_in_use)
     if budget_left < ss.min_order_notional_usd:
         result.skipped.append(
             f"portfolio_cap_reached:in_use=${no_capital_in_use:.2f}/{portfolio_cap:.2f}"
+            f"({_settings.tail_deployed_pct:.0%} of equity)"
         )
         return result
 
@@ -199,8 +203,28 @@ def scan_tails(
             result.skipped.append(f"{label}:dust_yes={yes_price:.3f}")
             continue
 
-        no_ask = no_asks.get(m.market_id) if no_asks else (1.0 - yes_price)
-        if no_ask is None or not (0.0 < no_ask < 1.0):
+        if no_asks is not None:
+            no_ask = no_asks.get(m.market_id)
+            if no_ask is None:
+                result.skipped.append(f"{label}:no_order_book")
+                continue
+        else:
+            # Approximation: add slippage buffer to account for spread
+            raw_approx = 1.0 - yes_price
+            no_ask = min(0.99, raw_approx * (1.0 + ss.tail_slippage_buffer))
+            logger.debug(f"[tail] {label}: approx no_ask={no_ask:.4f} (raw={raw_approx:.4f})")
+
+        if not (0.0 < no_ask < 1.0):
+            continue
+
+        # Price band guard: only trade within the viable NO ask range
+        if hasattr(ss, 'tail_min_no_ask') and (
+            no_ask < ss.tail_min_no_ask or no_ask > ss.tail_max_no_ask
+        ):
+            result.skipped.append(
+                f"{label}:out_of_band_no_ask={no_ask:.3f} "
+                f"[{ss.tail_min_no_ask:.2f},{ss.tail_max_no_ask:.2f}]"
+            )
             continue
 
         p_model_no = 1.0 - yes_probs.get(m.market_id, 0.0)

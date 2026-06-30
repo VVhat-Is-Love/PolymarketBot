@@ -2,6 +2,39 @@ import re
 from datetime import date, datetime
 
 # ---------------------------------------------------------------------------
+# Canonical city name (G3-5)
+# ---------------------------------------------------------------------------
+# Maps lowercase raw names / aliases → canonical name used in CITIES_WHITELIST.
+# Applied at three points: weather write, market-title parse, forecast read.
+CITY_CANONICAL: dict[str, str] = {
+    "nyc": "New York",
+    "new york city": "New York",
+    "new york": "New York",
+    "ny": "New York",
+    "sao paulo": "Sao Paulo",
+    "são paulo": "Sao Paulo",
+    "kuala lumpur": "Kuala Lumpur",
+    "buenos aires": "Buenos Aires",
+    "hong kong": "Hong Kong",
+    "cape town": "Cape Town",
+    "los angeles": "Los Angeles",
+    "san francisco": "San Francisco",
+    "mexico city": "Mexico City",
+    "panama city": "Panama City",
+}
+
+
+def canonical_city(raw: str) -> str:
+    """Return the canonical city name for whitelist matching.
+
+    Strips whitespace, lower-cases, looks up in CITY_CANONICAL; falls back to
+    title-casing the raw value if not found (keeps existing whitelist entries
+    like 'Amsterdam' unchanged).
+    """
+    cleaned = raw.strip()
+    return CITY_CANONICAL.get(cleaned.lower(), cleaned)
+
+# ---------------------------------------------------------------------------
 # Month name → number mapping
 # ---------------------------------------------------------------------------
 _MONTHS: dict[str, int] = {
@@ -51,15 +84,47 @@ _BIN_POINT = re.compile(r"^(\d+(?:\.\d+)?)\s*°?[CFcf]?\s*$")
 # Public API
 # ---------------------------------------------------------------------------
 
+def _word_in(term: str, text: str) -> bool:
+    """
+    True if `term` appears in `text` as a standalone word (both lower-cased).
+
+    Uses letter-boundary lookarounds rather than plain substring so short
+    aliases like 'la' do NOT match inside other city names:
+        'la' in 'milan'  → substring match (WRONG, caused Milan→Los Angeles)
+        _word_in('la', 'milan') → False  (preceded by a letter)
+        _word_in('la', 'temp in la on may') → True
+    """
+    if not term:
+        return False
+    return re.search(r"(?<![a-z])" + re.escape(term) + r"(?![a-z])", text) is not None
+
+
 def parse_city_from_title(title: str, whitelist: dict) -> str | None:
-    """'Highest temperature in Seoul on May 5?' → 'Seoul'"""
+    """'Highest temperature in Seoul on May 5?' → 'Seoul' (canonical).
+
+    Matching priority (CRITICAL — prevents wrong-market trades):
+      1. Exact canonical city name as a whole word, across the WHOLE whitelist.
+         This guarantees 'Milan' wins over the 'LA' alias substring inside it.
+      2. City aliases as whole words (e.g. 'NYC', 'HK').
+      3. CITY_CANONICAL fallback table.
+    """
     t = title.lower()
-    for city, cfg in whitelist.items():
-        if city.lower() in t:
+
+    # Pass 1: exact canonical city name (whole-word) — highest priority
+    for city in whitelist:
+        if _word_in(city.lower(), t):
             return city
+
+    # Pass 2: aliases (whole-word)
+    for city, cfg in whitelist.items():
         for alias in cfg.get("aliases", []):
-            if alias.lower() in t:
+            if _word_in(alias.lower(), t):
                 return city
+
+    # Pass 3: CITY_CANONICAL table (whole-word) for titles like "highest temp in NYC"
+    for raw, canonical in CITY_CANONICAL.items():
+        if _word_in(raw, t) and canonical in whitelist:
+            return canonical
     return None
 
 
