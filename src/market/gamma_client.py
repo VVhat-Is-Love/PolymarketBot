@@ -62,6 +62,24 @@ class GammaClient:
     def last_fetch_status(self) -> str:
         return self._last_fetch_status
 
+    def _refresh_session(self) -> None:
+        """Close stale connection pool and open a new Session.
+
+        Long-running processes accumulate idle TCP connections that hit
+        ReadTimeout even when the server responds in 0.2 s on a fresh socket.
+        Called on ReadTimeout before retry, and on circuit-breaker cooldown expiry.
+        """
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "polymarket-bot/0.1",
+        })
+        logger.info("[gamma] HTTP session refreshed (stale connection pool cleared)")
+
     def _is_circuit_open(self) -> bool:
         if self._circuit_open_until is None:
             return False
@@ -69,9 +87,14 @@ class GammaClient:
             self._circuit_open_until = None
             self._consec_hard = 0
             self._consec_timeout = 0
-            # _open_count deliberately NOT reset here — only a successful fetch
-            # proves Gamma recovered; expiry alone just means "try again".
-            logger.info("Gamma circuit breaker: cooldown finished, resuming")
+            # Reset open_count on expiry so the next failure gets a fresh
+            # exponential cooldown (10 min) rather than the saturated 60 min.
+            # Also refresh the session: stale connections are the primary cause
+            # of timeouts in long-running processes, and the pool has been idle
+            # for the entire cooldown period.
+            self._open_count = 0
+            self._refresh_session()
+            logger.info("Gamma circuit breaker: cooldown finished — session refreshed, resuming")
             return False
         return True
 
@@ -149,8 +172,8 @@ class GammaClient:
     def _get(self, path: str, params: dict | None = None) -> list | dict:
         url = f"{GAMMA_BASE}{path}"
         try:
-            # (connect, read): connect-fail fast-fails at 5s; read capped at 30s.
-            # 2 retries + 2s backoff → ≤62s worst-case per call.
+            # (connect, read): connect-fail fast-fails at 5s; read capped at 45s.
+            # 2 retries + 2s backoff → ≤92s worst-case per call.
             resp = self._session.get(
                 url, params=params,
                 timeout=(_PRICES_CONNECT_TIMEOUT_S, _PRICES_READ_TIMEOUT_S),
@@ -162,6 +185,11 @@ class GammaClient:
                 resp.raise_for_status()
             resp.raise_for_status()
             return resp.json()
+        except requests.exceptions.ReadTimeout:
+            # Stale connection pool: refresh before tenacity retries so the next
+            # attempt uses a fresh socket (resolves in ~0.2 s if Gamma is alive).
+            self._refresh_session()
+            raise
         except requests.HTTPError as e:
             logger.error(f"HTTP {e.response.status_code} from {url}: {e}")
             raise
@@ -188,10 +216,33 @@ class GammaClient:
 
     def _get_once(self, path: str, params: dict | None = None,
                   timeout: float = _DISCOVERY_TIMEOUT_S) -> list | dict:
-        """Single-attempt GET (no tenacity) for budget-bounded discovery paging."""
+        """Single-attempt GET for budget-bounded discovery paging.
+
+        On ReadTimeout: close the stale connection pool, open a new Session,
+        and retry ONCE.  Long-running processes accumulate idle TCP connections
+        that cause ReadTimeout even when Gamma responds in 0.2 s on a fresh
+        socket — the single refresh+retry resolves that without increasing the
+        wall-clock timeout.  If the retry also fails, the exception propagates
+        to _fetch_keyset_page which classifies and records it normally.
+        """
         url = f"{GAMMA_BASE}{path}"
+        # First attempt.
         try:
-            # connect=3s fast-fail; read=timeout (default 20s).
+            resp = self._session.get(
+                url, params=params,
+                timeout=(_DISCOVERY_CONNECT_TIMEOUT_S, timeout),
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.ReadTimeout:
+            logger.warning(
+                f"[gamma] ReadTimeout on {path!r} — refreshing session, retrying once"
+            )
+            self._refresh_session()
+        finally:
+            time.sleep(REQUEST_DELAY)
+        # Second attempt with a fresh session.  Any exception propagates as-is.
+        try:
             resp = self._session.get(
                 url, params=params,
                 timeout=(_DISCOVERY_CONNECT_TIMEOUT_S, timeout),
